@@ -54,6 +54,8 @@ if (_gatewayKey) {
 // 实体管理
 // ============================================
 let allEntities = [];
+let selectedEntity = null;
+let pendingEntityProfile = null;
 
 async function loadEntities() {
     const status = document.getElementById('entity-status');
@@ -103,7 +105,11 @@ async function loadEntityMemories(entity) {
     const response = await fetch(`/api/entities/${entity.id}/memories`);
     const data = await response.json();
     if (!response.ok || data.error) return;
-    document.getElementById('entity-memory-title').textContent = `${entity.name} 的关联记忆`;
+    selectedEntity = data.entity || entity;
+    pendingEntityProfile = null;
+    document.getElementById('entity-profile-draft').style.display = 'none';
+    document.getElementById('entity-memory-title').textContent = `${selectedEntity.name} 的实体详情`;
+    document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
     const list = document.getElementById('entity-memory-list');
     list.replaceChildren();
     (data.memories || []).forEach(memory => {
@@ -114,6 +120,75 @@ async function loadEntityMemories(entity) {
         list.appendChild(item);
     });
     document.getElementById('entity-memory-card').style.display = 'block';
+}
+
+function parseEntityProfile(profile) {
+    if (!profile) return null;
+    if (typeof profile === 'object') return profile;
+    try { return JSON.parse(profile); } catch (_) { return null; }
+}
+
+function formatEntityProfile(profile, fallback = '') {
+    const value = parseEntityProfile(profile);
+    if (!value) return fallback || '尚未生成实体概况。';
+    const sections = [
+        ['摘要', value.summary],
+        ['关系', value.relationship],
+        ['稳定事实', value.stable_facts],
+        ['近期动态', value.recent_updates],
+        ['重要偏好', value.preferences],
+        ['待确认信息', value.uncertainties],
+        ['证据记忆', (value.evidence_memory_ids || []).map(id => `#${id}`)],
+    ];
+    return sections.filter(([, content]) => Array.isArray(content) ? content.length : content)
+        .map(([title, content]) => `${title}：${Array.isArray(content) ? content.join('；') : content}`).join('\n');
+}
+
+async function generateEntityProfileDraft() {
+    if (!selectedEntity) return;
+    const status = document.getElementById('entity-status');
+    const button = document.getElementById('entity-profile-generate');
+    button.disabled = true;
+    status.textContent = `正在为 ${selectedEntity.name} 生成概况草稿…`;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/profile/draft`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '生成失败');
+        pendingEntityProfile = data.draft;
+        document.getElementById('entity-profile-old').textContent = formatEntityProfile(data.current_profile, selectedEntity.description);
+        document.getElementById('entity-profile-new').textContent = formatEntityProfile(data.draft);
+        document.getElementById('entity-profile-draft').style.display = 'block';
+        status.textContent = '草稿已生成，请比较后确认。';
+    } catch (error) {
+        status.textContent = error.message;
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function saveEntityProfileDraft() {
+    if (!selectedEntity || !pendingEntityProfile) return;
+    const status = document.getElementById('entity-status');
+    const response = await fetch(`/api/entities/${selectedEntity.id}/profile`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: pendingEntityProfile }),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        status.textContent = data.error || '保存失败';
+        return;
+    }
+    selectedEntity.profile_json = data.profile;
+    selectedEntity.description = data.profile.summary;
+    document.getElementById('entity-profile-current').textContent = formatEntityProfile(data.profile);
+    cancelEntityProfileDraft();
+    status.textContent = '实体概况已保存。';
+    loadEntities();
+}
+
+function cancelEntityProfileDraft() {
+    pendingEntityProfile = null;
+    document.getElementById('entity-profile-draft').style.display = 'none';
 }
 
 async function mergeSelectedEntities() {

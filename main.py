@@ -26,9 +26,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned
+from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, normalize_entity_profile
+import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 
 # ============================================================
@@ -341,8 +342,24 @@ def _format_matched_entity_overview(memories: list) -> str:
     lines = []
     for entity in entities.values():
         aliases = f"，别名：{'、'.join(entity.get('aliases', []))}" if entity.get("aliases") else ""
-        description = f"；概况：{entity['description']}" if entity.get("description") else ""
-        lines.append(f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）{description}")
+        profile = entity.get("profile") or {}
+        if isinstance(profile, str):
+            try:
+                profile = json.loads(profile)
+            except json.JSONDecodeError:
+                profile = {}
+        summary = profile.get("summary") or entity.get("description", "")
+        details = []
+        if profile.get("relationship"):
+            details.append(f"关系：{profile['relationship']}")
+        for key, label in (("stable_facts", "稳定事实"), ("recent_updates", "近期动态"),
+                           ("preferences", "偏好"), ("uncertainties", "待确认")):
+            values = profile.get(key) or []
+            if values:
+                details.append(f"{label}：{'；'.join(values)}")
+        description = f"；概况：{summary}" if summary else ""
+        detail_text = f"；{'；'.join(details)}" if details else ""
+        lines.append(f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）{description}{detail_text}")
     return "\n".join(lines)
 
 async def build_system_prompt_with_memories(user_message: str) -> str:
@@ -1645,7 +1662,55 @@ async def api_get_entities():
 
 @app.get("/api/entities/{entity_id}/memories")
 async def api_get_entity_memories(entity_id: int):
-    return {"memories": await get_entity_memories(entity_id)}
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    return {"entity": entity, "memories": await get_entity_memories(entity_id)}
+
+
+@app.post("/api/entities/{entity_id}/profile/draft")
+async def api_generate_entity_profile_draft(entity_id: int):
+    """Generate but do not persist an entity-profile draft."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    memories = [memory for memory in await get_entity_memories(entity_id) if memory.get("is_active") is not False]
+    memories.sort(key=lambda memory: (-(memory.get("layer") or 1), -memory.get("importance", 5)))
+    memories = memories[:80]
+    if not memories:
+        return JSONResponse(status_code=400, content={"error": "该实体没有可用的活跃记忆"})
+    draft = await generate_entity_profile(entity, memories)
+    if not draft or not draft.get("summary") or not draft.get("evidence_memory_ids"):
+        return JSONResponse(status_code=502, content={"error": "模型未生成有效且带证据的实体概况，现有概况未改变"})
+    return {
+        "status": "draft",
+        "entity": entity,
+        "current_profile": entity.get("profile_json"),
+        "draft": draft,
+        "model": _memory_extractor_module.MEMORY_MODEL,
+    }
+
+
+@app.put("/api/entities/{entity_id}/profile")
+async def api_save_entity_profile(entity_id: int, request: Request):
+    """Persist a profile only after explicit Dashboard confirmation."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    raw_profile = data.get("profile")
+    if not isinstance(raw_profile, dict):
+        return JSONResponse(status_code=400, content={"error": "profile 必须是 JSON 对象"})
+    memories = await get_entity_memories(entity_id)
+    allowed_ids = {int(memory["id"]) for memory in memories}
+    profile = normalize_entity_profile(raw_profile, allowed_ids)
+    if not profile.get("summary") or not profile.get("evidence_memory_ids"):
+        return JSONResponse(status_code=400, content={"error": "概况摘要和证据记忆不能为空"})
+    result = await save_entity_profile(entity_id, profile, profile["evidence_memory_ids"], _memory_extractor_module.MEMORY_MODEL)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    result["profile"] = profile
+    return result
 
 
 @app.post("/api/entities/merge")

@@ -474,7 +474,23 @@
                     <div id="entity-list" style="margin-top:16px"></div>
                 </div>
                 <div class="card" id="entity-memory-card" style="display:none">
-                    <h3 id="entity-memory-title">关联记忆</h3>
+                    <div class="toolbar" style="justify-content:space-between">
+                        <h3 id="entity-memory-title">关联记忆</h3>
+                        <button class="btn btn-primary" id="entity-profile-generate" onclick="generateEntityProfileDraft()">生成/刷新概况</button>
+                    </div>
+                    <h4 style="margin:16px 0 8px">当前实体概况</h4>
+                    <pre id="entity-profile-current" style="white-space:pre-wrap;line-height:1.6"></pre>
+                    <div id="entity-profile-draft" style="display:none;margin:16px 0">
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                            <div><h4>保存中的概况</h4><pre id="entity-profile-old" style="white-space:pre-wrap;line-height:1.6"></pre></div>
+                            <div><h4>模型生成的新草稿</h4><pre id="entity-profile-new" style="white-space:pre-wrap;line-height:1.6"></pre></div>
+                        </div>
+                        <div class="toolbar" style="margin-top:12px">
+                            <button class="btn btn-primary" onclick="saveEntityProfileDraft()">确认保存</button>
+                            <button class="btn btn-secondary" onclick="cancelEntityProfileDraft()">取消</button>
+                        </div>
+                    </div>
+                    <h4 style="margin:16px 0 8px">关联记忆</h4>
                     <div id="entity-memory-list"></div>
                 </div>
             </section>

@@ -20,6 +20,7 @@ sys.modules.setdefault("jieba", jieba)
 sys.modules.setdefault("jieba.analyse", jieba_analyse)
 
 import database
+import memory_extractor
 
 
 class FakeConnection:
@@ -43,6 +44,7 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
                 "created_at": database.datetime.now(database.dt_timezone.utc),
                 "layer": 1, "title": None, "entity_id": 7, "entity_name": "Alice",
                 "normalized_name": "alice", "entity_type": "person", "description": "Friend",
+                "profile_json": None,
                 "aliases": ["小艾"], "normalized_aliases": ["小艾"],
             },
             {
@@ -50,6 +52,7 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
                 "created_at": database.datetime.now(database.dt_timezone.utc),
                 "layer": 2, "title": "Shanghai trip", "entity_id": 7, "entity_name": "Alice",
                 "normalized_name": "alice", "entity_type": "person", "description": "Friend",
+                "profile_json": None,
                 "aliases": ["小艾"], "normalized_aliases": ["小艾"],
             },
             {
@@ -57,6 +60,7 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
                 "created_at": database.datetime.now(database.dt_timezone.utc),
                 "layer": 3, "title": "Important relationship", "entity_id": 7, "entity_name": "Alice",
                 "normalized_name": "alice", "entity_type": "person", "description": "Friend",
+                "profile_json": None,
                 "aliases": ["小艾"], "normalized_aliases": ["小艾"],
             },
         ]
@@ -69,6 +73,21 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["matched_entities"][0]["name"] == "Alice" for item in candidates.values()))
         terms = conn.calls[0][1][0]
         self.assertIn("小艾", terms)
+
+    def test_profile_normalization_rejects_unknown_evidence(self):
+        profile = memory_extractor.normalize_entity_profile({
+            "summary": "  Alice is a friend.  ",
+            "relationship": "friend",
+            "stable_facts": ["Likes jazz"],
+            "recent_updates": [],
+            "preferences": ["Jazz"],
+            "uncertainties": ["Current city is unclear"],
+            "evidence_memory_ids": [11, "12", 999, "invalid"],
+        }, {11, 12})
+
+        self.assertEqual(profile["summary"], "Alice is a friend.")
+        self.assertEqual(profile["evidence_memory_ids"], [11, 12])
+        self.assertNotIn(999, profile["evidence_memory_ids"])
 
 
 if __name__ == "__main__":

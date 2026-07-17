@@ -300,6 +300,88 @@ Omit records without entities. Do not use pronouns or generic nouns. Do not inve
         return None
 
 
+def normalize_entity_profile(raw_profile: Dict, allowed_memory_ids: set) -> Dict:
+    """Keep the profile schema small and discard evidence not supplied to the model."""
+    def clean_text(value, limit=500):
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+    def clean_list(value, limit=12):
+        if not isinstance(value, list):
+            return []
+        return [text for text in (clean_text(item, 240) for item in value) if text][:limit]
+
+    evidence = []
+    for value in raw_profile.get("evidence_memory_ids", []):
+        try:
+            memory_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if memory_id in allowed_memory_ids and memory_id not in evidence:
+            evidence.append(memory_id)
+    return {
+        "summary": clean_text(raw_profile.get("summary"), 500),
+        "relationship": clean_text(raw_profile.get("relationship"), 300),
+        "stable_facts": clean_list(raw_profile.get("stable_facts")),
+        "recent_updates": clean_list(raw_profile.get("recent_updates")),
+        "preferences": clean_list(raw_profile.get("preferences")),
+        "uncertainties": clean_list(raw_profile.get("uncertainties")),
+        "evidence_memory_ids": evidence,
+    }
+
+
+async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optional[Dict]:
+    """Generate a profile draft; persistence is intentionally handled elsewhere after confirmation."""
+    if not memories or not get_memory_api_key():
+        return None
+    evidence_lines = []
+    for memory in memories:
+        layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(memory.get("layer", 1), "记忆")
+        evidence_lines.append(f"[ID={memory['id']}][{layer_name}] {memory['content']}")
+    current_profile = entity.get("profile_json") or {}
+    if isinstance(current_profile, str):
+        try:
+            current_profile = json.loads(current_profile)
+        except json.JSONDecodeError:
+            current_profile = {}
+    prompt = f"""你是长期记忆系统的实体档案整理员。请仅根据给出的证据，为实体生成可供聊天检索使用的概况草稿。
+
+实体：{entity.get('name')}（{entity.get('entity_type', 'other')}）
+别名：{'、'.join(entity.get('aliases') or []) or '无'}
+当前概况：{json.dumps(current_profile, ensure_ascii=False)}
+
+证据记忆：
+{chr(10).join(evidence_lines)}
+
+要求：
+1. 不得推测证据中没有的信息；矛盾或不确定内容放入 uncertainties。
+2. recent_updates 只放近期状态，stable_facts 只放稳定事实。
+3. evidence_memory_ids 只能引用上方出现的 ID，并覆盖概况实际使用的证据。
+4. 只返回 JSON 对象：
+{{"summary":"简短摘要","relationship":"与用户或伙伴的关系","stable_facts":[],"recent_updates":[],"preferences":[],"uncertainties":[],"evidence_memory_ids":[]}}
+"""
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                json={"model": MEMORY_MODEL, "temperature": 0, "max_tokens": 1800,
+                      "messages": [{"role": "user", "content": prompt}]},
+            )
+        if response.status_code != 200:
+            print(f"⚠️ 实体概况生成失败: {response.status_code} {response.text[:200]}")
+            return None
+        text = _extract_response_content(response.json()).strip()
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.IGNORECASE)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        raw_profile = json.loads(match.group() if match else text)
+        if not isinstance(raw_profile, dict):
+            return None
+        return normalize_entity_profile(raw_profile, {int(memory["id"]) for memory in memories})
+    except Exception as exc:
+        print(f"⚠️ 实体概况解析失败: {exc}")
+        return None
+
+
 SCORING_PROMPT = """你是记忆重要性评分专家。请对以下记忆条目逐条评分。
 
 # 评分规则（1-10）

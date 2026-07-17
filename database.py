@@ -9,6 +9,7 @@
 
 import os
 import re
+import json
 from typing import Optional, List
 from datetime import datetime, timedelta, timezone as dt_timezone
 
@@ -260,6 +261,22 @@ async def init_tables():
             );
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities (entity_id);")
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'entities' AND column_name = 'profile_json') THEN
+                    ALTER TABLE entities ADD COLUMN profile_json JSONB DEFAULT NULL;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'entities' AND column_name = 'profile_evidence_ids') THEN
+                    ALTER TABLE entities ADD COLUMN profile_evidence_ids INTEGER[] DEFAULT ARRAY[]::INTEGER[];
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'entities' AND column_name = 'profile_updated_at') THEN
+                    ALTER TABLE entities ADD COLUMN profile_updated_at TIMESTAMPTZ DEFAULT NULL;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'entities' AND column_name = 'profile_model') THEN
+                    ALTER TABLE entities ADD COLUMN profile_model TEXT DEFAULT NULL;
+                END IF;
+            END $$;
+        """)
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -674,7 +691,7 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
     rows = await conn.fetch("""
         SELECT m.id, m.content, m.importance, m.created_at, m.layer, m.title,
                e.id AS entity_id, e.name AS entity_name, e.normalized_name,
-               e.entity_type, e.description,
+               e.entity_type, e.description, e.profile_json,
                COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
                COALESCE(array_agg(DISTINCT ea.normalized_alias) FILTER (WHERE ea.normalized_alias IS NOT NULL), ARRAY[]::text[]) AS normalized_aliases
         FROM entities e
@@ -701,6 +718,7 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
         entity = {
             "id": row["entity_id"], "name": row["entity_name"], "type": row["entity_type"],
             "description": row["description"] or "", "aliases": list(row["aliases"] or []),
+            "profile": row["profile_json"],
         }
         item = candidates.setdefault(row["id"], {
             "content": row["content"], "importance": row["importance"],
@@ -719,7 +737,7 @@ async def _attach_entity_context(conn, results: list):
         return results
     ids = [int(result["id"]) for result in results]
     rows = await conn.fetch("""
-        SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description,
+        SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description, e.profile_json,
                COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
         FROM memory_entities me
         JOIN entities e ON e.id = me.entity_id
@@ -733,6 +751,7 @@ async def _attach_entity_context(conn, results: list):
         by_memory.setdefault(row["memory_id"], []).append({
             "id": row["id"], "name": row["name"], "type": row["entity_type"],
             "description": row["description"] or "", "aliases": list(row["aliases"] or []),
+            "profile": row["profile_json"],
             "confidence": row["confidence"],
         })
     for result in results:
@@ -2088,7 +2107,9 @@ async def list_entities():
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT e.id, e.name, e.entity_type, e.description, e.created_at, e.updated_at,
+            SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
+                   e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
+                   e.created_at, e.updated_at,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e
@@ -2098,6 +2119,46 @@ async def list_entities():
             ORDER BY memory_count DESC, e.name
         """)
         return [dict(row) for row in rows]
+
+
+async def get_entity_detail(entity_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
+                   e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
+                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+            FROM entities e
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            WHERE e.id = $1
+            GROUP BY e.id
+        """, entity_id)
+        return dict(row) if row else None
+
+
+async def save_entity_profile(entity_id: int, profile: dict, evidence_ids: list, model: str):
+    """Persist a user-confirmed profile only when all evidence belongs to the entity."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        valid_rows = await conn.fetch("""
+            SELECT memory_id FROM memory_entities
+            WHERE entity_id = $1 AND memory_id = ANY($2::int[])
+        """, entity_id, evidence_ids)
+        valid_ids = {row["memory_id"] for row in valid_rows}
+        if valid_ids != set(evidence_ids):
+            return {"error": "概况包含不属于该实体的证据记忆"}
+        summary = str(profile.get("summary", "")).strip()
+        if not summary:
+            return {"error": "实体概况摘要不能为空"}
+        result = await conn.execute("""
+            UPDATE entities SET description = $2, profile_json = $3::jsonb,
+                   profile_evidence_ids = $4, profile_updated_at = NOW(),
+                   profile_model = $5, updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, summary, json.dumps(profile, ensure_ascii=False), evidence_ids, model)
+        if result == "UPDATE 0":
+            return {"error": "实体不存在"}
+    return {"status": "ok", "entity_id": entity_id}
 
 
 async def get_entity_memories(entity_id: int):

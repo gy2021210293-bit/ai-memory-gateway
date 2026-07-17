@@ -15,7 +15,8 @@
 - The constellation is a read-only `/constellation` page. It reuses the original project's canvas renderer and visual styling while consuming the gateway's `/api/memories`; visualization does not maintain a separate memory database.
 - Entity MVP uses PostgreSQL `entities`, `entity_aliases`, and `memory_entities` as the canonical entity layer. New extracted memories carry explicit named entities into these tables; legacy memories are only backfilled through the bounded manual Dashboard action, with `memories.entity_scanned` preventing repeat charges for entity-free records. Retrieval prompt entries include linked entity names, and the star map now treats entities as constellations across People, Places, Projects, Events, and Life galaxies.
 - Retrieval is entity-aware: `search_memories()` combines keyword candidates, optional vector candidates, and entity name/alias candidates. Entity hits recall linked active memories across layers 1/2/3, add `MEMORY_HW_ENTITY` to ranking, attach entity metadata to results, and inject one deduplicated matched-entity overview before the recalled memories.
+- Entity profiles are manual and evidence-backed: Dashboard draft generation reads up to 80 active linked memories, returns structured fields without writing, shows old/new profiles side by side, and only persists after confirmation. Saved profiles include evidence IDs, model, and update time; unsupported evidence IDs are rejected, and structured profile fields are included in entity-aware retrieval context.
 
 ## Open questions
 
-- Entity descriptions and automatic alias discovery are intentionally deferred until entity extraction and manual merge behavior are validated on deployed data.
+- Automatic alias discovery remains deferred until manual entity merge behavior is validated on deployed data.
