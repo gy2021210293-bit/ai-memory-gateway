@@ -51,6 +51,102 @@ if (_gatewayKey) {
 }
 
 // ============================================
+// 实体管理
+// ============================================
+let allEntities = [];
+
+async function loadEntities() {
+    const status = document.getElementById('entity-status');
+    if (!status) return;
+    status.textContent = '加载中…';
+    try {
+        const response = await fetch('/api/entities');
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '加载失败');
+        allEntities = data.entities || [];
+        renderEntities();
+        status.textContent = `${allEntities.length} 个实体`;
+    } catch (error) {
+        status.textContent = error.message;
+    }
+}
+
+function renderEntities() {
+    const list = document.getElementById('entity-list');
+    const source = document.getElementById('entity-source');
+    const target = document.getElementById('entity-target');
+    list.replaceChildren();
+    [source, target].forEach(select => {
+        const firstLabel = select === source ? '选择要合并的实体' : '选择保留的实体';
+        select.replaceChildren(Object.assign(document.createElement('option'), { value: '', textContent: firstLabel }));
+        allEntities.forEach(entity => select.appendChild(Object.assign(document.createElement('option'), {
+            value: String(entity.id), textContent: `${entity.name} (${entity.memory_count})`,
+        })));
+    });
+    if (!allEntities.length) {
+        list.textContent = '还没有实体。新对话会自动提取，也可以回填已有记忆。';
+        return;
+    }
+    allEntities.forEach(entity => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'memory-item';
+        row.style.cssText = 'width:100%;text-align:left;margin-bottom:8px;cursor:pointer';
+        const aliases = entity.aliases?.length ? ` · 别名：${entity.aliases.join('、')}` : '';
+        row.textContent = `${entity.name} · ${entity.entity_type} · ${entity.memory_count} 条记忆${aliases}`;
+        row.onclick = () => loadEntityMemories(entity);
+        list.appendChild(row);
+    });
+}
+
+async function loadEntityMemories(entity) {
+    const response = await fetch(`/api/entities/${entity.id}/memories`);
+    const data = await response.json();
+    if (!response.ok || data.error) return;
+    document.getElementById('entity-memory-title').textContent = `${entity.name} 的关联记忆`;
+    const list = document.getElementById('entity-memory-list');
+    list.replaceChildren();
+    (data.memories || []).forEach(memory => {
+        const item = document.createElement('div');
+        item.className = 'memory-item';
+        item.style.marginBottom = '8px';
+        item.textContent = memory.content;
+        list.appendChild(item);
+    });
+    document.getElementById('entity-memory-card').style.display = 'block';
+}
+
+async function mergeSelectedEntities() {
+    const sourceId = Number(document.getElementById('entity-source').value);
+    const targetId = Number(document.getElementById('entity-target').value);
+    const status = document.getElementById('entity-status');
+    if (!sourceId || !targetId || sourceId === targetId) {
+        status.textContent = '请选择两个不同的实体。';
+        return;
+    }
+    if (!confirm('合并后，源实体会成为目标实体的别名。确定继续吗？')) return;
+    const response = await fetch('/api/entities/merge', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
+    });
+    const data = await response.json();
+    status.textContent = data.error || '实体已合并。';
+    if (response.ok) loadEntities();
+}
+
+async function backfillEntities() {
+    const status = document.getElementById('entity-status');
+    if (!confirm('将调用记忆模型处理最多 30 条尚未关联实体的旧记忆，是否继续？')) return;
+    status.textContent = '正在回填实体，请稍候…';
+    const response = await fetch('/api/entities/backfill', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 30 }),
+    });
+    const data = await response.json();
+    status.textContent = data.error || `处理 ${data.processed} 条记忆，创建 ${data.links_created} 个关联。`;
+    if (response.ok) loadEntities();
+}
+
+// ============================================
 // 全局状态
 // ============================================
 let allMemories = [];
@@ -113,6 +209,9 @@ function switchSection(name) {
     }
     if (name === 'threads') {
         loadThreads();
+    }
+    if (name === 'entities') {
+        loadEntities();
     }
     if (name === 'settings') {
         loadSettings();

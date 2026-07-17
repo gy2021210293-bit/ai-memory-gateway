@@ -26,8 +26,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories
 import drives_integration as drives
 
 # ============================================================
@@ -349,6 +350,7 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
             return SYSTEM_PROMPT
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
+        entity_map = await get_entities_for_memory_ids([mem["id"] for mem in memories])
         memory_lines = []
         for mem in memories:
             date_str = ""
@@ -360,7 +362,9 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
                     date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
                 except:
                     date_str = f"[{str(mem['created_at'])[:10]}] "
-            memory_lines.append(f"- {date_str}{mem['content']}")
+            names = [entity["name"] for entity in entity_map.get(mem["id"], [])]
+            entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
+            memory_lines.append(f"- {date_str}{mem['content']}{entity_suffix}")
         memory_text = "\n".join(memory_lines)
         
         enhanced_prompt = f"""{SYSTEM_PROMPT}
@@ -896,6 +900,7 @@ async def build_memory_text(user_message: str) -> str:
         if not memories:
             return ""
         
+        entity_map = await get_entities_for_memory_ids([mem["id"] for mem in memories])
         memory_lines = []
         for mem in memories:
             date_str = ""
@@ -907,7 +912,9 @@ async def build_memory_text(user_message: str) -> str:
                     date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
                 except:
                     date_str = f"[{str(mem['created_at'])[:10]}] "
-            memory_lines.append(f"- {date_str}{mem['content']}")
+            names = [entity["name"] for entity in entity_map.get(mem["id"], [])]
+            entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
+            memory_lines.append(f"- {date_str}{mem['content']}{entity_suffix}")
         
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
@@ -1061,11 +1068,13 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
             filtered_memories.append(mem)
         
         for mem in filtered_memories:
-            await save_memory(
+            memory_id = await save_memory(
                 content=mem["content"],
                 importance=mem["importance"],
                 source_session=session_id,
             )
+            await link_memory_entities(memory_id, mem.get("entities", []))
+            await mark_memories_entity_scanned([memory_id])
         
         if filtered_memories:
             total = await get_all_memories_count()
@@ -1585,8 +1594,10 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     memories = await get_all_memories_detail(layer=layer, active_only=active_only)
+    entity_map = await get_entities_for_memory_ids([memory["id"] for memory in memories])
     tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
     for m in memories:
+        m["entities"] = entity_map.get(m["id"], [])
         if m.get("created_at"):
             dt = m["created_at"]
             if dt.tzinfo is None:
@@ -1602,6 +1613,59 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
     if layer_stats:
         result["layer_stats"] = layer_stats
     return result
+
+
+@app.get("/api/entities")
+async def api_get_entities():
+    """List entities with aliases and linked-memory counts."""
+    return {"entities": await list_entities()}
+
+
+@app.get("/api/entities/{entity_id}/memories")
+async def api_get_entity_memories(entity_id: int):
+    return {"memories": await get_entity_memories(entity_id)}
+
+
+@app.post("/api/entities/merge")
+async def api_merge_entities(request: Request):
+    data = await request.json()
+    try:
+        source_id = int(data.get("source_id"))
+        target_id = int(data.get("target_id"))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "source_id 和 target_id 必须是整数"})
+    result = await merge_entities(source_id, target_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/entities/backfill")
+async def api_backfill_entities(request: Request):
+    """Manually extract entities for a bounded batch of legacy memories."""
+    data = await request.json()
+    try:
+        limit = max(1, min(100, int(data.get("limit", 30))))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
+    memories = await get_unlinked_memories(limit)
+    extracted = await extract_entities_from_memories(memories)
+    if extracted is None:
+        return JSONResponse(status_code=502, content={"error": "实体提取模型调用失败，未标记这些记忆，可稍后重试"})
+    linked = 0
+    memories_with_entities = 0
+    for memory in memories:
+        entities = extracted.get(memory["id"], [])
+        if entities:
+            memories_with_entities += 1
+            linked += await link_memory_entities(memory["id"], entities, source="backfill")
+    await mark_memories_entity_scanned([memory["id"] for memory in memories])
+    return {
+        "status": "ok",
+        "processed": len(memories),
+        "memories_with_entities": memories_with_entities,
+        "links_created": linked,
+    }
 
 
 @app.get("/api/memories/search")

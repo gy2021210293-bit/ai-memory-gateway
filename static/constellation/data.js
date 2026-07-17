@@ -4,9 +4,11 @@ const gatewayKey = new URLSearchParams(window.location.search).get('gateway_key'
 const AUTH = () => gatewayKey ? { headers: { 'X-Gateway-Key': gatewayKey } } : {};
 
 export const GALAXIES = [
-    { id: 'Core', hue: 45, azimuth: -90, desc: 'Long-term core memories' },
-    { id: 'Events', hue: 152, azimuth: -18, desc: 'Consolidated event memories' },
-    { id: 'Fragments', hue: 215, azimuth: 54, desc: 'Raw conversation fragments' },
+    { id: 'People', hue: 8, azimuth: -90, desc: 'People and pets' },
+    { id: 'Places', hue: 215, azimuth: -18, desc: 'Places and locations' },
+    { id: 'Projects', hue: 275, azimuth: 54, desc: 'Projects, organizations, and activities' },
+    { id: 'Events', hue: 152, azimuth: 126, desc: 'Named events and experiences' },
+    { id: 'Life', hue: 45, azimuth: 198, desc: 'Objects and other named subjects' },
 ];
 export const GALAXY_BY_ID = Object.fromEntries(GALAXIES.map(g => [g.id, g]));
 
@@ -46,10 +48,12 @@ function makeConstellation(id, label, galaxyLabel, memories) {
     const color = colorFor(galaxyLabel, label);
     return { id, label, galaxyLabel, color: color.css, rgb: color.rgb, stars: memories.map(m => starOf(m, id, label)) };
 }
-function sessionLabel(memory) {
-    const session = String(memory.source_session || '').trim();
-    if (session) return `Session ${session.slice(0, 12)}`;
-    return (memory.created_at || 'Unknown date').slice(0, 10);
+function galaxyForType(type) {
+    if (type === 'person' || type === 'pet') return 'People';
+    if (type === 'place') return 'Places';
+    if (type === 'project' || type === 'organization' || type === 'activity') return 'Projects';
+    if (type === 'event') return 'Events';
+    return 'Life';
 }
 
 export async function loadUniverse() {
@@ -60,20 +64,17 @@ export async function loadUniverse() {
     const fragments = memories.filter(m => Number(m.layer) === 1);
     const events = memories.filter(m => Number(m.layer) === 2);
     const cores = memories.filter(m => Number(m.layer) === 3);
-    const usedFragmentIds = new Set(events.flatMap(event => Array.isArray(event.merged_from) ? event.merged_from.map(Number) : []));
-    const cons = [];
+    const entityGroups = new Map();
+    memories.forEach(memory => (memory.entities || []).forEach(entity => {
+        const key = Number(entity.id);
+        if (!entityGroups.has(key)) entityGroups.set(key, { entity, memories: [] });
+        entityGroups.get(key).memories.push(memory);
+    }));
+    const cons = [...entityGroups.values()].map(({ entity, memories: linked }) =>
+        makeConstellation(`n${entity.id}`, entity.name, galaxyForType(entity.type), linked));
 
-    events.forEach(event => {
-        const linked = fragments.filter(fragment => (Array.isArray(event.merged_from) ? event.merged_from : []).map(Number).includes(Number(fragment.id)));
-        cons.push(makeConstellation(`e${event.id}`, titleOf(event), 'Events', linked.length ? linked : [event]));
-    });
-    const groups = new Map();
-    fragments.filter(m => !usedFragmentIds.has(Number(m.id))).forEach(fragment => {
-        const label = sessionLabel(fragment);
-        if (!groups.has(label)) groups.set(label, []);
-        groups.get(label).push(fragment);
-    });
-    groups.forEach((items, label) => cons.push(makeConstellation(`f${strHash(label)}`, label, 'Fragments', items)));
+    const unlinked = memories.filter(memory => !(memory.entities || []).length && Number(memory.layer) < 3);
+    if (unlinked.length) cons.push(makeConstellation('unlinked', 'Unlinked memories', 'Life', unlinked));
 
     universe.constellations = cons;
     universe.core = [

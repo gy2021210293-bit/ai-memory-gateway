@@ -17,7 +17,7 @@ import os
 import json
 import re
 import httpx
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -118,6 +118,17 @@ importance 分数 1-10，10 最重要。
 """
 
 
+ENTITY_OUTPUT_GUIDANCE = """
+
+For every returned memory object, also return an `entities` array. Each entity must be a
+specific named person, place, organization, project, object, pet, activity, or event that
+is explicitly present in that memory. Do not invent entities and do not use pronouns or
+generic nouns. Format each entity as {"name": "display name", "type":
+"person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0-1.0}.
+If no explicit named entity exists, return an empty array.
+"""
+
+
 async def extract_memories(messages: List[Dict[str, str]], existing_memories: List[str] = None) -> List[Dict]:
     """
     从对话消息中提取记忆
@@ -157,7 +168,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         memories_text = "（暂无已知信息）"
 
     # 把已有记忆填入prompt
-    prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text)
+    prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text) + ENTITY_OUTPUT_GUIDANCE
 
     # 调用 LLM 提取记忆
     try:
@@ -235,6 +246,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                     valid_memories.append({
                         "content": str(mem["content"]),
                         "importance": int(mem.get("importance", 5)),
+                        "entities": [entity for entity in mem.get("entities", []) if isinstance(entity, (dict, str))],
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")
@@ -246,6 +258,46 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     except Exception as e:
         print(f"⚠️  记忆提取出错: {e}")
         return []
+
+
+async def extract_entities_from_memories(memories: List[Dict]) -> Optional[Dict[int, List[Dict]]]:
+    """Entity-only extraction for an explicitly requested legacy-memory backfill."""
+    if not memories:
+        return {}
+    if not get_memory_api_key():
+        return None
+    items = "\n".join(f"[{int(item['id'])}] {item['content']}" for item in memories)
+    prompt = f"""Extract only explicit named entities from these memory records.
+Return JSON in this format:
+[{{"memory_id": 1, "entities": [{{"name": "...", "type": "person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0}}]}}]
+Omit records without entities. Do not use pronouns or generic nouns. Do not invent names.
+
+{items}"""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                json={"model": MEMORY_MODEL, "temperature": 0, "max_tokens": 2000,
+                      "messages": [{"role": "user", "content": prompt}]},
+            )
+        if response.status_code != 200:
+            print(f"⚠️ 实体回填请求失败: {response.status_code} {response.text[:200]}")
+            return None
+        text = _extract_response_content(response.json()).strip()
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.IGNORECASE)
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        parsed = json.loads(match.group() if match else text)
+        allowed_ids = {int(item["id"]) for item in memories}
+        result = {}
+        for item in parsed if isinstance(parsed, list) else []:
+            memory_id = int(item.get("memory_id", 0))
+            if memory_id in allowed_ids:
+                result[memory_id] = [entity for entity in item.get("entities", []) if isinstance(entity, (dict, str))]
+        return result
+    except Exception as exc:
+        print(f"⚠️ 实体回填解析失败: {exc}")
+        return None
 
 
 SCORING_PROMPT = """你是记忆重要性评分专家。请对以下记忆条目逐条评分。

@@ -39,6 +39,10 @@
                     <span class="nav-icon">✦</span>
                     <span class="nav-label">记忆星图</span>
                 </a>
+                <a href="#" class="nav-item" data-section="entities">
+                    <span class="nav-icon">◎</span>
+                    <span class="nav-label">实体管理</span>
+                </a>
                 <a href="#" class="nav-item" data-section="settings">
                     <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></span>
                     <span class="nav-label">设置</span>
@@ -446,6 +450,32 @@
                 <div class="constellation-shell">
                     <div id="constellation-map" aria-label="记忆星图"></div>
                     <aside id="constellation-detail"><p>选择一颗星，查看它承载的记忆。</p></aside>
+                </div>
+            </section>
+
+            <section id="section-entities" class="section">
+                <div class="section-header">
+                    <h1>实体管理</h1>
+                    <p class="section-desc">查看记忆中的人物、地点、项目与事件，并合并重复实体。</p>
+                </div>
+                <div class="card toolbar-card">
+                    <div class="toolbar">
+                        <button class="btn btn-primary" onclick="backfillEntities()">回填旧记忆（最多30条）</button>
+                        <span id="entity-status" class="section-desc"></span>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="toolbar">
+                        <select id="entity-source" class="input"><option value="">选择要合并的实体</option></select>
+                        <span>合并到</span>
+                        <select id="entity-target" class="input"><option value="">选择保留的实体</option></select>
+                        <button class="btn btn-secondary" onclick="mergeSelectedEntities()">合并实体</button>
+                    </div>
+                    <div id="entity-list" style="margin-top:16px"></div>
+                </div>
+                <div class="card" id="entity-memory-card" style="display:none">
+                    <h3 id="entity-memory-title">关联记忆</h3>
+                    <div id="entity-memory-list"></div>
                 </div>
             </section>
 

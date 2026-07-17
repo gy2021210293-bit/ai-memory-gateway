@@ -217,6 +217,48 @@ async def init_tables():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_event_date ON memories (event_date);
         """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'memories' AND column_name = 'entity_scanned'
+                ) THEN
+                    ALTER TABLE memories ADD COLUMN entity_scanned BOOLEAN DEFAULT FALSE;
+                END IF;
+            END $$;
+        """)
+
+        # ---- 实体层：实体、别名、记忆关联 ----
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id              SERIAL PRIMARY KEY,
+                name            TEXT NOT NULL,
+                normalized_name TEXT NOT NULL UNIQUE,
+                entity_type     TEXT NOT NULL DEFAULT 'other',
+                description     TEXT DEFAULT '',
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                entity_id       INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                alias           TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (entity_id, normalized_alias)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id       INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                entity_id       INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                confidence      REAL NOT NULL DEFAULT 1.0,
+                source          TEXT NOT NULL DEFAULT 'extractor',
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (memory_id, entity_id)
+            );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities (entity_id);")
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -1490,6 +1532,16 @@ async def create_event_memory(title: str, content: str, importance: int,
         """, content, importance, title, merged_from, event_date)
         
         new_id = row['id'] if row else None
+
+        if new_id and merged_from:
+            await conn.execute("""
+                INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
+                SELECT $1, entity_id, MAX(confidence), 'inherited'
+                FROM memory_entities WHERE memory_id = ANY($2::int[])
+                GROUP BY entity_id
+                ON CONFLICT (memory_id, entity_id) DO UPDATE SET
+                    confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence)
+            """, new_id, merged_from)
         
         # 向量搜索：计算并保存 embedding
         if MEMORY_VECTOR_ENABLED and new_id:
@@ -1554,6 +1606,16 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
         """, new_content, importance, layer, new_title, memory_ids, event_date)
         
         new_id = row['id'] if row else None
+
+        if new_id:
+            await conn.execute("""
+                INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
+                SELECT $1, entity_id, MAX(confidence), 'inherited'
+                FROM memory_entities WHERE memory_id = ANY($2::int[])
+                GROUP BY entity_id
+                ON CONFLICT (memory_id, entity_id) DO UPDATE SET
+                    confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence)
+            """, new_id, memory_ids)
         
         # 向量搜索：计算并保存 embedding
         if MEMORY_VECTOR_ENABLED and new_id:
@@ -1797,3 +1859,159 @@ async def revert_merge(memory_id: int):
         """, memory_id)
         
         return {"status": "ok", "restored": restored}
+
+
+# ============================================================
+# 实体层
+# ============================================================
+
+def normalize_entity_name(name: str) -> str:
+    """Generate the canonical lookup key without changing the display name."""
+    return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
+
+
+async def link_memory_entities(memory_id: int, entities: list, source: str = "extractor"):
+    """Upsert extracted entities and link them to one memory."""
+    if not memory_id or not entities:
+        return 0
+    pool = await get_pool()
+    linked = 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for item in entities:
+                if isinstance(item, str):
+                    item = {"name": item, "type": "other"}
+                name = str(item.get("name", "")).strip()
+                normalized = normalize_entity_name(name)
+                if not normalized:
+                    continue
+                entity_type = str(item.get("type", "other") or "other").strip().lower()
+                allowed_types = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}
+                if entity_type not in allowed_types:
+                    entity_type = "other"
+                try:
+                    confidence = max(0.0, min(1.0, float(item.get("confidence", 1.0))))
+                except (TypeError, ValueError):
+                    confidence = 1.0
+                row = await conn.fetchrow("""
+                    INSERT INTO entities (name, normalized_name, entity_type)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (normalized_name) DO UPDATE SET
+                        entity_type = CASE WHEN entities.entity_type = 'other' THEN EXCLUDED.entity_type ELSE entities.entity_type END,
+                        updated_at = NOW()
+                    RETURNING id
+                """, name, normalized, entity_type)
+                await conn.execute("""
+                    INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (memory_id, entity_id) DO UPDATE SET
+                        confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence),
+                        source = EXCLUDED.source
+                """, memory_id, row["id"], confidence, source)
+                linked += 1
+    return linked
+
+
+async def get_entities_for_memory_ids(memory_ids: list) -> dict:
+    if not memory_ids:
+        return {}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT me.memory_id, e.id, e.name, e.entity_type, me.confidence
+            FROM memory_entities me
+            JOIN entities e ON e.id = me.entity_id
+            WHERE me.memory_id = ANY($1::int[])
+            ORDER BY me.memory_id, me.confidence DESC, e.name
+        """, [int(memory_id) for memory_id in memory_ids])
+    result = {}
+    for row in rows:
+        result.setdefault(row["memory_id"], []).append({
+            "id": row["id"], "name": row["name"], "type": row["entity_type"],
+            "confidence": row["confidence"],
+        })
+    return result
+
+
+async def list_entities():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.name, e.entity_type, e.description, e.created_at, e.updated_at,
+                   COUNT(DISTINCT me.memory_id)::int AS memory_count,
+                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+            FROM entities e
+            LEFT JOIN memory_entities me ON me.entity_id = e.id
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            GROUP BY e.id
+            ORDER BY memory_count DESC, e.name
+        """)
+        return [dict(row) for row in rows]
+
+
+async def get_entity_memories(entity_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT m.id, m.content, m.importance, m.source_session, m.created_at,
+                   m.layer, m.title, m.is_active, me.confidence
+            FROM memory_entities me
+            JOIN memories m ON m.id = me.memory_id
+            WHERE me.entity_id = $1
+            ORDER BY m.created_at DESC
+        """, entity_id)
+        return [dict(row) for row in rows]
+
+
+async def get_unlinked_memories(limit: int = 30):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT m.id, m.content
+            FROM memories m
+            WHERE m.is_active = TRUE AND COALESCE(m.entity_scanned, FALSE) = FALSE
+              AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id)
+            ORDER BY m.id
+            LIMIT $1
+        """, limit)
+        return [dict(row) for row in rows]
+
+
+async def mark_memories_entity_scanned(memory_ids: list):
+    if not memory_ids:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE memories SET entity_scanned = TRUE WHERE id = ANY($1::int[])",
+            [int(memory_id) for memory_id in memory_ids],
+        )
+
+
+async def merge_entities(source_id: int, target_id: int):
+    if source_id == target_id:
+        return {"error": "源实体和目标实体不能相同"}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            source = await conn.fetchrow("SELECT id, name, normalized_name FROM entities WHERE id = $1", source_id)
+            target = await conn.fetchrow("SELECT id FROM entities WHERE id = $1", target_id)
+            if not source or not target:
+                return {"error": "实体不存在"}
+            await conn.execute("""
+                INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
+                SELECT memory_id, $2, confidence, source FROM memory_entities WHERE entity_id = $1
+                ON CONFLICT (memory_id, entity_id) DO UPDATE SET
+                    confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence)
+            """, source_id, target_id)
+            await conn.execute("""
+                INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
+                SELECT $2, alias, normalized_alias FROM entity_aliases WHERE entity_id = $1
+                ON CONFLICT (normalized_alias) DO NOTHING
+            """, source_id, target_id)
+            await conn.execute("""
+                INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
+                VALUES ($1, $2, $3) ON CONFLICT (normalized_alias) DO NOTHING
+            """, target_id, source["name"], source["normalized_name"])
+            await conn.execute("DELETE FROM entities WHERE id = $1", source_id)
+    return {"status": "ok", "source_id": source_id, "target_id": target_id}
