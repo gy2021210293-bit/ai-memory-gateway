@@ -611,7 +611,7 @@
                 <!-- 搜索权重 -->
                 <div class="card settings-card">
                     <h3 class="settings-group-title">搜索权重</h3>
-                    <small class="form-hint" style="display:block;margin-bottom:12px;">四项权重之和建议为 1.0</small>
+                    <small class="form-hint" style="display:block;margin-bottom:12px;">前四项权重之和建议为 1.0；实体权重作为命中加成。</small>
                     <div class="settings-field">
                         <label>关键词权重 <span class="slider-val" id="val-MEMORY_HW_KEYWORD"></span></label>
                         <input type="range" id="set-MEMORY_HW_KEYWORD" min="0" max="1" step="0.05" oninput="updateSliderVal('MEMORY_HW_KEYWORD')">
@@ -627,6 +627,10 @@
                     <div class="settings-field">
                         <label>时效性权重 <span class="slider-val" id="val-MEMORY_HW_RECENCY"></span></label>
                         <input type="range" id="set-MEMORY_HW_RECENCY" min="0" max="1" step="0.05" oninput="updateSliderVal('MEMORY_HW_RECENCY')">
+                    </div>
+                    <div class="settings-field">
+                        <label>实体命中加成 <span class="slider-val" id="val-MEMORY_HW_ENTITY"></span></label>
+                        <input type="range" id="set-MEMORY_HW_ENTITY" min="0" max="1" step="0.05" oninput="updateSliderVal('MEMORY_HW_ENTITY')">
                     </div>
                     <div class="settings-field">
                         <label>语义阈值 <span class="slider-val" id="val-MEMORY_SEMANTIC_THRESHOLD"></span></label>

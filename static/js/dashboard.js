@@ -463,7 +463,10 @@ async function semanticSearch() {
         if (paginationEl) paginationEl.innerHTML = '';
         
         const scoreInfo = results.length > 0 
-            ? results.map(r => `#${r.id}(${(r.score || 0).toFixed(3)})`).join(', ')
+            ? results.map(r => {
+                const entities = (r.matched_entities || []).map(entity => entity.name).join('/');
+                return `#${r.id}(${(r.score || 0).toFixed(3)}${entities ? ` · ${entities}` : ''})`;
+            }).join(', ')
             : '';
         
         document.getElementById('stats').innerHTML = 
@@ -1999,7 +2002,7 @@ const _SETTINGS_FIELDS = {
     float: ['MIN_SCORE_THRESHOLD'],
     bool: ['MEMORY_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM'],
     range: ['MEMORY_HW_KEYWORD', 'MEMORY_HW_SEMANTIC', 'MEMORY_HW_IMPORTANCE',
-            'MEMORY_HW_RECENCY', 'MEMORY_SEMANTIC_THRESHOLD'],
+            'MEMORY_HW_RECENCY', 'MEMORY_HW_ENTITY', 'MEMORY_SEMANTIC_THRESHOLD'],
     text: ['systemPrompt'],
 };
 

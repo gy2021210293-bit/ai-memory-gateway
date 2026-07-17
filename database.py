@@ -42,6 +42,7 @@ MEMORY_HW_SEMANTIC = float(os.getenv("MEMORY_HW_SEMANTIC", "0.35"))
 MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
+MEMORY_HW_ENTITY = float(os.getenv("MEMORY_HW_ENTITY", "0.25"))
 
 
 # ============================================================
@@ -488,7 +489,8 @@ def _min_max_normalize(scores: dict) -> dict:
     min_v, max_v = min(vals), max(vals)
     spread = max_v - min_v
     if spread == 0:
-        return {k: 1.0 for k in scores}
+        value = 1.0 if max_v > 0 else 0.0
+        return {k: value for k in scores}
     return {k: (v - min_v) / spread for k, v in scores.items()}
 
 
@@ -661,12 +663,90 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
         return row["id"] if row else None
 
 
+async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limit: int):
+    """Return memories reached through an entity name or alias match."""
+    normalized_query = normalize_entity_name(query)
+    terms = list(dict.fromkeys(
+        term for term in [normalized_query, *(normalize_entity_name(k) for k in keywords)] if term
+    ))
+    if not terms:
+        return {}
+    rows = await conn.fetch("""
+        SELECT m.id, m.content, m.importance, m.created_at, m.layer, m.title,
+               e.id AS entity_id, e.name AS entity_name, e.normalized_name,
+               e.entity_type, e.description,
+               COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
+               COALESCE(array_agg(DISTINCT ea.normalized_alias) FILTER (WHERE ea.normalized_alias IS NOT NULL), ARRAY[]::text[]) AS normalized_aliases
+        FROM entities e
+        LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+        JOIN memory_entities me ON me.entity_id = e.id
+        JOIN memories m ON m.id = me.memory_id
+        WHERE m.is_active = TRUE AND EXISTS (
+            SELECT 1 FROM unnest($1::text[]) AS term
+            WHERE e.normalized_name LIKE '%' || term || '%'
+               OR term LIKE '%' || e.normalized_name || '%'
+               OR ea.normalized_alias LIKE '%' || term || '%'
+               OR term LIKE '%' || ea.normalized_alias || '%'
+        )
+        GROUP BY m.id, e.id
+        ORDER BY m.importance DESC, m.created_at DESC
+        LIMIT $2
+    """, terms, max(limit * 10, 30))
+    candidates = {}
+    for row in rows:
+        names = [row["normalized_name"], *(row["normalized_aliases"] or [])]
+        exact = any(name in terms for name in names)
+        phrase = any(name and name in normalized_query for name in names)
+        entity_score = 1.0 if exact else 0.9 if phrase else 0.7
+        entity = {
+            "id": row["entity_id"], "name": row["entity_name"], "type": row["entity_type"],
+            "description": row["description"] or "", "aliases": list(row["aliases"] or []),
+        }
+        item = candidates.setdefault(row["id"], {
+            "content": row["content"], "importance": row["importance"],
+            "created_at": row["created_at"], "layer": row["layer"] or 1, "title": row["title"],
+            "entity_score": 0.0, "matched_entities": [],
+        })
+        item["entity_score"] = max(item["entity_score"], entity_score)
+        if not any(existing["id"] == entity["id"] for existing in item["matched_entities"]):
+            item["matched_entities"].append(entity)
+    return candidates
+
+
+async def _attach_entity_context(conn, results: list):
+    """Attach all linked entities while preserving which entities caused recall."""
+    if not results:
+        return results
+    ids = [int(result["id"]) for result in results]
+    rows = await conn.fetch("""
+        SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description,
+               COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+        FROM memory_entities me
+        JOIN entities e ON e.id = me.entity_id
+        LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+        WHERE me.memory_id = ANY($1::int[])
+        GROUP BY me.memory_id, me.confidence, e.id
+        ORDER BY me.memory_id, me.confidence DESC, e.name
+    """, ids)
+    by_memory = {}
+    for row in rows:
+        by_memory.setdefault(row["memory_id"], []).append({
+            "id": row["id"], "name": row["name"], "type": row["entity_type"],
+            "description": row["description"] or "", "aliases": list(row["aliases"] or []),
+            "confidence": row["confidence"],
+        })
+    for result in results:
+        result["entities"] = by_memory.get(result["id"], [])
+        result.setdefault("matched_entities", [])
+        result.setdefault("entity_score", 0.0)
+    return results
+
+
 async def search_memories(query: str, limit: int = 10):
     """
     搜索相关记忆
     
-    MEMORY_VECTOR_ENABLED=true 时走混合搜索（关键词 + 向量）
-    否则走纯关键词搜索
+    始终启用关键词 + 实体聚合；MEMORY_VECTOR_ENABLED=true 时再加入向量召回。
     """
     if MEMORY_VECTOR_ENABLED:
         return await search_memories_hybrid(query, limit)
@@ -674,11 +754,32 @@ async def search_memories(query: str, limit: int = 10):
     # ---- 纯关键词搜索 ----
     keywords = extract_search_keywords(query)
     
-    if not keywords:
-        return []
-    
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if not keywords:
+            entity_candidates = await _fetch_entity_search_candidates(conn, query, [], limit)
+            now = datetime.now(dt_timezone.utc)
+            results = []
+            for memory_id, info in entity_candidates.items():
+                days = max(0.0, (now - info["created_at"]).total_seconds() / 86400.0)
+                results.append({
+                    "id": memory_id, "content": info["content"], "importance": info["importance"],
+                    "created_at": info["created_at"], "hit_count": 0,
+                    "layer": info["layer"], "title": info["title"],
+                    "entity_score": info["entity_score"], "matched_entities": info["matched_entities"],
+                    "score": (WEIGHT_IMPORTANCE * info["importance"] / 10.0 +
+                              WEIGHT_RECENCY / (1.0 + days) + MEMORY_HW_ENTITY * info["entity_score"]),
+                })
+            results.sort(key=lambda row: (-row["score"], -row["importance"]))
+            results = results[:limit]
+            await _attach_entity_context(conn, results)
+            if results:
+                await conn.execute(
+                    "UPDATE memories SET last_accessed = NOW() WHERE id = ANY($1::int[])",
+                    [row["id"] for row in results],
+                )
+            return results
+
         # 每个关键词命中得1分
         case_parts = []
         params = []
@@ -694,11 +795,11 @@ async def search_memories(query: str, limit: int = 10):
         where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
         
         limit_idx = len(keywords) + 1
-        params.append(limit)
+        params.append(limit * 3)
         
         sql = f"""
             SELECT 
-                id, content, importance, created_at,
+                id, content, importance, created_at, layer, title,
                 ({hit_count_expr}) AS hit_count,
                 (
                     {WEIGHT_KEYWORD} * ({hit_count_expr})::float / {max_hits}.0 +
@@ -711,15 +812,36 @@ async def search_memories(query: str, limit: int = 10):
             LIMIT ${limit_idx}
         """
         
-        results = await conn.fetch(sql, *params)
-        
-        # 过滤低分记忆
+        keyword_rows = await conn.fetch(sql, *params)
+        candidates = {row["id"]: dict(row) for row in keyword_rows}
+        entity_candidates = await _fetch_entity_search_candidates(conn, query, keywords, limit)
+        now = datetime.now(dt_timezone.utc)
+        for memory_id, entity_info in entity_candidates.items():
+            if memory_id in candidates:
+                candidates[memory_id]["score"] = min(
+                    1.5, float(candidates[memory_id]["score"]) + MEMORY_HW_ENTITY * entity_info["entity_score"]
+                )
+            else:
+                days = max(0.0, (now - entity_info["created_at"]).total_seconds() / 86400.0)
+                candidates[memory_id] = {
+                    "id": memory_id, "content": entity_info["content"],
+                    "importance": entity_info["importance"], "created_at": entity_info["created_at"],
+                    "layer": entity_info["layer"], "title": entity_info["title"],
+                    "hit_count": 0,
+                    "score": (WEIGHT_IMPORTANCE * entity_info["importance"] / 10.0 +
+                              WEIGHT_RECENCY * (1.0 / (1.0 + days)) +
+                              MEMORY_HW_ENTITY * entity_info["entity_score"]),
+                }
+            candidates[memory_id]["entity_score"] = entity_info["entity_score"]
+            candidates[memory_id]["matched_entities"] = entity_info["matched_entities"]
+
+        results = sorted(candidates.values(), key=lambda row: (-float(row["score"]), -row["importance"]))
+        before_count = len(results)
         if MIN_SCORE_THRESHOLD > 0:
-            before_count = len(results)
-            results = [r for r in results if r['score'] >= MIN_SCORE_THRESHOLD]
-            filtered = before_count - len(results)
-        else:
-            filtered = 0
+            results = [row for row in results if float(row["score"]) >= MIN_SCORE_THRESHOLD]
+        filtered = before_count - len(results)
+        results = results[:limit]
+        await _attach_entity_context(conn, results)
         
         if results:
             print(f"🔍 搜索 '{query}' → 关键词 {keywords[:8]}{'...' if len(keywords)>8 else ''} → 命中 {len(results)} 条" + (f"（过滤 {filtered} 条低分）" if filtered else ""))
@@ -739,17 +861,14 @@ async def search_memories(query: str, limit: int = 10):
 
 async def search_memories_hybrid(query: str, limit: int = 10):
     """
-    记忆混合搜索：关键词 + 向量，归一化后四维加权
+    记忆聚合搜索：关键词 + 向量 + 实体，结合重要度与时间衰减排序。
     
-    权重：MEMORY_HW_KEYWORD + MEMORY_HW_SEMANTIC + MEMORY_HW_IMPORTANCE + MEMORY_HW_RECENCY
+    实体命中使用 MEMORY_HW_ENTITY 作为现有综合分数之外的加成。
     """
     from datetime import datetime, timezone
     
     keywords = extract_search_keywords(query)
     query_embedding = await compute_embedding(query) if EMBEDDING_API_KEY else []
-    
-    if not keywords and not query_embedding:
-        return []
     
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -772,7 +891,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             params.append(limit * 3)
             
             kw_sql = f"""
-                SELECT id, content, importance, created_at,
+                SELECT id, content, importance, created_at, layer, title,
                        ({hit_count_expr}) AS hit_count,
                        ({hit_count_expr})::float / {max_hits}.0 AS kw_score
                 FROM memories
@@ -787,6 +906,8 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                     'content': r['content'],
                     'importance': r['importance'],
                     'created_at': r['created_at'],
+                    'layer': r['layer'] or 1,
+                    'title': r['title'],
                     'hit_count': r['hit_count'],
                     'kw_score': float(r['kw_score']),
                     'similarity': 0.0,
@@ -797,7 +918,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             if HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
                 sem_rows = await conn.fetch("""
-                    SELECT id, content, importance, created_at,
+                    SELECT id, content, importance, created_at, layer, title,
                            1 - (embedding <=> $1::vector) as similarity
                     FROM memories
                     WHERE embedding IS NOT NULL AND is_active = TRUE
@@ -808,7 +929,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 # Python端计算cosine
                 import json
                 all_mem = await conn.fetch("""
-                    SELECT id, content, importance, created_at, embedding_json
+                    SELECT id, content, importance, created_at, layer, title, embedding_json
                     FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
                 """)
                 
@@ -835,6 +956,8 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                         'content': r['content'],
                         'importance': r['importance'],
                         'created_at': r['created_at'],
+                        'layer': r['layer'] or 1,
+                        'title': r['title'],
                         'hit_count': 0,
                         'kw_score': 0.0,
                         'similarity': sim,
@@ -848,20 +971,42 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 print(f"   🔢 向量路: {sem_total}条候选全被阈值过滤（最高sim={sem_max:.3f}, 阈值={MEMORY_SEMANTIC_THRESHOLD}）")
             elif sem_total > 0:
                 print(f"   🔢 向量路: {sem_passed}/{sem_total}条通过阈值（最高sim={sem_max:.3f}）")
+
+        # ---- 实体路：正式名/别名命中后召回该实体的所有活跃记忆 ----
+        entity_candidates = await _fetch_entity_search_candidates(conn, query, keywords, limit)
+        for memory_id, entity_info in entity_candidates.items():
+            if memory_id in candidates:
+                candidates[memory_id]["entity_score"] = entity_info["entity_score"]
+                candidates[memory_id]["matched_entities"] = entity_info["matched_entities"]
+            else:
+                candidates[memory_id] = {
+                    "content": entity_info["content"],
+                    "importance": entity_info["importance"],
+                    "created_at": entity_info["created_at"],
+                    "layer": entity_info["layer"],
+                    "title": entity_info["title"],
+                    "hit_count": 0,
+                    "kw_score": 0.0,
+                    "similarity": 0.0,
+                    "entity_score": entity_info["entity_score"],
+                    "matched_entities": entity_info["matched_entities"],
+                }
         
         if not candidates:
-            print(f"🔍 混合搜索 '{query}' → 两路均无结果")
+            print(f"🔍 聚合搜索 '{query}' → 关键词、向量、实体三路均无结果")
             return []
         
         # ---- 归一化 + 加权 ----
         kw_norm = _min_max_normalize({mid: v['kw_score'] for mid, v in candidates.items()})
         sem_norm = _min_max_normalize({mid: v['similarity'] for mid, v in candidates.items()})
+        entity_norm = _min_max_normalize({mid: v.get('entity_score', 0.0) for mid, v in candidates.items()})
         
         now = datetime.now(timezone.utc)
         final = []
         for mid, info in candidates.items():
             kw = kw_norm.get(mid, 0.0)
             sem = sem_norm.get(mid, 0.0)
+            entity_score = entity_norm.get(mid, 0.0)
             imp = info['importance'] / 10.0
             days = (now - info['created_at']).total_seconds() / 86400.0
             rec = 1.0 / (1.0 + days)
@@ -869,15 +1014,20 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             score = (MEMORY_HW_KEYWORD * kw +
                      MEMORY_HW_SEMANTIC * sem +
                      MEMORY_HW_IMPORTANCE * imp +
-                     MEMORY_HW_RECENCY * rec)
+                     MEMORY_HW_RECENCY * rec +
+                     MEMORY_HW_ENTITY * entity_score)
             
             final.append({
                 'id': mid,
                 'content': info['content'],
                 'importance': info['importance'],
                 'created_at': info['created_at'],
+                'layer': info.get('layer', 1),
+                'title': info.get('title'),
                 'hit_count': info['hit_count'],
                 'similarity': info['similarity'],
+                'entity_score': info.get('entity_score', 0.0),
+                'matched_entities': info.get('matched_entities', []),
                 'score': score,
             })
         
@@ -892,13 +1042,14 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             filtered = 0
         
         results = final[:limit]
+        await _attach_entity_context(conn, results)
         
         if results:
             mode_tag = "混合" if query_embedding else "关键词"
             kw_tag = f"关键词 {keywords[:6]}" if keywords else "无关键词"
             print(f"🔍 {mode_tag}搜索 '{query}' → {kw_tag} → 命中 {len(results)} 条" + (f"（过滤 {filtered} 条低分）" if filtered else ""))
             for r in results[:3]:
-                print(f"   📌 [score={r['score']:.3f}] (kw={r['hit_count']}, sim={r['similarity']:.2f}, imp={r['importance']}) {r['content'][:60]}...")
+                print(f"   📌 [score={r['score']:.3f}] (kw={r['hit_count']}, sim={r['similarity']:.2f}, entity={r['entity_score']:.2f}, imp={r['importance']}) {r['content'][:60]}...")
             
             ids = [r["id"] for r in results]
             await conn.execute(

@@ -20,7 +20,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有 API 端点需要携带密钥。Dashboard 通过 URL 参数传递密钥，自动注入后续请求
 - **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入
 - **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
-- **记忆向量搜索（可选）** — 关键词 + 语义向量四维混合搜索，说"过年"能搜到"春节"。支持 OpenAI 兼容的 Embedding API
+- **聚合记忆检索** — 关键词、可选语义向量和实体名称/别名三路召回；实体命中会聚合其碎片、事件与核心记忆
 - **设置面板** — 在 Dashboard 中直接管理所有运行时配置，热更新无需重启。支持模型列表动态拉取、可搜索下拉选择
 - **零成本起步** — 可部署在 Render、Zeabur 等平台的免费额度内
 
@@ -252,7 +252,7 @@ ai-memory-gateway/
 
 提取记忆时，网关会把客户端发来的完整对话上下文（不含 system prompt）传给提取模型，这样能捕捉到跨轮次的信息。通过 `MEMORY_EXTRACT_INTERVAL` 可以控制提取频率：设为 0 禁用自动提取，设为 1 每轮都提，设为 N 则每 N 轮提取一次（适合控制成本）。
 
-> **关于向量搜索：** 当前版本支持可选的记忆向量搜索功能。默认使用 jieba 中文分词 + 关键词匹配（ILIKE），适合大多数场景。如果需要语义搜索（说"过年"能搜到"春节"），可以设置 `MEMORY_VECTOR_ENABLED=true` + `EMBEDDING_API_KEY`，系统会同时走关键词和向量两路搜索，四维加权排序。支持任何 OpenAI 兼容的 Embedding API（OpenAI、Jina、Voyage、本地 Ollama 等）。如果数据库支持 pgvector 扩展会自动启用，否则回退到 Python 端计算余弦相似度。
+> **关于聚合搜索：** 关键词和实体名称/别名召回始终启用；实体命中会召回该实体关联的碎片、事件和核心记忆。设置 `MEMORY_VECTOR_ENABLED=true` + `EMBEDDING_API_KEY` 后再加入语义向量一路。支持任何 OpenAI 兼容的 Embedding API；数据库支持 pgvector 时自动启用，否则回退到 Python 端计算余弦相似度。
 
 **向量搜索环境变量（可选）：**
 
@@ -267,6 +267,7 @@ ai-memory-gateway/
 | `MEMORY_HW_SEMANTIC` | 混合搜索：语义相似度权重 | `0.35` |
 | `MEMORY_HW_IMPORTANCE` | 混合搜索：重要程度权重 | `0.15` |
 | `MEMORY_HW_RECENCY` | 混合搜索：时间衰减权重 | `0.15` |
+| `MEMORY_HW_ENTITY` | 实体正式名或别名命中后的聚合召回加成 | `0.25` |
 | `MEMORY_SEMANTIC_THRESHOLD` | 向量相似度阈值 | `0.5` |
 
 开启后，新记忆会自动计算 embedding。已有记忆可以在 Dashboard 记忆管理页面点击「开始补算」一键补算。
@@ -310,7 +311,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
   - 记忆系统（开关、提取模型、注入条数、分数阈值、提取间隔）
   - 缓存分区（开关、轮转周期、摘要模型）
   - 向量搜索（开关、Embedding API Key/Base URL/模型/维度）
-  - 搜索权重（四维权重滑块 + 语义阈值）
+  - 搜索权重（四项基础权重 + 实体命中加成 + 语义阈值）
   - 其他（强制流式、推理强度）
   - System Prompt（在线编辑，实时字数统计）
 - **模型列表 API** — 新增 `/api/models` 端点，根据 API 服务商（OpenRouter/Google/OpenAI）自动拉取可用模型列表，设置面板的模型选择框支持搜索过滤
@@ -326,7 +327,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 - **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有非公开端点需要携带 `X-Gateway-Key` 请求头或 `?gateway_key=` URL 参数。未设置时跳过鉴权（兼容旧部署）
 - **Dashboard 全面升级** — 分层 Tab 标签页（全部/核心/事件/碎片 + 计数）、层级下拉选择器、标题编辑、底部浮动操作栏（选中后出现）、整理弹窗、合并弹窗、查看合并来源弹窗
 - **去重检查** — 新增三层去重策略（精确匹配 → 包含关系 → Jaccard 相似度），API 可调阈值
-- **搜索过滤** — 所有搜索路径（关键词 + 向量）自动跳过已归档记忆
+- **搜索过滤** — 所有搜索路径（关键词 + 向量 + 实体）自动跳过已归档记忆
 
 ### v3.2（2026-05-04）
 
@@ -342,7 +343,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 
 ### v3.1（2026-05-02）
 
-- **记忆向量搜索** — 支持关键词 + 语义向量四维混合搜索（关键词、语义相似度、重要程度、时间衰减），`MEMORY_VECTOR_ENABLED=true` 开启。使用 OpenAI 兼容的 Embedding API，支持 OpenAI、Jina、Voyage、本地 Ollama 等
+- **聚合记忆检索** — 关键词、实体名称/别名与可选语义向量三路召回，结合重要程度、时间衰减和实体命中加成排序；向量一路由 `MEMORY_VECTOR_ENABLED=true` 开启
 - **自动 embedding** — 新记忆保存时自动计算 embedding，已有记忆可在 Dashboard 一键补算（带进度条）
 - **pgvector 自动检测** — 数据库支持 pgvector 扩展时自动启用，否则回退到 Python 端余弦相似度计算
 - **分区缓存优化** — 摘要区改用 content block 数组尾部追加，轮转时前面的摘要 block 缓存命中。轮计数改为按逻辑轮分组，兼容 tool 调用消息（一轮中无论包含多少 tool 消息都不会切错分区）

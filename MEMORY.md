@@ -14,6 +14,7 @@
 - SiliconFlow can be used through its OpenAI-compatible APIs for both chat and embeddings; semantic retrieval should remain attached to the gateway's existing vector-search path.
 - The constellation is a read-only `/constellation` page. It reuses the original project's canvas renderer and visual styling while consuming the gateway's `/api/memories`; visualization does not maintain a separate memory database.
 - Entity MVP uses PostgreSQL `entities`, `entity_aliases`, and `memory_entities` as the canonical entity layer. New extracted memories carry explicit named entities into these tables; legacy memories are only backfilled through the bounded manual Dashboard action, with `memories.entity_scanned` preventing repeat charges for entity-free records. Retrieval prompt entries include linked entity names, and the star map now treats entities as constellations across People, Places, Projects, Events, and Life galaxies.
+- Retrieval is entity-aware: `search_memories()` combines keyword candidates, optional vector candidates, and entity name/alias candidates. Entity hits recall linked active memories across layers 1/2/3, add `MEMORY_HW_ENTITY` to ranking, attach entity metadata to results, and inject one deduplicated matched-entity overview before the recalled memories.
 
 ## Open questions
 

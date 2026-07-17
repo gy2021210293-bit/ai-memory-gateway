@@ -213,6 +213,7 @@ async def lifespan(app: FastAPI):
                         "MEMORY_VECTOR_ENABLED": lambda v: _parse_bool(v),
                         "MEMORY_HW_KEYWORD": float, "MEMORY_HW_SEMANTIC": float,
                         "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
+                        "MEMORY_HW_ENTITY": float,
                         "MEMORY_SEMANTIC_THRESHOLD": float,
                     }
                     # 显式空值也要恢复的字段：面板清空=关闭该功能，重启后应保持关闭而不是回退到环境变量
@@ -331,6 +332,19 @@ async def gateway_auth_middleware(request: Request, call_next):
 # 记忆注入
 # ============================================================
 
+def _format_matched_entity_overview(memories: list) -> str:
+    """Format each entity once even when it recalled several memories."""
+    entities = {}
+    for memory in memories:
+        for entity in memory.get("matched_entities", []):
+            entities[entity["id"]] = entity
+    lines = []
+    for entity in entities.values():
+        aliases = f"，别名：{'、'.join(entity.get('aliases', []))}" if entity.get("aliases") else ""
+        description = f"；概况：{entity['description']}" if entity.get("description") else ""
+        lines.append(f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）{description}")
+    return "\n".join(lines)
+
 async def build_system_prompt_with_memories(user_message: str) -> str:
     """
     构建带记忆的 system prompt
@@ -350,10 +364,11 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
             return SYSTEM_PROMPT
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
-        entity_map = await get_entities_for_memory_ids([mem["id"] for mem in memories])
+        entity_map = {mem["id"]: mem.get("entities", []) for mem in memories}
         memory_lines = []
         for mem in memories:
             date_str = ""
+            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(mem.get("layer", 1), "记忆")
             if mem.get("created_at"):
                 try:
                     utc_str = str(mem['created_at'])[:19]
@@ -364,12 +379,15 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
                     date_str = f"[{str(mem['created_at'])[:10]}] "
             names = [entity["name"] for entity in entity_map.get(mem["id"], [])]
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
-            memory_lines.append(f"- {date_str}{mem['content']}{entity_suffix}")
+            memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         memory_text = "\n".join(memory_lines)
+        entity_overview = _format_matched_entity_overview(memories)
+        entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
         
         enhanced_prompt = f"""{SYSTEM_PROMPT}
 
 【从过往对话中检索到的相关记忆】
+{entity_section}
 {memory_text}
 
 # 记忆应用
@@ -900,10 +918,11 @@ async def build_memory_text(user_message: str) -> str:
         if not memories:
             return ""
         
-        entity_map = await get_entities_for_memory_ids([mem["id"] for mem in memories])
+        entity_map = {mem["id"]: mem.get("entities", []) for mem in memories}
         memory_lines = []
         for mem in memories:
             date_str = ""
+            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(mem.get("layer", 1), "记忆")
             if mem.get("created_at"):
                 try:
                     utc_str = str(mem['created_at'])[:19]
@@ -914,12 +933,15 @@ async def build_memory_text(user_message: str) -> str:
                     date_str = f"[{str(mem['created_at'])[:10]}] "
             names = [entity["name"] for entity in entity_map.get(mem["id"], [])]
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
-            memory_lines.append(f"- {date_str}{mem['content']}{entity_suffix}")
+            memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         
+        entity_overview = _format_matched_entity_overview(memories)
+        entity_block = f"<matched_entities>\n{entity_overview}\n</matched_entities>\n" if entity_overview else ""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
             "<retrieved_memories>\n"
             "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
+            + entity_block
             + "\n".join(memory_lines)
             + "\n</retrieved_memories>"
         )
@@ -2733,6 +2755,7 @@ async def get_settings():
             "MEMORY_HW_SEMANTIC":       float(db.get("MEMORY_HW_SEMANTIC") or _db_module.MEMORY_HW_SEMANTIC),
             "MEMORY_HW_IMPORTANCE":     float(db.get("MEMORY_HW_IMPORTANCE") or _db_module.MEMORY_HW_IMPORTANCE),
             "MEMORY_HW_RECENCY":        float(db.get("MEMORY_HW_RECENCY") or _db_module.MEMORY_HW_RECENCY),
+            "MEMORY_HW_ENTITY":         float(db.get("MEMORY_HW_ENTITY") or _db_module.MEMORY_HW_ENTITY),
             "MEMORY_SEMANTIC_THRESHOLD": float(db.get("MEMORY_SEMANTIC_THRESHOLD") or _db_module.MEMORY_SEMANTIC_THRESHOLD),
 
             # 其他
@@ -2789,6 +2812,7 @@ async def save_settings(request: Request):
             "MEMORY_HW_SEMANTIC":      float,
             "MEMORY_HW_IMPORTANCE":    float,
             "MEMORY_HW_RECENCY":       float,
+            "MEMORY_HW_ENTITY":        float,
             "MEMORY_SEMANTIC_THRESHOLD": float,
         }
 
