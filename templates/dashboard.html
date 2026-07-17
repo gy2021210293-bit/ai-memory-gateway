@@ -483,7 +483,12 @@
                     <div id="entity-profile-draft" style="display:none;margin:16px 0">
                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
                             <div><h4>保存中的概况</h4><pre id="entity-profile-old" style="white-space:pre-wrap;line-height:1.6"></pre></div>
-                            <div><h4>模型生成的新草稿</h4><pre id="entity-profile-new" style="white-space:pre-wrap;line-height:1.6"></pre></div>
+                            <div>
+                                <h4>模型生成的新草稿（可修改）</h4>
+                                <label for="entity-profile-summary-edit" class="section-desc">摘要（最多200字，保存时覆盖旧摘要）</label>
+                                <textarea id="entity-profile-summary-edit" class="textarea" rows="6" maxlength="200"></textarea>
+                                <pre id="entity-profile-new" style="white-space:pre-wrap;line-height:1.6"></pre>
+                            </div>
                         </div>
                         <div class="toolbar" style="margin-top:12px">
                             <button class="btn btn-primary" onclick="saveEntityProfileDraft()">确认保存</button>

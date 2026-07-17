@@ -270,6 +270,7 @@ ai-memory-gateway/
 | `MEMORY_HW_RECENCY` | 混合搜索：时间衰减权重 | `0.15` |
 | `MEMORY_HW_ENTITY` | 实体正式名或别名命中后的聚合召回加成 | `0.25` |
 | `MEMORY_SEMANTIC_THRESHOLD` | 向量相似度阈值 | `0.5` |
+| `USER_ENTITY_NAMES` | 不应创建为实体的用户本人名称，英文逗号分隔 | `晏晏,用户,user,the user` |
 
 开启后，新记忆会自动计算 embedding。已有记忆可以在 Dashboard 记忆管理页面点击「开始补算」一键补算。
 

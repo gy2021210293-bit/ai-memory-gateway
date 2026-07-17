@@ -156,7 +156,9 @@ async function generateEntityProfileDraft() {
         if (!response.ok || data.error) throw new Error(data.error || '生成失败');
         pendingEntityProfile = data.draft;
         document.getElementById('entity-profile-old').textContent = formatEntityProfile(data.current_profile, selectedEntity.description);
-        document.getElementById('entity-profile-new').textContent = formatEntityProfile(data.draft);
+        document.getElementById('entity-profile-summary-edit').value = data.draft.summary || '';
+        const draftDetails = { ...data.draft, summary: '' };
+        document.getElementById('entity-profile-new').textContent = formatEntityProfile(draftDetails);
         document.getElementById('entity-profile-draft').style.display = 'block';
         status.textContent = '草稿已生成，请比较后确认。';
     } catch (error) {
@@ -169,6 +171,12 @@ async function generateEntityProfileDraft() {
 async function saveEntityProfileDraft() {
     if (!selectedEntity || !pendingEntityProfile) return;
     const status = document.getElementById('entity-status');
+    const editedSummary = document.getElementById('entity-profile-summary-edit').value.trim();
+    if (!editedSummary) {
+        status.textContent = '实体摘要不能为空。';
+        return;
+    }
+    pendingEntityProfile = { ...pendingEntityProfile, summary: editedSummary.slice(0, 200) };
     const response = await fetch(`/api/entities/${selectedEntity.id}/profile`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ profile: pendingEntityProfile }),

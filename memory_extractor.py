@@ -32,6 +32,11 @@ MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
 
 # 用来提取记忆的模型（便宜的就行）
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+USER_ENTITY_NAMES = {
+    re.sub(r"\s+", " ", name.strip()).casefold()
+    for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
+    if name.strip()
+}
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
@@ -126,7 +131,20 @@ is explicitly present in that memory. Do not invent entities and do not use pron
 generic nouns. Format each entity as {"name": "display name", "type":
 "person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0-1.0}.
 If no explicit named entity exists, return an empty array.
+Never return the user herself as an entity. In particular, exclude 晏晏, 用户, user,
+the user, first-person pronouns, and any name configured as the user's own name.
 """
+
+
+def _exclude_user_entities(entities) -> List:
+    """Drop user-self references before they can reach the entity store."""
+    result = []
+    for entity in entities if isinstance(entities, list) else []:
+        name = entity if isinstance(entity, str) else entity.get("name", "") if isinstance(entity, dict) else ""
+        normalized = re.sub(r"\s+", " ", str(name).strip()).casefold()
+        if normalized and normalized not in USER_ENTITY_NAMES:
+            result.append(entity)
+    return result
 
 
 async def extract_memories(messages: List[Dict[str, str]], existing_memories: List[str] = None) -> List[Dict]:
@@ -246,7 +264,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                     valid_memories.append({
                         "content": str(mem["content"]),
                         "importance": int(mem.get("importance", 5)),
-                        "entities": [entity for entity in mem.get("entities", []) if isinstance(entity, (dict, str))],
+                        "entities": _exclude_user_entities(mem.get("entities", [])),
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")
@@ -271,6 +289,7 @@ async def extract_entities_from_memories(memories: List[Dict]) -> Optional[Dict[
 Return JSON in this format:
 [{{"memory_id": 1, "entities": [{{"name": "...", "type": "person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0}}]}}]
 Omit records without entities. Do not use pronouns or generic nouns. Do not invent names.
+Never return the user herself (including 晏晏, 用户, user, or the user) as an entity.
 
 {items}"""
     try:
@@ -293,7 +312,7 @@ Omit records without entities. Do not use pronouns or generic nouns. Do not inve
         for item in parsed if isinstance(parsed, list) else []:
             memory_id = int(item.get("memory_id", 0))
             if memory_id in allowed_ids:
-                result[memory_id] = [entity for entity in item.get("entities", []) if isinstance(entity, (dict, str))]
+                result[memory_id] = _exclude_user_entities(item.get("entities", []))
         return result
     except Exception as exc:
         print(f"⚠️ 实体回填解析失败: {exc}")
@@ -305,10 +324,10 @@ def normalize_entity_profile(raw_profile: Dict, allowed_memory_ids: set) -> Dict
     def clean_text(value, limit=500):
         return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
 
-    def clean_list(value, limit=12):
+    def clean_list(value, limit=6):
         if not isinstance(value, list):
             return []
-        return [text for text in (clean_text(item, 240) for item in value) if text][:limit]
+        return [text for text in (clean_text(item, 80) for item in value) if text][:limit]
 
     evidence = []
     for value in raw_profile.get("evidence_memory_ids", []):
@@ -319,8 +338,8 @@ def normalize_entity_profile(raw_profile: Dict, allowed_memory_ids: set) -> Dict
         if memory_id in allowed_memory_ids and memory_id not in evidence:
             evidence.append(memory_id)
     return {
-        "summary": clean_text(raw_profile.get("summary"), 500),
-        "relationship": clean_text(raw_profile.get("relationship"), 300),
+        "summary": clean_text(raw_profile.get("summary"), 200),
+        "relationship": clean_text(raw_profile.get("relationship"), 120),
         "stable_facts": clean_list(raw_profile.get("stable_facts")),
         "recent_updates": clean_list(raw_profile.get("recent_updates")),
         "preferences": clean_list(raw_profile.get("preferences")),
@@ -353,10 +372,11 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 {chr(10).join(evidence_lines)}
 
 要求：
-1. 不得推测证据中没有的信息；矛盾或不确定内容放入 uncertainties。
-2. recent_updates 只放近期状态，stable_facts 只放稳定事实。
-3. evidence_memory_ids 只能引用上方出现的 ID，并覆盖概况实际使用的证据。
-4. 只返回 JSON 对象：
+1. 你是陪伴用户的 AI。summary 必须以你的第一人称“我”来写，简洁概括你当前对该实体的稳定认识，80-160字，最多200字。
+2. 新草稿应以最新证据修正旧印象；不得推测证据中没有的信息，矛盾或不确定内容放入 uncertainties。
+3. recent_updates 只放近期状态，stable_facts 只放稳定事实；各列表最多6项，每项尽量不超过80字。
+4. evidence_memory_ids 只能引用上方出现的 ID，并覆盖概况实际使用的证据。
+5. 只返回 JSON 对象：
 {{"summary":"简短摘要","relationship":"与用户或伙伴的关系","stable_facts":[],"recent_updates":[],"preferences":[],"uncertainties":[],"evidence_memory_ids":[]}}
 """
     try:

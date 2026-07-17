@@ -44,6 +44,11 @@ MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 MEMORY_HW_ENTITY = float(os.getenv("MEMORY_HW_ENTITY", "0.25"))
+USER_ENTITY_NAMES = {
+    re.sub(r"\s+", " ", name.strip()).casefold()
+    for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
+    if name.strip()
+}
 
 
 # ============================================================
@@ -261,6 +266,12 @@ async def init_tables():
             );
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities (entity_id);")
+        # 用户本人由主记忆系统维护，不作为普通实体参与召回。
+        if USER_ENTITY_NAMES:
+            await conn.execute(
+                "DELETE FROM entities WHERE normalized_name = ANY($1::text[])",
+                sorted(USER_ENTITY_NAMES),
+            )
         await conn.execute("""
             DO $$ BEGIN
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'entities' AND column_name = 'profile_json') THEN
@@ -2040,6 +2051,10 @@ def normalize_entity_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
 
 
+def is_user_entity_name(name: str) -> bool:
+    return normalize_entity_name(name) in USER_ENTITY_NAMES
+
+
 async def link_memory_entities(memory_id: int, entities: list, source: str = "extractor"):
     """Upsert extracted entities and link them to one memory."""
     if not memory_id or not entities:
@@ -2053,7 +2068,7 @@ async def link_memory_entities(memory_id: int, entities: list, source: str = "ex
                     item = {"name": item, "type": "other"}
                 name = str(item.get("name", "")).strip()
                 normalized = normalize_entity_name(name)
-                if not normalized:
+                if not normalized or is_user_entity_name(name):
                     continue
                 entity_type = str(item.get("type", "other") or "other").strip().lower()
                 allowed_types = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}

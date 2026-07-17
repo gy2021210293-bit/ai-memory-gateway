@@ -34,6 +34,17 @@ class FakeConnection:
 
 
 class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
+    def test_user_is_not_an_entity(self):
+        self.assertTrue(database.is_user_entity_name("晏晏"))
+        self.assertTrue(database.is_user_entity_name(" USER "))
+        self.assertEqual(
+            memory_extractor._exclude_user_entities([
+                {"name": "晏晏", "type": "person"},
+                {"name": "Alice", "type": "person"},
+            ]),
+            [{"name": "Alice", "type": "person"}],
+        )
+
     def test_all_zero_scores_stay_zero(self):
         self.assertEqual(database._min_max_normalize({1: 0.0, 2: 0.0}), {1: 0.0, 2: 0.0})
 
@@ -88,6 +99,19 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile["summary"], "Alice is a friend.")
         self.assertEqual(profile["evidence_memory_ids"], [11, 12])
         self.assertNotIn(999, profile["evidence_memory_ids"])
+
+    def test_profile_normalization_is_compact(self):
+        profile = memory_extractor.normalize_entity_profile({
+            "summary": "我" * 250,
+            "relationship": "朋友" * 100,
+            "stable_facts": ["事实" * 100] * 8,
+            "evidence_memory_ids": [1],
+        }, {1})
+
+        self.assertEqual(len(profile["summary"]), 200)
+        self.assertEqual(len(profile["relationship"]), 120)
+        self.assertEqual(len(profile["stable_facts"]), 6)
+        self.assertTrue(all(len(item) <= 80 for item in profile["stable_facts"]))
 
 
 if __name__ == "__main__":
