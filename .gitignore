@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.env
+
+# 你自己的人设和记忆（不要提交到公开仓库！）
+# 如果你 fork 了这个仓库到私有仓库，可以取消下面的注释
+# system_prompt.txt
+# seed_memories.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
