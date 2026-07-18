@@ -19,6 +19,7 @@
 - The user is not an entity. `USER_ENTITY_NAMES` controls self-name exclusions; extraction, legacy backfill, and database linking reject those names, and startup removes existing matching entity rows without deleting memories. Entity summaries are compact AI-first-person current views: summary <=200 characters, supporting lists <=6 items, the Dashboard draft summary is editable before confirmation, and saving replaces the prior profile on the same entity.
 - Consolidated event `content` is written as Xiangye's concise first-person memory: normally 80-180 Chinese characters and at most two sentences, preserving factual support and natural emotional warmth without adding new schema or runtime retrieval complexity.
 - Fragment extraction resolves relative time from each persisted conversation message's `created_at` in `TIMEZONE_HOURS`, writes the absolute date directly into memory `content`, preserves the source expression's precision and plan/possibility status, and does not add structured temporal storage yet.
+- Consolidated events include their absolute date naturally in `content` and return a per-event `event_date` saved through the existing database column; consolidation provides full local source timestamps and falls back to the selected range start only when the model date is invalid.
 
 ## Open questions
 

@@ -1858,11 +1858,11 @@ CONSOLIDATION_PROMPT = """
 要求：
 1. 只合并确实属于同一主题或事件的碎片，不强行拼接。
 2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。
-3. title不超过10个汉字。content以我的第一人称视角书写，80～180个汉字、最多两句；既说清发生了什么，也自然留住当时的状态、互动和意义。
+3. title不超过10个汉字。content以我的第一人称视角书写，80～180个汉字、最多两句；必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
 4. 每条记忆都应有温度，但事实、情绪、动机和关系变化必须有原文支持；不编造，不拔高。
 5. 只保留一句不可替代的关键原话，并标明说话者；普通口头表达不保留。技术事件记投入、受阻、解决和完成，不记冗长调试过程。
 6. 表达自然、具体、克制，禁止‘根据记录’‘该事件表明’‘用户表现出’等档案式话语。
-7. importance使用1～10：1～3普通细节，4～6有持续价值，7～8重要事件、承诺或关系变化，9～10长期核心或不可替代的记忆。merged_ids只包含实际用到的碎片ID；content不使用双引号。
+7. event_date填事件发生或计划发生的主日期（YYYY-MM-DD）；原文只有上午、下午或晚上时，在content中保留这个精度，不编造时刻。importance使用1～10；merged_ids只包含实际用到的碎片ID；content不使用双引号。
 
 碎片记忆：
 {fragments}
@@ -1872,6 +1872,7 @@ CONSOLIDATION_PROMPT = """
   {{
     "title": "事件标题（10字内）",
     "content": "向野第一人称视角的完整事件记忆",
+    "event_date": "2026-07-18",
     "importance": 5,
     "merged_ids": [1, 2, 3]
   }}
@@ -1906,10 +1907,18 @@ async def consolidate_memories_for_date_range(start_date, end_date):
         return {"status": "no_fragments", "start_date": str(start_date), "end_date": str(end_date)}
     
     # 构建碎片文本
-    fragments_text = "\n".join([
-        f"[ID={f['id']}] ({f['created_at'].strftime('%m-%d') if hasattr(f['created_at'], 'strftime') else str(f['created_at'])[:10]}) {f['content']}"
-        for f in fragments
-    ])
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    fragment_lines = []
+    for fragment in fragments:
+        created_at = fragment.get("created_at")
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            time_label = created_at.astimezone(local_tz).strftime("%Y-%m-%d %H:%M UTC%z")
+        else:
+            time_label = str(created_at)[:16]
+        fragment_lines.append(f"[ID={fragment['id']}] [{time_label}] {fragment['content']}")
+    fragments_text = "\n".join(fragment_lines)
     
     # 调用 AI 进行整理
     prompt = CONSOLIDATION_PROMPT.format(fragments=fragments_text)
@@ -2007,11 +2016,15 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             for event in events:
                 merged_ids = event.get("merged_ids", [])
                 if merged_ids:
+                    try:
+                        event_date = date.fromisoformat(str(event.get("event_date", "")))
+                    except ValueError:
+                        event_date = start_date
                     await create_event_memory(
                         title=event.get("title", ""),
                         content=event.get("content", ""),
                         importance=event.get("importance", 5),
-                        event_date=start_date,
+                        event_date=event_date,
                         merged_from=merged_ids
                     )
                     created_count += 1
