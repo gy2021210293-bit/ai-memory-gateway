@@ -2,6 +2,7 @@ import logging
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 
 
 asyncpg = types.ModuleType("asyncpg")
@@ -34,6 +35,19 @@ class FakeConnection:
 
 
 class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
+    def test_message_time_uses_configured_timezone(self):
+        rendered = memory_extractor._format_message_time(
+            datetime(2026, 7, 18, 16, 30, tzinfo=timezone.utc),
+            datetime(2000, 1, 1, tzinfo=timezone.utc),
+        )
+        self.assertIn("2026-07-19 00:30", rendered)
+        self.assertIn("UTC+0800", rendered)
+
+    def test_message_time_falls_back_for_invalid_input(self):
+        fallback = datetime(2026, 7, 18, 2, 5, tzinfo=timezone.utc)
+        rendered = memory_extractor._format_message_time("not-a-time", fallback)
+        self.assertIn("2026-07-18 10:05", rendered)
+
     def test_user_is_not_an_entity(self):
         self.assertTrue(database.is_user_entity_name("晏晏"))
         self.assertTrue(database.is_user_entity_name(" USER "))

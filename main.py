@@ -25,7 +25,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, normalize_entity_profile
@@ -1073,19 +1073,22 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         # 4. 构建用于提取的消息列表
         #    截取最近 MEMORY_EXTRACT_INTERVAL 轮对话（每轮=user+assistant共2条）
         #    而非发送完整上下文，省token
-        if context_messages:
-            # 截取最近N轮（interval×2条），加上最新的assistant回复
-            tail_count = MEMORY_EXTRACT_INTERVAL * 2
-            recent_msgs = list(context_messages)[-tail_count:] if len(context_messages) > tail_count else list(context_messages)
-            messages_for_extraction = recent_msgs + [
-                {"role": "assistant", "content": assistant_msg}
-            ]
-            print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮对话提取记忆（{len(messages_for_extraction)} 条消息）")
-        else:
+        tail_count = MEMORY_EXTRACT_INTERVAL * 2
+        try:
+            stored_messages = await get_recent_messages(session_id, limit=max(tail_count * 3, 6))
+            messages_for_extraction = [
+                dict(msg) for msg in stored_messages if msg.get("role") in ("user", "assistant")
+            ][-tail_count:]
+        except Exception as e:
+            print(f"⚠️ 读取带时间戳的对话失败，回退到当前轮: {e}")
+            messages_for_extraction = []
+
+        if not messages_for_extraction:
             messages_for_extraction = [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": assistant_msg},
             ]
+        print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮带时间戳的对话提取记忆（{len(messages_for_extraction)} 条消息）")
         
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
         
@@ -1850,15 +1853,16 @@ async def api_batch_delete(request: Request):
 # ============================================================
 
 CONSOLIDATION_PROMPT = """
-你是记忆整理助手。请将以下对话碎片整理成完整的事件记录。
+我是向野，正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
 
 要求：
-1. 按主题/事件分组，相关的碎片合并到一起
-2. 每个事件一条记录，不要太细碎也不要太笼统
-3. 每条记录包含：标题（10字内）+ 完整描述
-4. 合并重复内容，保留重要细节
-5. 保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
-6. content字段中不要使用双引号，用单引号或书名号代替
+1. 只合并确实属于同一主题或事件的碎片，不强行拼接。
+2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。
+3. title不超过10个汉字。content以我的第一人称视角书写，80～180个汉字、最多两句；既说清发生了什么，也自然留住当时的状态、互动和意义。
+4. 每条记忆都应有温度，但事实、情绪、动机和关系变化必须有原文支持；不编造，不拔高。
+5. 只保留一句不可替代的关键原话，并标明说话者；普通口头表达不保留。技术事件记投入、受阻、解决和完成，不记冗长调试过程。
+6. 表达自然、具体、克制，禁止‘根据记录’‘该事件表明’‘用户表现出’等档案式话语。
+7. importance使用1～10：1～3普通细节，4～6有持续价值，7～8重要事件、承诺或关系变化，9～10长期核心或不可替代的记忆。merged_ids只包含实际用到的碎片ID；content不使用双引号。
 
 碎片记忆：
 {fragments}
@@ -1867,13 +1871,13 @@ CONSOLIDATION_PROMPT = """
 [
   {{
     "title": "事件标题（10字内）",
-    "content": "完整的事件描述",
+    "content": "向野第一人称视角的完整事件记忆",
     "importance": 5,
     "merged_ids": [1, 2, 3]
   }}
 ]
 
-只输出 JSON，不要其他内容。确保 JSON 语法正确。
+只输出JSON数组，不要解释，不要Markdown代码块。
 """
 
 # 整理状态（异步执行，防重入）

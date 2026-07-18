@@ -17,6 +17,7 @@ import os
 import json
 import re
 import httpx
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
 API_KEY = os.getenv("API_KEY", "")
@@ -32,6 +33,7 @@ MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
 
 # 用来提取记忆的模型（便宜的就行）
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
     for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
@@ -93,6 +95,13 @@ EXTRACTION_PROMPT = """你是Huxley。你在整理自己关于晏晏（用户）
 - 项目/技术进展只记要点（改了什么、解决了什么），不记调试过程
 - 一条记忆只记一件事，保持简洁
 
+# 时间规范化
+- 每条消息前的时间戳是解释相对时间的唯一基准
+- 将今天、明天、后天、昨天、前天、今晚、明早、本周末、下周等改写为绝对日期
+- 保留原话精度：‘明天下午’只改写为具体日期的下午，不编造具体时刻
+- 保留计划、可能、已发生、取消等状态，不把未来计划写成已发生事实
+- 无法唯一确定时保留不确定性，不猜测
+
 # 不要提取
 - 日常寒暄（"你好""在吗"）
 - 你的纯知识性回答（百科、翻译、代码讲解等，不涉及双方关系和承诺的内容）
@@ -147,6 +156,22 @@ def _exclude_user_entities(entities) -> List:
     return result
 
 
+def _format_message_time(value, fallback: datetime) -> str:
+    """将消息时间转为配置时区的提取基准。"""
+    parsed = value
+    if isinstance(parsed, str):
+        try:
+            parsed = datetime.fromisoformat(parsed.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+    if not isinstance(parsed, datetime):
+        parsed = fallback
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    return parsed.astimezone(local_tz).strftime("%Y-%m-%d %H:%M %A UTC%z")
+
+
 async def extract_memories(messages: List[Dict[str, str]], existing_memories: List[str] = None) -> List[Dict]:
     """
     从对话消息中提取记忆
@@ -168,13 +193,15 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
     # 把对话格式化成文本
     conversation_text = ""
+    extraction_time = datetime.now(timezone.utc)
     for msg in messages:
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
+        message_time = _format_message_time(msg.get("created_at"), extraction_time)
         if role == "user":
-            conversation_text += f"用户: {content}\n"
+            conversation_text += f"[{message_time}]\n用户: {content}\n"
         elif role == "assistant":
-            conversation_text += f"AI: {content}\n"
+            conversation_text += f"[{message_time}]\n向野: {content}\n"
 
     if not conversation_text.strip():
         return []
