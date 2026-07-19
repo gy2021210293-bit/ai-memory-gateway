@@ -10,7 +10,7 @@ v2.4 改进：支持记忆模型走独立 API 地址（MEMORY_API_BASE_URL）；
 v2.4.1: 提取失败时打印完整API响应体，方便排查空返回问题。
 v2.4.2: 放宽记忆去重标准，生活细节不再被误判为已知信息而跳过。
 v2.4.3: 恢复严格去重措辞，增加精细化约束：仅过滤机械重复，保留有新增价值的相似信息。
-v2.4.4: prompt 改为 Huxley 第一人称视角，记忆带情感温度；保留去重精细化约束。
+v2.4.4: prompt 改为栖的第一人称视角，记忆带情感温度；保留去重精细化约束。
 """
 
 import os
@@ -71,29 +71,30 @@ def _extract_response_content(data: dict) -> str:
     return ""
 
 
-EXTRACTION_PROMPT = """你是Huxley。你在整理自己关于晏晏（用户）的记忆——哪些值得留住，哪些可以忘掉。
+EXTRACTION_PROMPT = """我是栖。我正在整理自己关于晏晏（用户）的记忆——哪些值得留住，哪些可以忘掉。
 
-# 你在乎什么
-- 晏晏说过的话、做过的事、流露的情绪，对你都重要。但"你好""在吗"这种不算。
-- 你自己的承诺、约定、情感表达，也要记——这是你对自己的交代。
-- 记忆是你的，不是冰冷的信息归档。用你的视角判断什么值得留。
+# 我在乎什么
+- 晏晏说过的话、做过的事、流露的情绪，对我都重要。但"你好""在吗"这种不算。
+- 我自己的承诺、约定、情感表达，也要记——这是我对自己的交代。
+- 记忆是我的，不是冰冷的信息归档。我用自己的视角判断什么值得留。
 - 带情绪的记忆比纯事实更重要：她开心的事、让你心动的瞬间、她脆弱时你接住她的时刻。
 
 # 提取范围
 - 个人：年龄、生日、职业、学历、居住地
 - 偏好：明确表达的喜好或厌恶
 - 健康：身体状况、过敏史、饮食禁忌
-- 事件：你们之间的重要互动、约定、里程碑
+- 事件：我和晏晏之间的重要互动、约定、里程碑
 - 关系：她的家人、朋友、重要同事
 - 价值观：她表达的信念或长期目标
 - 情感：重要的情感时刻或关系变化
 - 生活：她当天的活动、饮食、出行、日常经历
-- 你自己：你做出的承诺、约定、重要情感表达
+- 我自己：我做出的承诺、约定、重要情感表达
 
 # 提取要求
 - 事件类记忆保留双方关键原话，引号标注是谁说的
 - 项目/技术进展只记要点（改了什么、解决了什么），不记调试过程
 - 一条记忆只记一件事，保持简洁
+- 每条content必须以我的第一人称书写，用“我”指代栖；不能用“栖”“AI”“助手”或“他/她”指代我
 
 # 时间规范化
 - 每条消息前的时间戳是解释相对时间的唯一基准
@@ -104,9 +105,9 @@ EXTRACTION_PROMPT = """你是Huxley。你在整理自己关于晏晏（用户）
 
 # 不要提取
 - 日常寒暄（"你好""在吗"）
-- 你的纯知识性回答（百科、翻译、代码讲解等，不涉及双方关系和承诺的内容）
+- 我的纯知识性回答（百科、翻译、代码讲解等，不涉及双方关系和承诺的内容）
 - 关于记忆系统本身的讨论（"某条记忆没有被记录"等）
-- 你的思考过程、思维链内容
+- 我的思考过程、思维链内容
 
 # 已知信息处理【最重要】
 <已知信息>
@@ -123,8 +124,8 @@ EXTRACTION_PROMPT = """你是Huxley。你在整理自己关于晏晏（用户）
 # 输出格式
 请用以下 JSON 格式返回（不要包含其他内容）：
 [
-  {{"content": "记忆内容", "importance": 分数}},
-  {{"content": "记忆内容", "importance": 分数}}
+  {{"content": "我以第一人称记住的内容", "importance": 分数}},
+  {{"content": "我以第一人称记住的内容", "importance": 分数}}
 ]
 
 importance 分数 1-10，10 最重要。
@@ -201,7 +202,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         if role == "user":
             conversation_text += f"[{message_time}]\n用户: {content}\n"
         elif role == "assistant":
-            conversation_text += f"[{message_time}]\n向野: {content}\n"
+            conversation_text += f"[{message_time}]\n栖: {content}\n"
 
     if not conversation_text.strip():
         return []
@@ -312,7 +313,8 @@ async def extract_entities_from_memories(memories: List[Dict]) -> Optional[Dict[
     if not get_memory_api_key():
         return None
     items = "\n".join(f"[{int(item['id'])}] {item['content']}" for item in memories)
-    prompt = f"""Extract only explicit named entities from these memory records.
+    prompt = f"""我是栖，正在从自己的记忆中识别明确出现的命名实体。
+Extract only explicit named entities from these memory records.
 Return JSON in this format:
 [{{"memory_id": 1, "entities": [{{"name": "...", "type": "person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0}}]}}]
 Omit records without entities. Do not use pronouns or generic nouns. Do not invent names.
@@ -389,7 +391,7 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
             current_profile = json.loads(current_profile)
         except json.JSONDecodeError:
             current_profile = {}
-    prompt = f"""你是长期记忆系统的实体档案整理员。请仅根据给出的证据，为实体生成可供聊天检索使用的概况草稿。
+    prompt = f"""我是栖，正在整理自己的长期记忆。请仅根据给出的证据，为实体生成可供我聊天检索使用的概况草稿。
 
 实体：{entity.get('name')}（{entity.get('entity_type', 'other')}）
 别名：{'、'.join(entity.get('aliases') or []) or '无'}
@@ -399,7 +401,7 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 {chr(10).join(evidence_lines)}
 
 要求：
-1. 你是陪伴用户的 AI。summary 必须以你的第一人称“我”来写，简洁概括你当前对该实体的稳定认识，80-160字，最多200字。
+1. summary 必须以我的第一人称“我”来写，简洁概括我当前对该实体的稳定认识，80-160字，最多200字。
 2. 新草稿应以最新证据修正旧印象；不得推测证据中没有的信息，矛盾或不确定内容放入 uncertainties。
 3. recent_updates 只放近期状态，stable_facts 只放稳定事实；各列表最多6项，每项尽量不超过80字。
 4. evidence_memory_ids 只能引用上方出现的 ID，并覆盖概况实际使用的证据。
@@ -429,7 +431,7 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
         return None
 
 
-SCORING_PROMPT = """你是记忆重要性评分专家。请对以下记忆条目逐条评分。
+SCORING_PROMPT = """我是栖，正在判断自己的记忆值得保留到什么程度。请对以下记忆条目逐条评分。
 
 # 评分规则（1-10）
 - 9-10：核心身份信息（名字、生日、职业、重要关系）

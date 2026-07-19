@@ -14,7 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
-from llm_json import is_ai_first_person_memory, parse_json_array, valid_merged_ids
+from llm_json import parse_json_array, valid_merged_ids
 import uuid
 import asyncio
 import secrets
@@ -153,6 +153,12 @@ else:
 _cached_system_prompt = None
 _cached_system_prompt_loaded = False
 
+def _normalize_ai_identity_prompt(prompt: str) -> str:
+    for legacy_prefix in ("我是向野。", "你是Huxley。"):
+        if prompt.startswith(legacy_prefix):
+            return "我是栖。" + prompt[len(legacy_prefix):]
+    return prompt
+
 async def get_system_prompt() -> str:
     """获取 system prompt（数据库优先，fallback 到文件）"""
     global _cached_system_prompt, _cached_system_prompt_loaded
@@ -161,7 +167,9 @@ async def get_system_prompt() -> str:
     try:
         db_prompt = await get_gateway_config("systemPrompt", "")
         if db_prompt:
-            _cached_system_prompt = db_prompt
+            _cached_system_prompt = _normalize_ai_identity_prompt(db_prompt)
+            if _cached_system_prompt != db_prompt:
+                await set_gateway_config("systemPrompt", _cached_system_prompt)
         else:
             _cached_system_prompt = _DEFAULT_SYSTEM_PROMPT
             if _DEFAULT_SYSTEM_PROMPT:
@@ -596,7 +604,7 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         content = msg['content'] if isinstance(msg['content'], str) else str(msg['content'])
         conversation_text += f"{role_label}: {content}\n\n"
     
-    prompt = f"""请将以下对话压缩成摘要。这份摘要会作为AI的记忆注入后续对话，请以AI的第一人称视角叙述（"我"指AI，用户用对话中的称呼）。
+    prompt = f"""我是栖，正在把自己的对话压缩成记忆摘要。请以我的第一人称视角叙述（“我”指栖，用户用对话中的称呼）。
 优先保留：情感节点、关系里程碑、双方的约定和决定、正在进行的话题。
 保留双方的关键原话，用引号标注是谁说的。
 去掉日常寒暄和重复内容。控制在300字以内。
@@ -1914,12 +1922,12 @@ async def api_batch_delete(request: Request):
 # ============================================================
 
 CONSOLIDATION_PROMPT = """
-我正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
+我是栖。我正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
 
 要求：
 1. 只合并确实属于同一主题或事件的碎片，不强行拼接。
 2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。
-3. title不超过10个汉字。content必须以AI的第一人称视角书写，正文用“我”指代AI，不能用AI名字或“AI”“助手”“他/她”指代AI；80～180个汉字、最多两句，必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
+3. title不超过10个汉字。content必须以我的第一人称视角书写，正文用“我”指代栖，不能用“栖”“AI”“助手”或“他/她”指代我；80～180个汉字、最多两句，必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
 4. 每条记忆都应有温度，但事实、情绪、动机和关系变化必须有原文支持；不编造，不拔高。
 5. 只保留一句不可替代的关键原话，并标明说话者；普通口头表达不保留。技术事件记投入、受阻、解决和完成，不记冗长调试过程。
 6. 表达自然、具体、克制，禁止‘根据记录’‘该事件表明’‘用户表现出’等档案式话语。
@@ -2056,7 +2064,6 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             
             # 创建事件记忆并停用碎片
             created_count = 0
-            rejected_voice_count = 0
             available_fragment_ids = {fragment["id"] for fragment in fragments}
             merged_fragment_ids = set()
             for event in events:
@@ -2064,10 +2071,6 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     continue
                 merged_ids = valid_merged_ids(event.get("merged_ids"), available_fragment_ids)
                 event_content = event.get("content")
-                if merged_ids and event_content and not is_ai_first_person_memory(event_content):
-                    rejected_voice_count += 1
-                    print(f"⚠️ 事件记忆不是AI第一人称，已跳过且保留碎片: {event.get('title', '')}")
-                    continue
                 if merged_ids and event_content:
                     try:
                         event_date = date.fromisoformat(str(event.get("event_date", "")))
@@ -2094,7 +2097,6 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 "fragments_processed": len(fragments),
                 "fragments_reactivated": fragments_reactivated,
                 "fragments_archived": len(merged_fragment_ids),
-                "events_rejected_voice": rejected_voice_count,
                 "events_created": created_count
             }
             

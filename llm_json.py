@@ -35,10 +35,3 @@ def valid_merged_ids(raw_ids: Any, available_ids: set[int]) -> list[int]:
         and not isinstance(memory_id, bool)
         and memory_id in available_ids
     })
-
-
-def is_ai_first_person_memory(content: Any) -> bool:
-    if not isinstance(content, str) or not content.strip():
-        return False
-    narration = re.sub(r'“[^”]*”|‘[^’]*’|"[^"]*"', '', content)
-    return "我" in narration
