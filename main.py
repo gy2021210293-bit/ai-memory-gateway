@@ -14,6 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+from llm_json import parse_json_array
 import uuid
 import asyncio
 import secrets
@@ -2025,51 +2026,30 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             data = response.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             
-            # 解析 JSON（三层容错）
-            json_match = re.search(r'\[[\s\S]*\]', content)
-            if json_match:
-                json_str = json_match.group()
+            try:
+                events = parse_json_array(content)
+            except ValueError as e:
+                print(f"⚠️ JSON解析失败，尝试让AI修复: {e}")
+                fix_resp = await client.post(
+                    get_memory_api_base_url(),
+                    headers={
+                        "Authorization": f"Bearer {get_memory_api_key()}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": consolidation_model,
+                        "messages": [{"role": "user", "content": f"请修复以下JSON的语法错误，只输出修复后的JSON数组，不要其他内容：\n{content}"}],
+                        "max_tokens": 2000
+                    }
+                )
+                if fix_resp.status_code != 200:
+                    return {"status": "error", "error": f"JSON解析失败，AI修复请求失败: HTTP {fix_resp.status_code}", "raw": content[:500]}
+                fix_content = fix_resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
                 try:
-                    events = json.loads(json_str)
-                except json.JSONDecodeError:
-                    # 方案1：用 strict=False
-                    try:
-                        events = json.loads(json_str, strict=False)
-                    except json.JSONDecodeError:
-                        # 方案2：去掉控制字符后重试
-                        cleaned = re.sub(r'[\x00-\x1f\x7f]', ' ', json_str)
-                        try:
-                            events = json.loads(cleaned)
-                        except json.JSONDecodeError as e:
-                            # 方案3：让 AI 重新格式化
-                            print(f"⚠️ JSON解析失败，尝试让AI修复: {e}")
-                            fix_resp = await client.post(
-                                get_memory_api_base_url(),
-                                headers={
-                                    "Authorization": f"Bearer {get_memory_api_key()}",
-                                    "Content-Type": "application/json"
-                                },
-                                json={
-                                    "model": consolidation_model,
-                                    "messages": [{"role": "user", "content": f"请修复以下JSON的语法错误，只输出修复后的JSON数组，不要其他内容：\n{json_str[:2000]}"}],
-                                    "max_tokens": 2000
-                                }
-                            )
-                            if fix_resp.status_code == 200:
-                                fix_content = fix_resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-                                fix_match = re.search(r'\[[\s\S]*\]', fix_content)
-                                if fix_match:
-                                    try:
-                                        events = json.loads(fix_match.group())
-                                        print(f"✅ AI修复JSON成功")
-                                    except json.JSONDecodeError:
-                                        return {"status": "error", "error": f"JSON解析失败（AI修复也失败）", "raw": content[:500]}
-                                else:
-                                    return {"status": "error", "error": "AI修复未返回有效JSON", "raw": content[:500]}
-                            else:
-                                return {"status": "error", "error": f"JSON解析失败，AI修复请求失败: HTTP {fix_resp.status_code}", "raw": content[:500]}
-            else:
-                return {"status": "error", "error": "无法解析 AI 返回的 JSON", "raw": content}
+                    events = parse_json_array(fix_content)
+                    print("✅ AI修复JSON成功")
+                except ValueError:
+                    return {"status": "error", "error": "JSON解析失败（AI修复也失败）", "raw": content[:500]}
             
             # 创建事件记忆并停用碎片
             created_count = 0
