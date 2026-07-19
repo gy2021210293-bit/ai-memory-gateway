@@ -1921,7 +1921,7 @@ async def api_batch_delete(request: Request):
 # 三层记忆架构：整理 / 合并 / 升级 / 统计
 # ============================================================
 
-CONSOLIDATION_PROMPT = “””
+CONSOLIDATION_PROMPT = """
 我是栖。我正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
 
 要求：
@@ -1941,16 +1941,16 @@ CONSOLIDATION_PROMPT = “””
 请用 JSON 格式输出：
 [
   {{
-    “title”: “事件标题（10字内）”,
-    “content”: “2026年7月18日，我以第一人称记住的完整事件”,
-    “event_date”: “2026-07-18”,
-    “importance”: 5,
-    “merged_ids”: [1, 2, 3]
+    "title": "事件标题（10字内）",
+    "content": "2026年7月18日，我以第一人称记住的完整事件",
+    "event_date": "2026-07-18",
+    "importance": 5,
+    "merged_ids": [1, 2, 3]
   }}
 ]
 
 只输出JSON数组，不要解释，不要Markdown代码块。
-“””
+"""
 
 # 整理状态（异步执行，防重入）
 _consolidate_status = {

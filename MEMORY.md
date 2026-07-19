@@ -9,6 +9,8 @@
 
 ## Decisions
 
+- Keep Python string delimiters and JSON examples in prompts as ASCII quotes. Commit `cb44263` changed `CONSOLIDATION_PROMPT` delimiters to smart quotes (`“””`) and its JSON example keys/values to curly quotes, causing a startup `SyntaxError` and invalid model JSON guidance; both were restored to ASCII.
+
 - Treat this gateway and its PostgreSQL database as the sole source of truth for conversations and memories.
 - Add the Memory Constellations experience as a dashboard visualization module, not as a second memory gateway or parallel database.
 - SiliconFlow can be used through its OpenAI-compatible APIs for both chat and embeddings; semantic retrieval should remain attached to the gateway's existing vector-search path.
