@@ -26,8 +26,14 @@ class ParseJsonArrayTests(unittest.TestCase):
 
     def test_merged_ids_only_include_available_integer_fragments(self):
         self.assertEqual(
-            valid_merged_ids([3, 2, 2, 999, "3", True], {1, 2, 3}),
-            [2, 3],
+            valid_merged_ids([3, 2, 2, 999, "3", " 1 ", True], {1, 2, 3}),
+            [1, 2, 3],
+        )
+
+    def test_merged_ids_reject_non_numeric_labels(self):
+        self.assertEqual(
+            valid_merged_ids(["ID=3", "three", 3.0], {1, 2, 3}),
+            [],
         )
 
     def test_invalid_merged_ids_are_empty(self):

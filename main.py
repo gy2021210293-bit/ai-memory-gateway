@@ -1925,8 +1925,8 @@ CONSOLIDATION_PROMPT = """
 我是栖。我正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
 
 要求：
-1. 只合并确实属于同一主题或事件的碎片，不强行拼接。
-2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。
+1. 逐条审视全部碎片。属于同一具体事件的碎片合并；不能与其他碎片合并、但本身记录了有效事实或经历的碎片，单独生成一条事件记忆，不能因为它是单条就丢弃。
+2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。除寒暄、纯知识回答和无意义重复外，每个有效碎片ID必须且只能出现在一个事件的merged_ids中。
 3. title不超过10个汉字。content必须以我的第一人称视角书写，正文用“我”指代栖，不能用“栖”“AI”“助手”或“他/她”指代我；80～180个汉字、最多两句，必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
 4. 每条记忆都应有温度，但事实、情绪、动机和关系变化必须有原文支持；不编造，不拔高。
 5. 只保留一句不可替代的关键原话，并标明说话者；普通口头表达不保留。技术事件记投入、受阻、解决和完成，不记冗长调试过程。
@@ -2035,7 +2035,8 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 return {"status": "error", "error": f"API调用失败: {last_error}"}
 
             data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response_message = data.get("choices", [{}])[0].get("message", {})
+            content = response_message.get("content") or response_message.get("reasoning_content") or ""
             
             try:
                 events = parse_json_array(content)
@@ -2064,13 +2065,22 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             
             # 创建事件记忆并停用碎片
             created_count = 0
+            skipped_invalid_ids = 0
+            skipped_empty_content = 0
             available_fragment_ids = {fragment["id"] for fragment in fragments}
             merged_fragment_ids = set()
             for event in events:
                 if not isinstance(event, dict):
+                    skipped_invalid_ids += 1
                     continue
                 merged_ids = valid_merged_ids(event.get("merged_ids"), available_fragment_ids)
                 event_content = event.get("content")
+                if not merged_ids:
+                    skipped_invalid_ids += 1
+                    continue
+                if not event_content:
+                    skipped_empty_content += 1
+                    continue
                 if merged_ids and event_content:
                     try:
                         event_date = date.fromisoformat(str(event.get("event_date", "")))
@@ -2089,6 +2099,11 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             
             # 只停用已经被成功落库事件引用的碎片；未合并碎片保持活跃
             await deactivate_memories(sorted(merged_fragment_ids))
+            print(
+                f"[consolidate] 模型返回{len(events)}条，创建{created_count}条；"
+                f"无效ID跳过{skipped_invalid_ids}条，空内容跳过{skipped_empty_content}条，"
+                f"归档{len(merged_fragment_ids)}/{len(fragments)}条碎片；原始响应={content[:300]!r}"
+            )
             
             return {
                 "status": "ok",
@@ -2097,6 +2112,9 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 "fragments_processed": len(fragments),
                 "fragments_reactivated": fragments_reactivated,
                 "fragments_archived": len(merged_fragment_ids),
+                "events_returned": len(events),
+                "events_skipped_invalid_ids": skipped_invalid_ids,
+                "events_skipped_empty_content": skipped_empty_content,
                 "events_created": created_count
             }
             

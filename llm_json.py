@@ -29,9 +29,16 @@ def parse_json_array(raw: Any) -> list:
 def valid_merged_ids(raw_ids: Any, available_ids: set[int]) -> list[int]:
     if not isinstance(raw_ids, list):
         return []
-    return sorted({
-        memory_id for memory_id in raw_ids
-        if isinstance(memory_id, int)
-        and not isinstance(memory_id, bool)
-        and memory_id in available_ids
-    })
+    result = set()
+    for raw_id in raw_ids:
+        if isinstance(raw_id, bool):
+            continue
+        if isinstance(raw_id, int):
+            memory_id = raw_id
+        elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+            memory_id = int(raw_id.strip())
+        else:
+            continue
+        if memory_id in available_ids:
+            result.add(memory_id)
+    return sorted(result)

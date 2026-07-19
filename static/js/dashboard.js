@@ -1090,7 +1090,10 @@ async function doConsolidate() {
                         if (r.status === 'no_fragments') {
                             showManageMsg('info', '📝 该时间段没有需要整理的碎片记忆');
                         } else if (r.status === 'ok') {
-                            showManageMsg('success', '✅ 整理完成！处理了 ' + r.fragments_processed + ' 条碎片，生成了 ' + r.events_created + ' 条事件记忆');
+                            const diagnostics = r.events_created === 0
+                                ? '（模型返回' + (r.events_returned || 0) + '条，无效ID跳过' + (r.events_skipped_invalid_ids || 0) + '条，空内容跳过' + (r.events_skipped_empty_content || 0) + '条）'
+                                : '';
+                            showManageMsg('success', '✅ 整理完成！处理了 ' + r.fragments_processed + ' 条碎片，生成了 ' + r.events_created + ' 条事件记忆' + diagnostics);
                             loadMemories();
                         } else if (r.status === 'error') {
                             showManageMsg('error', '❌ ' + (r.error || '未知错误'));
