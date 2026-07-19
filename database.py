@@ -1728,6 +1728,30 @@ async def get_fragments_by_date_range(start_date, end_date):
         return [dict(r) for r in rows]
 
 
+async def reactivate_orphan_fragments_by_date_range(start_date, end_date):
+    """恢复指定日期范围内未被任何事件引用的误归档碎片。"""
+    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    start_utc = datetime(start_date.year, start_date.month, start_date.day, tzinfo=local_tz).astimezone(dt_timezone.utc)
+    end_utc = datetime(end_date.year, end_date.month, end_date.day, tzinfo=local_tz).astimezone(dt_timezone.utc) + timedelta(days=1)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE memories AS fragment
+            SET is_active = TRUE
+            WHERE fragment.layer = 1
+              AND fragment.is_active = FALSE
+              AND fragment.created_at >= $1 AND fragment.created_at < $2
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM memories AS event
+                  WHERE event.layer = 2
+                    AND fragment.id = ANY(COALESCE(event.merged_from, ARRAY[]::INTEGER[]))
+              )
+        """, start_utc, end_utc)
+        return int(result.split()[-1]) if result else 0
+
+
 async def create_event_memory(title: str, content: str, importance: int, 
                                event_date, merged_from: list):
     """创建事件记忆（从碎片合并而来）"""

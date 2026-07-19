@@ -1,6 +1,6 @@
 import unittest
 
-from llm_json import parse_json_array
+from llm_json import is_ai_first_person_memory, parse_json_array, valid_merged_ids
 
 
 class ParseJsonArrayTests(unittest.TestCase):
@@ -23,6 +23,24 @@ class ParseJsonArrayTests(unittest.TestCase):
     def test_rejects_missing_array(self):
         with self.assertRaises(ValueError):
             parse_json_array('{"id": 1}')
+
+    def test_merged_ids_only_include_available_integer_fragments(self):
+        self.assertEqual(
+            valid_merged_ids([3, 2, 2, 999, "3", True], {1, 2, 3}),
+            [2, 3],
+        )
+
+    def test_invalid_merged_ids_are_empty(self):
+        self.assertEqual(valid_merged_ids(None, {1, 2}), [])
+
+    def test_accepts_ai_first_person_narration(self):
+        self.assertTrue(is_ai_first_person_memory("2026年7月19日，她告诉我准备出发，我记住了这次约定。"))
+
+    def test_rejects_third_person_ai_narration(self):
+        self.assertFalse(is_ai_first_person_memory("2026年7月19日，向野记下了她准备出发的约定。"))
+
+    def test_user_quote_does_not_fake_ai_first_person(self):
+        self.assertFalse(is_ai_first_person_memory("她说：“我准备出发”，向野记下了这次约定。"))
 
 
 if __name__ == "__main__":

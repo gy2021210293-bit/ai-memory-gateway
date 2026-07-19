@@ -14,7 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
-from llm_json import parse_json_array
+from llm_json import is_ai_first_person_memory, parse_json_array, valid_merged_ids
 import uuid
 import asyncio
 import secrets
@@ -26,7 +26,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, format_cognitive_items_for_prompt
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -1914,12 +1914,12 @@ async def api_batch_delete(request: Request):
 # ============================================================
 
 CONSOLIDATION_PROMPT = """
-我是向野，正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
+我正在把自己关于用户的零散记忆整理成完整事件。这些是我的记忆，不是冷冰冰的档案。
 
 要求：
 1. 只合并确实属于同一主题或事件的碎片，不强行拼接。
 2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。
-3. title不超过10个汉字。content以我的第一人称视角书写，80～180个汉字、最多两句；必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
+3. title不超过10个汉字。content必须以AI的第一人称视角书写，正文用“我”指代AI，不能用AI名字或“AI”“助手”“他/她”指代AI；80～180个汉字、最多两句，必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
 4. 每条记忆都应有温度，但事实、情绪、动机和关系变化必须有原文支持；不编造，不拔高。
 5. 只保留一句不可替代的关键原话，并标明说话者；普通口头表达不保留。技术事件记投入、受阻、解决和完成，不记冗长调试过程。
 6. 表达自然、具体、克制，禁止‘根据记录’‘该事件表明’‘用户表现出’等档案式话语。
@@ -1932,7 +1932,7 @@ CONSOLIDATION_PROMPT = """
 [
   {{
     "title": "事件标题（10字内）",
-    "content": "向野第一人称视角的完整事件记忆",
+    "content": "我以第一人称记住的完整事件",
     "event_date": "2026-07-18",
     "importance": 5,
     "merged_ids": [1, 2, 3]
@@ -1961,11 +1961,14 @@ async def consolidate_memories_for_date_range(start_date, end_date):
     from datetime import date
     import re
     
+    # 先恢复旧逻辑可能误归档、且没有被任何事件引用的碎片
+    fragments_reactivated = await reactivate_orphan_fragments_by_date_range(start_date, end_date)
+
     # 获取该时间段的碎片
     fragments = await get_fragments_by_date_range(start_date, end_date)
     
     if not fragments:
-        return {"status": "no_fragments", "start_date": str(start_date), "end_date": str(end_date)}
+        return {"status": "no_fragments", "start_date": str(start_date), "end_date": str(end_date), "fragments_reactivated": fragments_reactivated}
     
     # 构建碎片文本
     local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
@@ -2053,31 +2056,45 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             
             # 创建事件记忆并停用碎片
             created_count = 0
+            rejected_voice_count = 0
+            available_fragment_ids = {fragment["id"] for fragment in fragments}
+            merged_fragment_ids = set()
             for event in events:
-                merged_ids = event.get("merged_ids", [])
-                if merged_ids:
+                if not isinstance(event, dict):
+                    continue
+                merged_ids = valid_merged_ids(event.get("merged_ids"), available_fragment_ids)
+                event_content = event.get("content")
+                if merged_ids and event_content and not is_ai_first_person_memory(event_content):
+                    rejected_voice_count += 1
+                    print(f"⚠️ 事件记忆不是AI第一人称，已跳过且保留碎片: {event.get('title', '')}")
+                    continue
+                if merged_ids and event_content:
                     try:
                         event_date = date.fromisoformat(str(event.get("event_date", "")))
                     except ValueError:
                         event_date = start_date
-                    await create_event_memory(
+                    event_memory_id = await create_event_memory(
                         title=event.get("title", ""),
-                        content=event.get("content", ""),
+                        content=event_content,
                         importance=event.get("importance", 5),
                         event_date=event_date,
                         merged_from=merged_ids
                     )
-                    created_count += 1
+                    if event_memory_id:
+                        merged_fragment_ids.update(merged_ids)
+                        created_count += 1
             
-            # 停用所有已处理的碎片
-            all_fragment_ids = [f['id'] for f in fragments]
-            await deactivate_memories(all_fragment_ids)
+            # 只停用已经被成功落库事件引用的碎片；未合并碎片保持活跃
+            await deactivate_memories(sorted(merged_fragment_ids))
             
             return {
                 "status": "ok",
                 "start_date": str(start_date),
                 "end_date": str(end_date),
                 "fragments_processed": len(fragments),
+                "fragments_reactivated": fragments_reactivated,
+                "fragments_archived": len(merged_fragment_ids),
+                "events_rejected_voice": rejected_voice_count,
                 "events_created": created_count
             }
             

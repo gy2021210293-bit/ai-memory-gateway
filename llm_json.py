@@ -24,3 +24,21 @@ def parse_json_array(raw: Any) -> list:
 
     detail = f": {last_error}" if last_error else ""
     raise ValueError(f"LLM响应中没有有效的JSON数组{detail}")
+
+
+def valid_merged_ids(raw_ids: Any, available_ids: set[int]) -> list[int]:
+    if not isinstance(raw_ids, list):
+        return []
+    return sorted({
+        memory_id for memory_id in raw_ids
+        if isinstance(memory_id, int)
+        and not isinstance(memory_id, bool)
+        and memory_id in available_ids
+    })
+
+
+def is_ai_first_person_memory(content: Any) -> bool:
+    if not isinstance(content, str) or not content.strip():
+        return False
+    narration = re.sub(r'“[^”]*”|‘[^’]*’|"[^"]*"', '', content)
+    return "我" in narration
