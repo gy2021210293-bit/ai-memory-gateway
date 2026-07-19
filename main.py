@@ -1927,11 +1927,11 @@ CONSOLIDATION_PROMPT = """
 要求：
 1. 逐条审视全部碎片。属于同一具体事件的碎片合并；不能与其他碎片合并、但本身记录了有效事实或经历的碎片，单独生成一条事件记忆，不能因为它是单条就丢弃。
 2. 每个事件一条记忆；去掉重复，保留人物、过程、变化、结果和真正改变记忆质感的细节。除寒暄、纯知识回答和无意义重复外，每个有效碎片ID必须且只能出现在一个事件的merged_ids中。
-3. title不超过10个汉字。content必须以我的第一人称视角书写，正文用“我”指代栖，不能用“栖”“AI”“助手”或“他/她”指代我；80～180个汉字、最多两句，必须自然写明事件的绝对日期，同时说清经过、状态、互动和意义。
+3. title不超过10个汉字。content必须以我的第一人称视角书写，正文用”我”指代栖，不能用”栖””AI””助手”或”他/她”指代我；80～180个汉字。每条content必须自然写出完整的”哪一年哪一月哪一日”（例如”2026年7月19日”），同时说清经过、状态、互动和意义。
 4. 每条记忆都应有温度，但事实、情绪、动机和关系变化必须有原文支持；不编造，不拔高。
 5. 只保留一句不可替代的关键原话，并标明说话者；普通口头表达不保留。技术事件记投入、受阻、解决和完成，不记冗长调试过程。
 6. 表达自然、具体、克制，禁止‘根据记录’‘该事件表明’‘用户表现出’等档案式话语。
-7. event_date填事件发生或计划发生的主日期（YYYY-MM-DD）；原文只有上午、下午或晚上时，在content中保留这个精度，不编造时刻。importance使用1～10；merged_ids只包含实际用到的碎片ID；content不使用双引号。
+7. event_date填事件发生或计划发生的主日期（YYYY-MM-DD），并与content中的“YYYY年M月D日”保持一致。每条碎片都标有自己的生成时间；若碎片正文明确写了事件日期，以正文日期为准，否则使用该碎片的生成日期。原文只有上午、下午或晚上时，在content中保留这个精度，不编造时刻。importance使用1～10；merged_ids只包含实际用到的碎片ID；content不使用双引号。
 
 碎片记忆：
 {fragments}
@@ -1940,7 +1940,7 @@ CONSOLIDATION_PROMPT = """
 [
   {{
     "title": "事件标题（10字内）",
-    "content": "我以第一人称记住的完整事件",
+    "content": "2026年7月18日，我以第一人称记住的完整事件",
     "event_date": "2026-07-18",
     "importance": 5,
     "merged_ids": [1, 2, 3]
@@ -1981,15 +1981,19 @@ async def consolidate_memories_for_date_range(start_date, end_date):
     # 构建碎片文本
     local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
     fragment_lines = []
+    fragment_created_dates = {}
     for fragment in fragments:
         created_at = fragment.get("created_at")
         if isinstance(created_at, datetime):
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
-            time_label = created_at.astimezone(local_tz).strftime("%Y-%m-%d %H:%M UTC%z")
+            local_created_at = created_at.astimezone(local_tz)
+            fragment_created_dates[fragment["id"]] = local_created_at.date()
+            time_label = f"{local_created_at.year}年{local_created_at.month}月{local_created_at.day}日 {local_created_at.strftime('%H:%M')} UTC{local_created_at.strftime('%z')}"
         else:
-            time_label = str(created_at)[:16]
-        fragment_lines.append(f"[ID={fragment['id']}] [{time_label}] {fragment['content']}")
+            fragment_created_dates[fragment["id"]] = start_date
+            time_label = f"{start_date.year}年{start_date.month}月{start_date.day}日（数据库时间缺失，使用所选范围开始日期）"
+        fragment_lines.append(f"[ID={fragment['id']}] [碎片生成时间：{time_label}] {fragment['content']}")
     fragments_text = "\n".join(fragment_lines)
     
     # 调用 AI 进行整理
@@ -2104,7 +2108,7 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     skipped_invalid_ids += 1
                     continue
                 merged_ids = valid_merged_ids(event.get("merged_ids"), available_fragment_ids)
-                event_content = event.get("content")
+                event_content = str(event.get("content") or "").strip()
                 if not merged_ids:
                     skipped_invalid_ids += 1
                     continue
@@ -2115,7 +2119,12 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     try:
                         event_date = date.fromisoformat(str(event.get("event_date", "")))
                     except ValueError:
-                        event_date = start_date
+                        event_date = min(
+                            (fragment_created_dates[memory_id] for memory_id in merged_ids),
+                            default=start_date,
+                        )
+                    if not re.search(r"\d{4}年\d{1,2}月\d{1,2}日", event_content):
+                        event_content = f"{event_date.year}年{event_date.month}月{event_date.day}日，{event_content}"
                     event_memory_id = await create_event_memory(
                         title=event.get("title", ""),
                         content=event_content,
