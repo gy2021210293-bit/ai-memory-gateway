@@ -13,9 +13,12 @@
   <aside id="panel"><button id="panel-close" aria-label="Close">×</button><div class="p-accent"></div><div class="p-cat" id="p-cat"></div><div class="p-title" id="p-title"></div><div class="p-body" id="p-body"></div><div id="p-meta"></div><div class="p-date" id="p-date"></div></aside>
   <div id="tt"></div><div id="hint">Scroll to zoom · drag to pan<br>click to dive in · Esc to go back</div>
   <script>
-    window.MEMORY_UI_CONFIG = { user: { name: 'Events', color: '#aae6c8' }, ai: { name: 'Core', color: '#ffe0aa' } };
+    window.MEMORY_UI_CONFIG = {
+      user: { name: {{ ui_user_name | tojson }}, color: '#aae6c8' },
+      ai: { name: {{ ui_ai_name | tojson }}, color: '#ffe0aa' }
+    };
     document.querySelector('.settings-link').href = `/dashboard${window.location.search}`;
   </script>
-  <script type="module" src="/static/constellation/main.js?v=2"></script>
+  <script type="module" src="/static/constellation/main.js?v=3"></script>
 </body>
 </html>

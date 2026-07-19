@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, format_cognitive_items_for_prompt
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, normalize_entity_profile
 import memory_extractor as _memory_extractor_module
@@ -78,6 +79,8 @@ CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # roun
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 CACHE_TTL = os.getenv("CACHE_TTL", "5m")  # 缓存TTL：5m(默认) | 1h。1h写入费2x(5m是1.25x)读都0.1x，消息间隔常超5分钟的慢聊场景1h更划算
 PARTITION_SESSION_ID = os.getenv("PARTITION_SESSION_ID", "")
+UI_USER_NAME = os.getenv("UI_USER_NAME", "晏晏")
+UI_AI_NAME = os.getenv("UI_AI_NAME", "栖")
 
 
 def make_cache_control() -> dict:
@@ -371,13 +374,11 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
     if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
         return SYSTEM_PROMPT
     
-    if MAX_MEMORIES_INJECT <= 0:
-        return SYSTEM_PROMPT
-    
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
-        
-        if not memories:
+        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
+        cognitive_text = format_cognitive_items_for_prompt(await list_cognitive_items(active_only=True))
+
+        if not memories and not cognitive_text:
             return SYSTEM_PROMPT
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
@@ -401,7 +402,10 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         entity_overview = _format_matched_entity_overview(memories)
         entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
         
+        cognitive_section = f"\n{cognitive_text}\n" if cognitive_text else ""
         enhanced_prompt = f"""{SYSTEM_PROMPT}
+
+{cognitive_section}
 
 【从过往对话中检索到的相关记忆】
 {entity_section}
@@ -856,6 +860,10 @@ async def build_partitioned_messages(
     
     if current_user_msg:
         parts = [build_time_injection()]
+
+        cognitive_text = await build_cognitive_text()
+        if cognitive_text:
+            parts.append(cognitive_text)
         
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
             mem_text = await build_memory_text(user_message)
@@ -912,6 +920,10 @@ async def _build_basic_cached(
     
     if current_user_msg:
         parts = [build_time_injection()]
+
+        cognitive_text = await build_cognitive_text()
+        if cognitive_text:
+            parts.append(cognitive_text)
         
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
             mem_text = await build_memory_text(user_message)
@@ -964,6 +976,15 @@ async def build_memory_text(user_message: str) -> str:
         )
     except Exception as e:
         print(f"⚠️ 记忆检索失败: {e}")
+        return ""
+
+
+async def build_cognitive_text() -> str:
+    """Format manually confirmed active cognition for partitioned chat requests."""
+    try:
+        return format_cognitive_items_for_prompt(await list_cognitive_items(active_only=True))
+    except Exception as e:
+        print(f"⚠️ 认知模型读取失败: {e}")
         return ""
 
 
@@ -1617,7 +1638,10 @@ async def constellation_page(request: Request):
     """Read-only star-map view backed by the gateway memory API."""
     if not MEMORY_ENABLED:
         return HTMLResponse("<h3>记忆系统未启用（设置 MEMORY_ENABLED=true 开启）</h3>")
-    return templates.TemplateResponse(request, "constellation.html")
+    return templates.TemplateResponse(request, "constellation.html", {
+        "ui_user_name": UI_USER_NAME,
+        "ui_ai_name": UI_AI_NAME,
+    })
 
 
 
@@ -1661,6 +1685,42 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
 async def api_get_entities():
     """List entities with aliases and linked-memory counts."""
     return {"entities": await list_entities()}
+
+
+@app.get("/api/cognitive-items")
+async def api_get_cognitive_items():
+    return {"items": await list_cognitive_items()}
+
+
+@app.post("/api/cognitive-items")
+async def api_create_cognitive_item(request: Request):
+    try:
+        result = await save_cognitive_item(await request.json())
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.put("/api/cognitive-items/{item_id}")
+async def api_update_cognitive_item(item_id: int, request: Request):
+    try:
+        result = await save_cognitive_item(await request.json(), item_id=item_id)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result.get("error"):
+        status_code = 404 if result["error"] == "认知项不存在" else 400
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.delete("/api/cognitive-items/{item_id}")
+async def api_delete_cognitive_item(item_id: int):
+    result = await delete_cognitive_item(item_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
 
 
 @app.get("/api/entities/{entity_id}/memories")

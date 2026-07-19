@@ -77,9 +77,10 @@ export async function loadUniverse() {
     if (unlinked.length) cons.push(makeConstellation('unlinked', 'Unlinked memories', 'Life', unlinked));
 
     universe.constellations = cons;
+    const ui = window.MEMORY_UI_CONFIG || { user: { name: '晏晏' }, ai: { name: '栖' } };
     universe.core = [
-        { name: 'Events', content: events.length ? `${events.length} consolidated event memories` : 'No event memories yet' },
-        { name: 'Core', content: cores.length ? cores.map(titleOf).join('\n') : 'No core memories yet' },
+        { name: ui.user.name, content: events.length ? `${events.length} 段共同事件记忆` : '共同经历仍在形成' },
+        { name: ui.ai.name, content: cores.length ? cores.map(titleOf).join('\n') : '核心记忆仍在形成' },
     ];
     universe.bridges = [];
     universe.galaxyBridges = [];

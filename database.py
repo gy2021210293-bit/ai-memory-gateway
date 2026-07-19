@@ -50,6 +50,16 @@ USER_ENTITY_NAMES = {
     if name.strip()
 }
 
+COGNITIVE_SUBJECTS = {"user", "self", "relationship"}
+COGNITIVE_TYPES = {
+    "identity_anchor", "stable_trait", "preference", "current_state",
+    "active_hypothesis", "commitment", "learned_lesson", "interaction_need",
+    "capability_boundary",
+}
+COGNITIVE_ITEM_MAX_CHARS = 160
+COGNITIVE_ITEMS_PER_SUBJECT = 4
+COGNITIVE_PROMPT_MAX_CHARS = 1200
+
 
 # ============================================================
 # 连接池管理
@@ -288,6 +298,23 @@ async def init_tables():
                 END IF;
             END $$;
         """)
+
+        # ---- 三元认知模型：用户 / AI 自我 / 双方关系 ----
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cognitive_items (
+                id                  SERIAL PRIMARY KEY,
+                subject             TEXT NOT NULL CHECK (subject IN ('user', 'self', 'relationship')),
+                cognitive_type      TEXT NOT NULL,
+                content             TEXT NOT NULL,
+                confidence          REAL NOT NULL DEFAULT 0.7 CHECK (confidence >= 0 AND confidence <= 1),
+                evidence_memory_ids INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+                status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+                created_by          TEXT NOT NULL DEFAULT 'manual',
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_cognitive_items_subject_status ON cognitive_items (subject, status);")
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -2242,3 +2269,122 @@ async def merge_entities(source_id: int, target_id: int):
             """, target_id, source["name"], source["normalized_name"])
             await conn.execute("DELETE FROM entities WHERE id = $1", source_id)
     return {"status": "ok", "source_id": source_id, "target_id": target_id}
+
+
+# ============================================================
+# 三元认知模型
+# ============================================================
+
+def normalize_cognitive_item_input(data: dict) -> dict:
+    """Validate the deliberately small manual cognitive-item schema."""
+    subject = str(data.get("subject", "")).strip().lower()
+    cognitive_type = str(data.get("cognitive_type", "")).strip().lower()
+    content = re.sub(r"\s+", " ", str(data.get("content", "")).strip())[:COGNITIVE_ITEM_MAX_CHARS]
+    if subject not in COGNITIVE_SUBJECTS:
+        raise ValueError("subject 必须是 user、self 或 relationship")
+    if cognitive_type not in COGNITIVE_TYPES:
+        raise ValueError("不支持的认知类型")
+    if not content:
+        raise ValueError("认知内容不能为空")
+    try:
+        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.7))))
+    except (TypeError, ValueError):
+        raise ValueError("confidence 必须是 0 到 1 之间的数字")
+    evidence_ids = []
+    for value in data.get("evidence_memory_ids", []) or []:
+        try:
+            memory_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if memory_id > 0 and memory_id not in evidence_ids:
+            evidence_ids.append(memory_id)
+    return {
+        "subject": subject,
+        "cognitive_type": cognitive_type,
+        "content": content,
+        "confidence": confidence,
+        "evidence_memory_ids": evidence_ids[:50],
+    }
+
+
+def format_cognitive_items_for_prompt(items: list) -> str:
+    if not items:
+        return ""
+    subject_labels = {"user": "对用户的认知", "self": "AI 自我认知", "relationship": "关系认知"}
+    groups = {subject: [] for subject in COGNITIVE_SUBJECTS}
+    for item in items:
+        if item.get("status", "active") == "active" and item.get("subject") in groups:
+            uncertainty = "（待确认）" if item.get("cognitive_type") == "active_hypothesis" else ""
+            if len(groups[item["subject"]]) < COGNITIVE_ITEMS_PER_SUBJECT:
+                content = str(item.get("content", ""))[:COGNITIVE_ITEM_MAX_CHARS]
+                groups[item["subject"]].append(f"- [{item.get('cognitive_type', '认知')}] {content}{uncertainty}")
+
+    selected = {subject: [] for subject in COGNITIVE_SUBJECTS}
+    used_chars = len("【三元认知模型】\n\n使用规则：以当前用户消息为最高优先级；待确认项不能当作事实；自然体现相关认知，不要向用户展示内部字段。")
+    for index in range(COGNITIVE_ITEMS_PER_SUBJECT):
+        for subject in ("user", "self", "relationship"):
+            if index >= len(groups[subject]):
+                continue
+            line = groups[subject][index]
+            section_cost = len(line) + 1 + (len(subject_labels[subject]) + 3 if not selected[subject] else 0)
+            if used_chars + section_cost <= COGNITIVE_PROMPT_MAX_CHARS:
+                selected[subject].append(line)
+                used_chars += section_cost
+    sections = [f"【{subject_labels[subject]}】\n" + "\n".join(selected[subject])
+                for subject in ("user", "self", "relationship") if selected[subject]]
+    if not sections:
+        return ""
+    return "【三元认知模型】\n" + "\n\n".join(sections) + (
+        "\n\n使用规则：以当前用户消息为最高优先级；待确认项不能当作事实；"
+        "自然体现相关认知，不要向用户展示内部字段。"
+    )
+
+
+async def list_cognitive_items(active_only: bool = False):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        where = "WHERE status = 'active'" if active_only else ""
+        rows = await conn.fetch(f"""
+            SELECT id, subject, cognitive_type, content, confidence,
+                   evidence_memory_ids, status, created_by, created_at, updated_at
+            FROM cognitive_items {where}
+            ORDER BY CASE subject WHEN 'user' THEN 1 WHEN 'self' THEN 2 ELSE 3 END,
+                     updated_at DESC, id DESC
+        """)
+        return [dict(row) for row in rows]
+
+
+async def save_cognitive_item(data: dict, item_id: int = None):
+    item = normalize_cognitive_item_input(data)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        evidence_ids = item["evidence_memory_ids"]
+        if evidence_ids:
+            rows = await conn.fetch("SELECT id FROM memories WHERE id = ANY($1::int[])", evidence_ids)
+            if {row["id"] for row in rows} != set(evidence_ids):
+                return {"error": "包含不存在的证据记忆 ID"}
+        if item_id is None:
+            row = await conn.fetchrow("""
+                INSERT INTO cognitive_items
+                    (subject, cognitive_type, content, confidence, evidence_memory_ids)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+            """, item["subject"], item["cognitive_type"], item["content"],
+                 item["confidence"], evidence_ids)
+        else:
+            row = await conn.fetchrow("""
+                UPDATE cognitive_items SET subject = $2, cognitive_type = $3, content = $4,
+                    confidence = $5, evidence_memory_ids = $6, updated_at = NOW()
+                WHERE id = $1 RETURNING *
+            """, item_id, item["subject"], item["cognitive_type"], item["content"],
+                 item["confidence"], evidence_ids)
+            if not row:
+                return {"error": "认知项不存在"}
+    return {"status": "ok", "item": dict(row)}
+
+
+async def delete_cognitive_item(item_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM cognitive_items WHERE id = $1", item_id)
+    return {"status": "ok"} if result != "DELETE 0" else {"error": "认知项不存在"}

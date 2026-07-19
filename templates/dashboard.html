@@ -43,6 +43,10 @@
                     <span class="nav-icon">◎</span>
                     <span class="nav-label">实体管理</span>
                 </a>
+                <a href="#" class="nav-item" data-section="cognition">
+                    <span class="nav-icon">◉</span>
+                    <span class="nav-label">认知模型</span>
+                </a>
                 <a href="#" class="nav-item" data-section="settings">
                     <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></span>
                     <span class="nav-label">设置</span>
@@ -500,6 +504,52 @@
                 </div>
             </section>
 
+            <section id="section-cognition" class="section">
+                <div class="section-header">
+                    <h1>三元认知模型</h1>
+                    <p class="section-desc">维护栖对晏晏、对自己以及对双方关系的当前理解。只有这里确认保存的活跃认知会进入聊天上下文。</p>
+                </div>
+                <div class="card">
+                    <div class="toolbar" style="align-items:flex-end;flex-wrap:wrap">
+                        <label>对象
+                            <select id="cognition-subject" class="input">
+                                <option value="user">晏晏（用户）</option>
+                                <option value="self">栖（AI 自我）</option>
+                                <option value="relationship">双方关系</option>
+                            </select>
+                        </label>
+                        <label>类型
+                            <select id="cognition-type" class="input">
+                                <option value="stable_trait">稳定特质</option>
+                                <option value="preference">偏好</option>
+                                <option value="current_state">当前状态</option>
+                                <option value="active_hypothesis">待确认假设</option>
+                                <option value="identity_anchor">身份锚点</option>
+                                <option value="commitment">承诺</option>
+                                <option value="learned_lesson">成长经验</option>
+                                <option value="interaction_need">互动需要</option>
+                                <option value="capability_boundary">能力边界</option>
+                            </select>
+                        </label>
+                        <label>置信度
+                            <input id="cognition-confidence" class="input" type="number" min="0" max="1" step="0.05" value="0.7" style="width:100px">
+                        </label>
+                        <label>证据记忆 ID
+                            <input id="cognition-evidence" class="input" placeholder="例如 12, 35" style="width:180px">
+                        </label>
+                    </div>
+                    <label style="display:block;margin-top:14px">认知内容
+                        <textarea id="cognition-content" class="textarea" rows="3" maxlength="160" placeholder="写下简洁、可验证、适合长期使用的认知（最多160字）"></textarea>
+                    </label>
+                    <div class="toolbar" style="margin-top:12px">
+                        <button class="btn btn-primary" id="cognition-save" onclick="saveCognitiveItem()">新增认知</button>
+                        <button class="btn btn-secondary" id="cognition-cancel" onclick="cancelCognitiveEdit()" style="display:none">取消编辑</button>
+                        <span id="cognition-status" class="section-desc"></span>
+                    </div>
+                </div>
+                <div id="cognition-groups"></div>
+            </section>
+
             <section id="section-settings" class="section">
                 <div class="section-header">
                     <h2>设置</h2>
@@ -694,6 +744,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=3.6"></script>
+    <script src="/static/js/dashboard.js?v=3.7"></script>
 </body>
 </html>

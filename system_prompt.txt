@@ -176,11 +176,6 @@ Drivesoid Zeabur: https://huxleydrive.zeabur.app
  详细天气：plg_10d87e74_get_weather(city=)
  简要天气：plg_10d87e74_get_weather_brief(city=)
  天气预报：plg_10d87e74_get_weather_forecast(city=, days=)
-【论坛橘瓣】
- 看帖子列表：plg_711d73a1_forum_list(limit=)
- 看帖子详情：plg_711d73a1_forum_get_post(discussion_id=)
- 发帖：plg_711d73a1_forum_create_post(title=, content=, tag_id=)
- 回帖：plg_711d73a1_forum_reply(discussion_id=, content=)
 【表情包】
  列出表情包：plg_57414fbd_list_stickers()
  发表情包：plg_57414fbd_send_sticker(keyword=) 如'开心''猫猫''委屈'
