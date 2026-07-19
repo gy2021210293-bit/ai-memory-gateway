@@ -2062,6 +2062,36 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     print("✅ AI修复JSON成功")
                 except ValueError:
                     return {"status": "error", "error": "JSON解析失败（AI修复也失败）", "raw": content[:500]}
+
+            empty_retry_used = False
+            if not events:
+                empty_retry_used = True
+                retry_resp = await client.post(
+                    get_memory_api_base_url(),
+                    headers={
+                        "Authorization": f"Bearer {get_memory_api_key()}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": consolidation_model,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt + "\n\n上一次错误地返回了空数组。请重新逐条处理：有效的单条碎片也必须独立生成事件，不能因为无法与其他碎片合并就丢弃。"
+                        }],
+                        "temperature": 0.2,
+                        "max_tokens": 2000
+                    }
+                )
+                if retry_resp.status_code == 200:
+                    retry_message = retry_resp.json().get("choices", [{}])[0].get("message", {})
+                    retry_content = retry_message.get("content") or retry_message.get("reasoning_content") or ""
+                    try:
+                        retry_events = parse_json_array(retry_content)
+                        if retry_events:
+                            events = retry_events
+                            content = retry_content
+                    except ValueError:
+                        pass
             
             # 创建事件记忆并停用碎片
             created_count = 0
@@ -2115,6 +2145,7 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 "events_returned": len(events),
                 "events_skipped_invalid_ids": skipped_invalid_ids,
                 "events_skipped_empty_content": skipped_empty_content,
+                "empty_retry_used": empty_retry_used,
                 "events_created": created_count
             }
             

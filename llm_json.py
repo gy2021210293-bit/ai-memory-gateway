@@ -4,23 +4,39 @@ from typing import Any
 
 
 def parse_json_array(raw: Any) -> list:
-    """Extract the first valid JSON array from an LLM text response."""
+    """Extract the final non-empty top-level JSON array from an LLM response."""
     text = str(raw or "").lstrip("\ufeff")
     variants = (text, re.sub(r",\s*([}\]])", r"\1", text))
     last_error = None
+    empty_array = None
 
     for candidate in variants:
         decoder = json.JSONDecoder(strict=False)
-        for index, char in enumerate(candidate):
-            if char != "[":
-                continue
+        arrays = []
+        index = 0
+        while True:
+            index = candidate.find("[", index)
+            if index < 0:
+                break
             try:
-                value, _ = decoder.raw_decode(candidate, index)
+                value, end = decoder.raw_decode(candidate, index)
             except json.JSONDecodeError as exc:
                 last_error = exc
+                index += 1
                 continue
             if isinstance(value, list):
-                return value
+                arrays.append(value)
+                index = end  # skip nested arrays inside this successfully decoded array
+            else:
+                index += 1
+        non_empty = [value for value in arrays if value]
+        if non_empty:
+            return non_empty[-1]
+        if arrays:
+            empty_array = []
+
+    if empty_array is not None:
+        return empty_array
 
     detail = f": {last_error}" if last_error else ""
     raise ValueError(f"LLM响应中没有有效的JSON数组{detail}")

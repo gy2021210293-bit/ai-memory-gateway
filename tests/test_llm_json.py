@@ -11,6 +11,16 @@ class ParseJsonArrayTests(unittest.TestCase):
         raw = '[分析] 我整理好了。\n```json\n[{"id": 2}]\n```'
         self.assertEqual(parse_json_array(raw), [{"id": 2}])
 
+    def test_prefers_final_non_empty_array_over_earlier_empty_example(self):
+        raw = '不能返回空数组 []。最终结果：[{"id": 4, "merged_ids": [1, 2]}]'
+        self.assertEqual(
+            parse_json_array(raw),
+            [{"id": 4, "merged_ids": [1, 2]}],
+        )
+
+    def test_returns_empty_only_when_no_non_empty_array_exists(self):
+        self.assertEqual(parse_json_array('没有事件：[]'), [])
+
     def test_allows_unescaped_newline_in_string(self):
         self.assertEqual(
             parse_json_array('[{"content": "第一行\n第二行"}]'),
