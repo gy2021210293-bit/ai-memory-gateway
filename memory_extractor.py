@@ -227,20 +227,18 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     # 调用 LLM 提取记忆
     try:
         async with httpx.AsyncClient(timeout=60) as client:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            request_messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
+            ]
             response = await client.post(
                 get_memory_api_base_url(),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": MEMORY_MODEL,
-                    "max_tokens": 1000,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
-                    ],
-                },
+                headers=headers,
+                json={"model": MEMORY_MODEL, "messages": request_messages},
             )
 
             if response.status_code != 200:
@@ -261,37 +259,33 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             # 打印模型原始返回（截断防刷屏）
             print(f"📝 记忆模型原始返回:\n{text[:500]}", flush=True)
 
-            # 清理可能的 markdown 格式
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-            # 强力JSON提取：如果上面清理后仍然解析失败，用正则兜底
             try:
-                memories = json.loads(text)
-            except json.JSONDecodeError:
-                # 尝试从文本中提取第一个 [...] 结构
-                match = re.search(r'\[.*\]', text, re.DOTALL)
-                if match:
-                    try:
-                        memories = json.loads(match.group())
-                        print(f"📝 JSON正则兜底提取成功")
-                    except json.JSONDecodeError as e:
-                        print(f"⚠️  记忆提取结果解析失败: {e}")
-                        print(f"⚠️  原始文本前500字符: {text[:500]}")
-                        return []
-                else:
-                    print(f"⚠️  记忆提取结果中未找到JSON数组")
-                    print(f"⚠️  原始文本前500字符: {text[:500]}")
+                memories = parse_json_array(text)
+            except ValueError as first_error:
+                print(f"⚠️  记忆提取结果解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_messages = request_messages + [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": "上一次输出没有给出可解析的最终结果。请重新检查原对话，只返回最终 JSON 数组，不要分析、解释或使用 Markdown。",
+                    },
+                ]
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers=headers,
+                    json={"model": MEMORY_MODEL, "messages": retry_messages},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️  记忆提取重试失败: {retry_response.status_code} {retry_response.text[:300]}")
                     return []
-
-            if not isinstance(memories, list):
-                return []
+                retry_text = _extract_response_content(retry_response.json())
+                try:
+                    memories = parse_json_array(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️  记忆提取重试结果仍无法解析: {retry_error}")
+                    print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
+                    return []
 
             # 验证格式
             valid_memories = []
