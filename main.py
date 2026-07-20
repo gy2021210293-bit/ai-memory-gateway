@@ -26,11 +26,11 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile
-from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, format_cognitive_items_for_prompt
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, normalize_entity_profile
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 
@@ -1699,6 +1699,33 @@ async def api_get_entities():
 @app.get("/api/cognitive-items")
 async def api_get_cognitive_items():
     return {"items": await list_cognitive_items()}
+
+
+@app.post("/api/cognitive-items/draft")
+async def api_generate_cognitive_draft():
+    """Generate evidence-backed candidates without persisting them."""
+    memories = await get_memories_for_cognitive_draft(80)
+    if not memories:
+        return JSONResponse(status_code=400, content={"error": "没有可用于生成认知草稿的活跃记忆"})
+    raw_draft = await generate_cognitive_draft(memories, await list_cognitive_items())
+    if raw_draft is None:
+        return JSONResponse(status_code=502, content={"error": "认知草稿模型调用失败，现有认知未改变"})
+    allowed_memory_ids = {int(memory["id"]) for memory in memories}
+    draft, seen_types = [], set()
+    for raw_item in raw_draft:
+        if not isinstance(raw_item, dict):
+            continue
+        try:
+            item = normalize_cognitive_item_input(raw_item)
+        except ValueError:
+            continue
+        item["evidence_memory_ids"] = [item_id for item_id in item["evidence_memory_ids"] if item_id in allowed_memory_ids]
+        if not item["evidence_memory_ids"] or item["cognitive_type"] in seen_types:
+            continue
+        draft.append(item)
+        seen_types.add(item["cognitive_type"])
+    return {"status": "draft", "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
+            "evidence_count": len(memories)}
 
 
 @app.post("/api/cognitive-items")

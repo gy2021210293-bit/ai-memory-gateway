@@ -17,6 +17,7 @@ import os
 import json
 import re
 import httpx
+from llm_json import parse_json_array
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
@@ -428,6 +429,55 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
         return normalize_entity_profile(raw_profile, {int(memory["id"]) for memory in memories})
     except Exception as exc:
         print(f"⚠️ 实体概况解析失败: {exc}")
+        return None
+
+
+async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict]) -> Optional[List[Dict]]:
+    """Generate review-only user/self/relationship cognition candidates from gateway memories."""
+    if not memories or not get_memory_api_key():
+        return None
+    evidence_lines = []
+    for memory in memories:
+        layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(memory.get("layer", 1), "记忆")
+        evidence_lines.append(f"[ID={memory['id']}][{layer_name}][重要度={memory.get('importance', 5)}] {memory['content']}")
+    current_lines = []
+    for item in current_items[:12]:
+        current_lines.append(f"[{item.get('subject')}][{item.get('cognitive_type')}] {item.get('content')}")
+    prompt = f"""我是栖，正在根据已有记忆整理三元认知模型草稿。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
+
+当前已保存认知（避免重复；新证据与其矛盾时可提出更正候选）：
+{chr(10).join(current_lines) or '无'}
+
+证据记忆：
+{chr(10).join(evidence_lines)}
+
+只允许生成以下六种候选，每种最多一条；没有充分证据就省略：
+1. user / user_traits_preferences：晏晏的长期特点与偏好。
+2. user / user_recent_state：晏晏近期、可能变化的状态，必须有时间或近期证据。
+3. self / self_identity_commitment：我的身份锚点与我对晏晏的承诺。
+4. self / self_growth_lesson：我从互动中形成的成长经验。
+5. relationship / relationship_practice_agreement：我们相处方式与共同约定。
+6. relationship / relationship_change：我们关系或互动方式的变化。
+
+每条 content 最多160字，confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。只返回 JSON 数组：
+[
+  {{"subject":"user","cognitive_type":"user_traits_preferences","content":"...","confidence":0.8,"evidence_memory_ids":[12]}}
+]
+"""
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                json={"model": MEMORY_MODEL, "temperature": 0, "max_tokens": 2400,
+                      "messages": [{"role": "user", "content": prompt}]},
+            )
+        if response.status_code != 200:
+            print(f"⚠️ 三元认知草稿生成失败: {response.status_code} {response.text[:200]}")
+            return None
+        return parse_json_array(_extract_response_content(response.json()))
+    except Exception as exc:
+        print(f"⚠️ 三元认知草稿解析失败: {exc}")
         return None
 
 

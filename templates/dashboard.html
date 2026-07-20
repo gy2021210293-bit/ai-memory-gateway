@@ -507,7 +507,14 @@
             <section id="section-cognition" class="section">
                 <div class="section-header">
                     <h1>三元认知模型</h1>
-                    <p class="section-desc">维护栖对晏晏、对自己以及对双方关系的当前理解。只有这里确认保存的活跃认知会进入聊天上下文。</p>
+                    <p class="section-desc">维护栖对晏晏、对自己以及对双方关系的六项核心理解。草稿只供预览，确认保存后才会进入聊天上下文。</p>
+                </div>
+                <div class="card">
+                    <div class="toolbar" style="justify-content:space-between">
+                        <span class="section-desc">基于最多80条高信号活跃记忆生成草稿，复用记忆模型。</span>
+                        <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft()">根据已有记忆生成草稿</button>
+                    </div>
+                    <div id="cognition-draft-list" style="display:none;margin-top:16px"></div>
                 </div>
                 <div class="card">
                     <div class="toolbar" style="align-items:flex-end;flex-wrap:wrap">
@@ -520,15 +527,12 @@
                         </label>
                         <label>类型
                             <select id="cognition-type" class="input">
-                                <option value="stable_trait">稳定特质</option>
-                                <option value="preference">偏好</option>
-                                <option value="current_state">当前状态</option>
-                                <option value="active_hypothesis">待确认假设</option>
-                                <option value="identity_anchor">身份锚点</option>
-                                <option value="commitment">承诺</option>
-                                <option value="learned_lesson">成长经验</option>
-                                <option value="interaction_need">互动需要</option>
-                                <option value="capability_boundary">能力边界</option>
+                                <option value="user_traits_preferences">长期特点与偏好</option>
+                                <option value="user_recent_state">近期状态</option>
+                                <option value="self_identity_commitment">身份锚点与承诺</option>
+                                <option value="self_growth_lesson">成长经验</option>
+                                <option value="relationship_practice_agreement">相处方式与共同约定</option>
+                                <option value="relationship_change">关系变化</option>
                             </select>
                         </label>
                         <label>置信度
@@ -744,6 +748,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=3.7"></script>
+    <script src="/static/js/dashboard.js?v=3.8"></script>
 </body>
 </html>

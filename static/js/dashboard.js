@@ -234,14 +234,20 @@ async function backfillEntities() {
 // ============================================
 let cognitiveItems = [];
 let editingCognitiveId = null;
+let pendingCognitiveDrafts = [];
 
 const COGNITION_SUBJECT_LABELS = {
     user: '晏晏（用户）', self: '栖（AI 自我）', relationship: '双方关系',
 };
 const COGNITION_TYPE_LABELS = {
-    identity_anchor: '身份锚点', stable_trait: '稳定特质', preference: '偏好',
-    current_state: '当前状态', active_hypothesis: '待确认假设', commitment: '承诺',
-    learned_lesson: '成长经验', interaction_need: '互动需要', capability_boundary: '能力边界',
+    user_traits_preferences: '长期特点与偏好', user_recent_state: '近期状态',
+    self_identity_commitment: '身份锚点与承诺', self_growth_lesson: '成长经验',
+    relationship_practice_agreement: '相处方式与共同约定', relationship_change: '关系变化',
+};
+const COGNITION_TYPE_SUBJECTS = {
+    user_traits_preferences: 'user', user_recent_state: 'user',
+    self_identity_commitment: 'self', self_growth_lesson: 'self',
+    relationship_practice_agreement: 'relationship', relationship_change: 'relationship',
 };
 
 async function loadCognitiveItems() {
@@ -307,6 +313,88 @@ function renderCognitiveItems() {
         });
         root.appendChild(card);
     });
+}
+
+async function generateCognitiveDraft() {
+    const button = document.getElementById('cognition-draft-generate');
+    const status = document.getElementById('cognition-status');
+    button.disabled = true;
+    status.textContent = '正在根据已有记忆生成认知草稿…';
+    try {
+        const response = await fetch('/api/cognitive-items/draft', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '生成失败');
+        pendingCognitiveDrafts = data.items || [];
+        renderCognitiveDrafts(data);
+        status.textContent = pendingCognitiveDrafts.length
+            ? `已生成 ${pendingCognitiveDrafts.length} 条草稿（模型：${data.model}）。请逐条确认保存。`
+            : '模型没有发现证据充分的新认知草稿。';
+    } catch (error) {
+        status.textContent = error.message;
+    } finally {
+        button.disabled = false;
+    }
+}
+
+function renderCognitiveDrafts(meta = {}) {
+    const root = document.getElementById('cognition-draft-list');
+    root.replaceChildren();
+    root.style.display = '';
+    const heading = document.createElement('h3');
+    heading.textContent = `模型草稿（证据来自 ${meta.evidence_count || '已有'} 条记忆，尚未保存）`;
+    root.appendChild(heading);
+    if (!pendingCognitiveDrafts.length) {
+        const empty = document.createElement('p');
+        empty.className = 'section-desc';
+        empty.textContent = '没有可供确认的草稿。';
+        root.appendChild(empty);
+        return;
+    }
+    pendingCognitiveDrafts.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'memory-item';
+        row.style.marginTop = '10px';
+        const title = document.createElement('strong');
+        title.textContent = `${COGNITION_SUBJECT_LABELS[item.subject]} · ${COGNITION_TYPE_LABELS[item.cognitive_type]}`;
+        const content = document.createElement('div');
+        content.style.margin = '6px 0';
+        content.textContent = item.content;
+        const evidence = document.createElement('div');
+        evidence.className = 'section-desc';
+        evidence.textContent = `置信度 ${Number(item.confidence).toFixed(2)} · 证据记忆：${item.evidence_memory_ids.map(id => `#${id}`).join('、')}`;
+        const action = document.createElement('button');
+        action.className = 'btn btn-primary btn-sm';
+        action.style.marginTop = '8px';
+        action.textContent = '编辑并保存';
+        action.onclick = () => useCognitiveDraft(index);
+        row.append(title, content, evidence, action);
+        root.appendChild(row);
+    });
+}
+
+function useCognitiveDraft(index) {
+    const item = pendingCognitiveDrafts[index];
+    if (!item) return;
+    editingCognitiveId = null;
+    document.getElementById('cognition-subject').value = item.subject;
+    document.getElementById('cognition-type').value = item.cognitive_type;
+    document.getElementById('cognition-content').value = item.content;
+    document.getElementById('cognition-confidence').value = item.confidence;
+    document.getElementById('cognition-evidence').value = item.evidence_memory_ids.join(', ');
+    document.getElementById('cognition-save').textContent = '确认保存草稿';
+    document.getElementById('cognition-cancel').style.display = '';
+    document.getElementById('cognition-content').focus();
+}
+
+function syncCognitiveSubject() {
+    const cognitiveType = document.getElementById('cognition-type').value;
+    document.getElementById('cognition-subject').value = COGNITION_TYPE_SUBJECTS[cognitiveType] || 'user';
+}
+
+function syncCognitiveType() {
+    const subject = document.getElementById('cognition-subject').value;
+    const type = Object.entries(COGNITION_TYPE_SUBJECTS).find(([, value]) => value === subject)?.[0];
+    if (type) document.getElementById('cognition-type').value = type;
 }
 
 function cognitiveFormData() {
@@ -405,6 +493,8 @@ document.addEventListener('DOMContentLoaded', () => {
     loadMemories();
     // 加载导出统计
     loadExportStats();
+    document.getElementById('cognition-type')?.addEventListener('change', syncCognitiveSubject);
+    document.getElementById('cognition-subject')?.addEventListener('change', syncCognitiveType);
 });
 
 // ============================================

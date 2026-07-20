@@ -52,12 +52,17 @@ USER_ENTITY_NAMES = {
 
 COGNITIVE_SUBJECTS = {"user", "self", "relationship"}
 COGNITIVE_TYPES = {
-    "identity_anchor", "stable_trait", "preference", "current_state",
-    "active_hypothesis", "commitment", "learned_lesson", "interaction_need",
-    "capability_boundary",
+    "user_traits_preferences", "user_recent_state",
+    "self_identity_commitment", "self_growth_lesson",
+    "relationship_practice_agreement", "relationship_change",
+}
+COGNITIVE_TYPE_SUBJECTS = {
+    "user_traits_preferences": "user", "user_recent_state": "user",
+    "self_identity_commitment": "self", "self_growth_lesson": "self",
+    "relationship_practice_agreement": "relationship", "relationship_change": "relationship",
 }
 COGNITIVE_ITEM_MAX_CHARS = 160
-COGNITIVE_ITEMS_PER_SUBJECT = 4
+COGNITIVE_ITEMS_PER_SUBJECT = 2
 COGNITIVE_PROMPT_MAX_CHARS = 1200
 
 
@@ -1728,6 +1733,20 @@ async def get_fragments_by_date_range(start_date, end_date):
         return [dict(r) for r in rows]
 
 
+async def get_memories_for_cognitive_draft(limit: int = 80):
+    """Return a bounded, high-signal evidence set for manual cognitive draft generation."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, importance, created_at, layer, title
+            FROM memories
+            WHERE is_active = TRUE
+            ORDER BY layer DESC, importance DESC, created_at DESC
+            LIMIT $1
+        """, limit)
+        return [dict(row) for row in rows]
+
+
 async def reactivate_orphan_fragments_by_date_range(start_date, end_date):
     """恢复指定日期范围内未被任何事件引用的误归档碎片。"""
     local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
@@ -2308,6 +2327,8 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         raise ValueError("subject 必须是 user、self 或 relationship")
     if cognitive_type not in COGNITIVE_TYPES:
         raise ValueError("不支持的认知类型")
+    if COGNITIVE_TYPE_SUBJECTS[cognitive_type] != subject:
+        raise ValueError("认知类型与认知对象不匹配")
     if not content:
         raise ValueError("认知内容不能为空")
     try:
@@ -2336,12 +2357,17 @@ def format_cognitive_items_for_prompt(items: list) -> str:
         return ""
     subject_labels = {"user": "对用户的认知", "self": "AI 自我认知", "relationship": "关系认知"}
     groups = {subject: [] for subject in COGNITIVE_SUBJECTS}
+    seen_types = set()
     for item in items:
-        if item.get("status", "active") == "active" and item.get("subject") in groups:
-            uncertainty = "（待确认）" if item.get("cognitive_type") == "active_hypothesis" else ""
+        cognitive_type = item.get("cognitive_type")
+        if (item.get("status", "active") == "active" and item.get("subject") in groups
+                and cognitive_type in COGNITIVE_TYPES
+                and COGNITIVE_TYPE_SUBJECTS[cognitive_type] == item.get("subject")
+                and cognitive_type not in seen_types):
             if len(groups[item["subject"]]) < COGNITIVE_ITEMS_PER_SUBJECT:
                 content = str(item.get("content", ""))[:COGNITIVE_ITEM_MAX_CHARS]
-                groups[item["subject"]].append(f"- [{item.get('cognitive_type', '认知')}] {content}{uncertainty}")
+                groups[item["subject"]].append(f"- [{cognitive_type}] {content}")
+                seen_types.add(cognitive_type)
 
     selected = {subject: [] for subject in COGNITIVE_SUBJECTS}
     used_chars = len("【三元认知模型】\n\n使用规则：以当前用户消息为最高优先级；待确认项不能当作事实；自然体现相关认知，不要向用户展示内部字段。")
