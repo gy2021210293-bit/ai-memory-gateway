@@ -240,7 +240,7 @@ const COGNITION_SUBJECT_LABELS = {
     user: '晏晏（用户）', self: '栖（AI 自我）', relationship: '双方关系',
 };
 const COGNITION_TYPE_LABELS = {
-    user_traits_preferences: '长期特点与偏好', user_recent_state: '近期状态',
+    user_traits_preferences: '身份、长期特点与偏好', user_recent_state: '当前所在地、状态与未来计划',
     self_identity_commitment: '身份锚点与承诺', self_growth_lesson: '成长经验',
     relationship_practice_agreement: '相处方式与共同约定', relationship_change: '关系变化',
 };
@@ -383,6 +383,7 @@ function useCognitiveDraft(index) {
     document.getElementById('cognition-evidence').value = item.evidence_memory_ids.join(', ');
     document.getElementById('cognition-save').textContent = '确认保存草稿';
     document.getElementById('cognition-cancel').style.display = '';
+    updateCognitiveCharHint();
     document.getElementById('cognition-content').focus();
 }
 
@@ -395,6 +396,12 @@ function syncCognitiveType() {
     const subject = document.getElementById('cognition-subject').value;
     const type = Object.entries(COGNITION_TYPE_SUBJECTS).find(([, value]) => value === subject)?.[0];
     if (type) document.getElementById('cognition-type').value = type;
+}
+
+function updateCognitiveCharHint() {
+    const content = document.getElementById('cognition-content').value;
+    const hint = document.getElementById('cognition-char-hint');
+    if (hint) hint.textContent = `${content.length} 字；建议控制在 240 字左右，超过仍可保存。`;
 }
 
 function cognitiveFormData() {
@@ -440,6 +447,7 @@ function editCognitiveItem(item) {
     document.getElementById('cognition-evidence').value = (item.evidence_memory_ids || []).join(', ');
     document.getElementById('cognition-save').textContent = '保存修改';
     document.getElementById('cognition-cancel').style.display = '';
+    updateCognitiveCharHint();
     document.getElementById('cognition-content').focus();
 }
 
@@ -450,6 +458,7 @@ function cancelCognitiveEdit() {
     document.getElementById('cognition-confidence').value = '0.7';
     document.getElementById('cognition-save').textContent = '新增认知';
     document.getElementById('cognition-cancel').style.display = 'none';
+    updateCognitiveCharHint();
 }
 
 async function removeCognitiveItem(itemId) {
@@ -495,6 +504,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadExportStats();
     document.getElementById('cognition-type')?.addEventListener('change', syncCognitiveSubject);
     document.getElementById('cognition-subject')?.addEventListener('change', syncCognitiveType);
+    document.getElementById('cognition-content')?.addEventListener('input', updateCognitiveCharHint);
 });
 
 // ============================================

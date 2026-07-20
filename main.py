@@ -1698,7 +1698,7 @@ async def api_get_entities():
 
 @app.get("/api/cognitive-items")
 async def api_get_cognitive_items():
-    return {"items": await list_cognitive_items()}
+    return {"items": await list_cognitive_items(active_only=True)}
 
 
 @app.post("/api/cognitive-items/draft")

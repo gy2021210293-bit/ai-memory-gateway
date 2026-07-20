@@ -452,14 +452,14 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 {chr(10).join(evidence_lines)}
 
 只允许生成以下六种候选，每种最多一条；没有充分证据就省略：
-1. user / user_traits_preferences：晏晏的长期特点与偏好。
-2. user / user_recent_state：晏晏近期、可能变化的状态，必须有时间或近期证据。
+1. user / user_traits_preferences：晏晏的身份、长期特点与偏好。
+2. user / user_recent_state：晏晏当前所在地、当前状态，以及有明确证据支持的未来可能状态或计划；必须保留计划、可能性和时间的不确定性。
 3. self / self_identity_commitment：我的身份锚点与我对晏晏的承诺。
 4. self / self_growth_lesson：我从互动中形成的成长经验。
 5. relationship / relationship_practice_agreement：我们相处方式与共同约定。
 6. relationship / relationship_change：我们关系或互动方式的变化。
 
-每条 content 最多160字，confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。只返回 JSON 数组：
+每条 content 建议120-240字，以简洁为主但不要为凑字数遗漏关键信息；confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。只返回 JSON 数组：
 [
   {{"subject":"user","cognitive_type":"user_traits_preferences","content":"...","confidence":0.8,"evidence_memory_ids":[12]}}
 ]

@@ -55,11 +55,19 @@ class CognitiveModelTests(unittest.TestCase):
                 "subject": "self", "cognitive_type": "user_recent_state", "content": "x",
             })
 
-    def test_normalize_limits_item_content(self):
+    def test_normalize_keeps_long_item_content(self):
         item = database.normalize_cognitive_item_input({
             "subject": "self", "cognitive_type": "self_identity_commitment", "content": "栖" * 300,
         })
-        self.assertEqual(len(item["content"]), database.COGNITIVE_ITEM_MAX_CHARS)
+        self.assertEqual(len(item["content"]), 300)
+
+    def test_prompt_does_not_truncate_a_selected_item(self):
+        content = "详细认知" * 80
+        prompt = database.format_cognitive_items_for_prompt([{
+            "subject": "user", "cognitive_type": "user_traits_preferences",
+            "content": content, "status": "active",
+        }])
+        self.assertIn(content, prompt)
 
     def test_prompt_groups_the_three_cognitive_objects(self):
         prompt = database.format_cognitive_items_for_prompt([

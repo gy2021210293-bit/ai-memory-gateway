@@ -61,7 +61,7 @@ COGNITIVE_TYPE_SUBJECTS = {
     "self_identity_commitment": "self", "self_growth_lesson": "self",
     "relationship_practice_agreement": "relationship", "relationship_change": "relationship",
 }
-COGNITIVE_ITEM_MAX_CHARS = 160
+COGNITIVE_ITEM_RECOMMENDED_CHARS = 240
 COGNITIVE_ITEMS_PER_SUBJECT = 2
 COGNITIVE_PROMPT_MAX_CHARS = 1200
 
@@ -2322,7 +2322,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
     """Validate the deliberately small manual cognitive-item schema."""
     subject = str(data.get("subject", "")).strip().lower()
     cognitive_type = str(data.get("cognitive_type", "")).strip().lower()
-    content = re.sub(r"\s+", " ", str(data.get("content", "")).strip())[:COGNITIVE_ITEM_MAX_CHARS]
+    content = re.sub(r"\s+", " ", str(data.get("content", "")).strip())
     if subject not in COGNITIVE_SUBJECTS:
         raise ValueError("subject 必须是 user、self 或 relationship")
     if cognitive_type not in COGNITIVE_TYPES:
@@ -2365,7 +2365,7 @@ def format_cognitive_items_for_prompt(items: list) -> str:
                 and COGNITIVE_TYPE_SUBJECTS[cognitive_type] == item.get("subject")
                 and cognitive_type not in seen_types):
             if len(groups[item["subject"]]) < COGNITIVE_ITEMS_PER_SUBJECT:
-                content = str(item.get("content", ""))[:COGNITIVE_ITEM_MAX_CHARS]
+                content = str(item.get("content", ""))
                 groups[item["subject"]].append(f"- [{cognitive_type}] {content}")
                 seen_types.add(cognitive_type)
 
@@ -2413,6 +2413,18 @@ async def save_cognitive_item(data: dict, item_id: int = None):
             rows = await conn.fetch("SELECT id FROM memories WHERE id = ANY($1::int[])", evidence_ids)
             if {row["id"] for row in rows} != set(evidence_ids):
                 return {"error": "包含不存在的证据记忆 ID"}
+        if item_id is None:
+            existing = await conn.fetchrow("""
+                SELECT id FROM cognitive_items
+                WHERE subject = $1 AND cognitive_type = $2 AND status = 'active'
+                ORDER BY updated_at DESC, id DESC LIMIT 1
+            """, item["subject"], item["cognitive_type"])
+            if existing:
+                item_id = existing["id"]
+                await conn.execute("""
+                    UPDATE cognitive_items SET status = 'superseded', updated_at = NOW()
+                    WHERE subject = $1 AND cognitive_type = $2 AND status = 'active' AND id != $3
+                """, item["subject"], item["cognitive_type"], item_id)
         if item_id is None:
             row = await conn.fetchrow("""
                 INSERT INTO cognitive_items

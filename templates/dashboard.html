@@ -527,8 +527,8 @@
                         </label>
                         <label>类型
                             <select id="cognition-type" class="input">
-                                <option value="user_traits_preferences">长期特点与偏好</option>
-                                <option value="user_recent_state">近期状态</option>
+                                <option value="user_traits_preferences">身份、长期特点与偏好</option>
+                                <option value="user_recent_state">当前所在地、状态与未来计划</option>
                                 <option value="self_identity_commitment">身份锚点与承诺</option>
                                 <option value="self_growth_lesson">成长经验</option>
                                 <option value="relationship_practice_agreement">相处方式与共同约定</option>
@@ -543,7 +543,8 @@
                         </label>
                     </div>
                     <label style="display:block;margin-top:14px">认知内容
-                        <textarea id="cognition-content" class="textarea" rows="3" maxlength="160" placeholder="写下简洁、可验证、适合长期使用的认知（最多160字）"></textarea>
+                        <textarea id="cognition-content" class="textarea" rows="3" placeholder="写下简洁、可验证、适合长期使用的认知（建议约240字，不会被截断）"></textarea>
+                        <small id="cognition-char-hint" class="section-desc">建议控制在 240 字左右，超过仍可保存。</small>
                     </label>
                     <div class="toolbar" style="margin-top:12px">
                         <button class="btn btn-primary" id="cognition-save" onclick="saveCognitiveItem()">新增认知</button>
@@ -748,6 +749,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=3.8"></script>
+    <script src="/static/js/dashboard.js?v=3.9"></script>
 </body>
 </html>
