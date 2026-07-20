@@ -80,21 +80,17 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertIn("关系认知", prompt)
         self.assertIn("以当前用户消息为最高优先级", prompt)
 
-    def test_prompt_has_per_subject_and_total_budgets(self):
-        items = []
-        for subject in ("user", "self", "relationship"):
-            for index in range(6):
-                items.append({
-                    "subject": subject, "cognitive_type": {
-                        "user": "user_traits_preferences", "self": "self_identity_commitment",
-                        "relationship": "relationship_practice_agreement",
-                    }[subject],
-                    "content": f"{subject}-{index}-" + "认知" * 100, "status": "active",
-                })
+    def test_prompt_uses_fixed_slot_order_without_total_budget(self):
+        items = [
+            {"subject": database.COGNITIVE_TYPE_SUBJECTS[cognitive_type],
+             "cognitive_type": cognitive_type, "content": cognitive_type + "-" + "x" * 300,
+             "status": "active"}
+            for cognitive_type in reversed(database.COGNITIVE_TYPE_ORDER)
+        ]
         prompt = database.format_cognitive_items_for_prompt(items)
-        self.assertLessEqual(len(prompt), database.COGNITIVE_PROMPT_MAX_CHARS)
-        for subject in ("user", "self", "relationship"):
-            self.assertLessEqual(prompt.count(f"[{subject}-"), database.COGNITIVE_ITEMS_PER_SUBJECT)
+        positions = [prompt.index(f"[{cognitive_type}]") for cognitive_type in database.COGNITIVE_TYPE_ORDER]
+        self.assertEqual(positions, sorted(positions))
+        self.assertGreater(len(prompt), 1200)
 
     def test_prompt_keeps_only_one_item_per_cognitive_slot(self):
         prompt = database.format_cognitive_items_for_prompt([

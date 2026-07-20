@@ -51,11 +51,12 @@ USER_ENTITY_NAMES = {
 }
 
 COGNITIVE_SUBJECTS = {"user", "self", "relationship"}
-COGNITIVE_TYPES = {
+COGNITIVE_TYPE_ORDER = (
     "user_traits_preferences", "user_recent_state",
     "self_identity_commitment", "self_growth_lesson",
     "relationship_practice_agreement", "relationship_change",
-}
+)
+COGNITIVE_TYPES = set(COGNITIVE_TYPE_ORDER)
 AI_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
     for name in os.getenv("AI_ENTITY_NAMES", "Huxley,栖,向野").split(",")
@@ -68,8 +69,6 @@ COGNITIVE_TYPE_SUBJECTS = {
     "relationship_practice_agreement": "relationship", "relationship_change": "relationship",
 }
 COGNITIVE_ITEM_RECOMMENDED_CHARS = 240
-COGNITIVE_ITEMS_PER_SUBJECT = 2
-COGNITIVE_PROMPT_MAX_CHARS = 1200
 
 
 # ============================================================
@@ -2367,32 +2366,22 @@ def format_cognitive_items_for_prompt(items: list) -> str:
     if not items:
         return ""
     subject_labels = {"user": "对用户的认知", "self": "AI 自我认知", "relationship": "关系认知"}
-    groups = {subject: [] for subject in COGNITIVE_SUBJECTS}
-    seen_types = set()
+    items_by_type = {}
     for item in items:
         cognitive_type = item.get("cognitive_type")
-        if (item.get("status", "active") == "active" and item.get("subject") in groups
+        if (item.get("status", "active") == "active" and item.get("subject") in COGNITIVE_SUBJECTS
                 and cognitive_type in COGNITIVE_TYPES
                 and COGNITIVE_TYPE_SUBJECTS[cognitive_type] == item.get("subject")
-                and cognitive_type not in seen_types):
-            if len(groups[item["subject"]]) < COGNITIVE_ITEMS_PER_SUBJECT:
-                content = str(item.get("content", ""))
-                groups[item["subject"]].append(f"- [{cognitive_type}] {content}")
-                seen_types.add(cognitive_type)
+                and cognitive_type not in items_by_type):
+            items_by_type[cognitive_type] = str(item.get("content", ""))
 
-    selected = {subject: [] for subject in COGNITIVE_SUBJECTS}
-    used_chars = len("【三元认知模型】\n\n使用规则：以当前用户消息为最高优先级；待确认项不能当作事实；自然体现相关认知，不要向用户展示内部字段。")
-    for index in range(COGNITIVE_ITEMS_PER_SUBJECT):
-        for subject in ("user", "self", "relationship"):
-            if index >= len(groups[subject]):
-                continue
-            line = groups[subject][index]
-            section_cost = len(line) + 1 + (len(subject_labels[subject]) + 3 if not selected[subject] else 0)
-            if used_chars + section_cost <= COGNITIVE_PROMPT_MAX_CHARS:
-                selected[subject].append(line)
-                used_chars += section_cost
-    sections = [f"【{subject_labels[subject]}】\n" + "\n".join(selected[subject])
-                for subject in ("user", "self", "relationship") if selected[subject]]
+    groups = {subject: [] for subject in ("user", "self", "relationship")}
+    for cognitive_type in COGNITIVE_TYPE_ORDER:
+        if cognitive_type in items_by_type:
+            subject = COGNITIVE_TYPE_SUBJECTS[cognitive_type]
+            groups[subject].append(f"- [{cognitive_type}] {items_by_type[cognitive_type]}")
+    sections = [f"【{subject_labels[subject]}】\n" + "\n".join(groups[subject])
+                for subject in ("user", "self", "relationship") if groups[subject]]
     if not sections:
         return ""
     return "【三元认知模型】\n" + "\n\n".join(sections) + (
