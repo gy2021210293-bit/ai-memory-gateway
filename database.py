@@ -56,6 +56,12 @@ COGNITIVE_TYPES = {
     "self_identity_commitment", "self_growth_lesson",
     "relationship_practice_agreement", "relationship_change",
 }
+AI_ENTITY_NAMES = {
+    re.sub(r"\s+", " ", name.strip()).casefold()
+    for name in os.getenv("AI_ENTITY_NAMES", "Huxley,栖,向野").split(",")
+    if name.strip()
+}
+EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
 COGNITIVE_TYPE_SUBJECTS = {
     "user_traits_preferences": "user", "user_recent_state": "user",
     "self_identity_commitment": "self", "self_growth_lesson": "self",
@@ -282,10 +288,10 @@ async def init_tables():
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities (entity_id);")
         # 用户本人由主记忆系统维护，不作为普通实体参与召回。
-        if USER_ENTITY_NAMES:
+        if EXCLUDED_ENTITY_NAMES:
             await conn.execute(
                 "DELETE FROM entities WHERE normalized_name = ANY($1::text[])",
-                sorted(USER_ENTITY_NAMES),
+                sorted(EXCLUDED_ENTITY_NAMES),
             )
         await conn.execute("""
             DO $$ BEGIN
@@ -2125,6 +2131,11 @@ def is_user_entity_name(name: str) -> bool:
     return normalize_entity_name(name) in USER_ENTITY_NAMES
 
 
+def is_excluded_entity_name(name: str) -> bool:
+    """Return whether a participant identity belongs in the cognitive model, not entities."""
+    return normalize_entity_name(name) in EXCLUDED_ENTITY_NAMES
+
+
 async def link_memory_entities(memory_id: int, entities: list, source: str = "extractor"):
     """Upsert extracted entities and link them to one memory."""
     if not memory_id or not entities:
@@ -2138,7 +2149,7 @@ async def link_memory_entities(memory_id: int, entities: list, source: str = "ex
                     item = {"name": item, "type": "other"}
                 name = str(item.get("name", "")).strip()
                 normalized = normalize_entity_name(name)
-                if not normalized or is_user_entity_name(name):
+                if not normalized or is_excluded_entity_name(name):
                     continue
                 entity_type = str(item.get("type", "other") or "other").strip().lower()
                 allowed_types = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}

@@ -40,6 +40,12 @@ USER_ENTITY_NAMES = {
     for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
     if name.strip()
 }
+AI_ENTITY_NAMES = {
+    re.sub(r"\s+", " ", name.strip()).casefold()
+    for name in os.getenv("AI_ENTITY_NAMES", "Huxley,栖,向野").split(",")
+    if name.strip()
+}
+EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
@@ -142,8 +148,9 @@ is explicitly present in that memory. Do not invent entities and do not use pron
 generic nouns. Format each entity as {"name": "display name", "type":
 "person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0-1.0}.
 If no explicit named entity exists, return an empty array.
-Never return the user herself as an entity. In particular, exclude 晏晏, 用户, user,
-the user, first-person pronouns, and any name configured as the user's own name.
+Never return either conversation participant as an entity. In particular, exclude 晏晏,
+Huxley, 栖, 向野, 用户, user, the user, first-person pronouns, and any configured
+user or AI participant name.
 """
 
 
@@ -153,7 +160,7 @@ def _exclude_user_entities(entities) -> List:
     for entity in entities if isinstance(entities, list) else []:
         name = entity if isinstance(entity, str) else entity.get("name", "") if isinstance(entity, dict) else ""
         normalized = re.sub(r"\s+", " ", str(name).strip()).casefold()
-        if normalized and normalized not in USER_ENTITY_NAMES:
+        if normalized and normalized not in EXCLUDED_ENTITY_NAMES:
             result.append(entity)
     return result
 

@@ -59,6 +59,19 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
             [{"name": "Alice", "type": "person"}],
         )
 
+    def test_ai_participants_are_not_entities(self):
+        for name in ("Huxley", "栖", "向野"):
+            self.assertTrue(database.is_excluded_entity_name(name))
+        self.assertEqual(
+            memory_extractor._exclude_user_entities([
+                {"name": "Huxley", "type": "person"},
+                {"name": "栖", "type": "person"},
+                {"name": "向野", "type": "person"},
+                {"name": "Alice", "type": "person"},
+            ]),
+            [{"name": "Alice", "type": "person"}],
+        )
+
     def test_all_zero_scores_stay_zero(self):
         self.assertEqual(database._min_max_normalize({1: 0.0, 2: 0.0}), {1: 0.0, 2: 0.0})
 
