@@ -1833,7 +1833,11 @@ async def api_save_entity_profile(entity_id: int, request: Request):
     result = await save_entity_profile(entity_id, profile, profile["evidence_memory_ids"], _memory_extractor_module.MEMORY_MODEL)
     if result.get("error"):
         return JSONResponse(status_code=400, content=result)
-    result["profile"] = profile
+    saved_entity = await get_entity_detail(entity_id)
+    if not saved_entity or not saved_entity.get("profile_json"):
+        return JSONResponse(status_code=500, content={"error": "实体概况保存后回读失败"})
+    result["entity"] = saved_entity
+    result["profile"] = saved_entity["profile_json"]
     return result
 
 

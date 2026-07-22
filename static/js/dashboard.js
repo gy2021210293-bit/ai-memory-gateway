@@ -236,12 +236,10 @@ async function saveEntityProfileDraft() {
         status.textContent = data.error || '保存失败';
         return;
     }
-    selectedEntity.profile_json = data.profile;
-    selectedEntity.description = data.profile.summary;
-    document.getElementById('entity-profile-current').textContent = formatEntityProfile(data.profile);
     cancelEntityProfileDraft();
+    await loadEntities();
+    await loadEntityMemories(data.entity);
     status.textContent = '实体概况已保存。';
-    loadEntities();
 }
 
 function cancelEntityProfileDraft() {
