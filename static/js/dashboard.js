@@ -102,27 +102,34 @@ function renderEntities() {
 }
 
 async function loadEntityMemories(entity) {
-    const response = await fetch(`/api/entities/${entity.id}/memories`);
-    const data = await response.json();
-    if (!response.ok || data.error) return;
-    selectedEntity = data.entity || entity;
-    pendingEntityProfile = null;
-    document.getElementById('entity-profile-draft').style.display = 'none';
-    document.getElementById('entity-memory-title').textContent = `${selectedEntity.name} 的实体详情`;
-    document.getElementById('entity-name-edit').value = selectedEntity.name || '';
-    document.getElementById('entity-type-edit').value = selectedEntity.entity_type || 'other';
-    document.getElementById('entity-aliases-edit').value = (selectedEntity.aliases || []).join('\n');
-    document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
-    const list = document.getElementById('entity-memory-list');
-    list.replaceChildren();
-    (data.memories || []).forEach(memory => {
-        const item = document.createElement('div');
-        item.className = 'memory-item';
-        item.style.marginBottom = '8px';
-        item.textContent = memory.content;
-        list.appendChild(item);
-    });
-    document.getElementById('entity-memory-card').style.display = 'block';
+    const status = document.getElementById('entity-status');
+    try {
+        const response = await fetch(`/api/entities/${entity.id}/memories`);
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        selectedEntity = data.entity || entity;
+        pendingEntityProfile = null;
+        document.getElementById('entity-profile-draft').style.display = 'none';
+        document.getElementById('entity-memory-title').textContent = `${selectedEntity.name} 的实体详情`;
+        document.getElementById('entity-name-edit').value = selectedEntity.name || '';
+        document.getElementById('entity-type-edit').value = selectedEntity.entity_type || 'other';
+        document.getElementById('entity-aliases-edit').value = (selectedEntity.aliases || []).join('\n');
+        document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
+        const list = document.getElementById('entity-memory-list');
+        list.replaceChildren();
+        (data.memories || []).forEach(memory => {
+            const item = document.createElement('div');
+            item.className = 'memory-item';
+            item.style.marginBottom = '8px';
+            item.textContent = memory.content;
+            list.appendChild(item);
+        });
+        document.getElementById('entity-memory-card').style.display = 'block';
+        return selectedEntity;
+    } catch (error) {
+        status.textContent = `实体详情加载失败：${error.message}`;
+        return null;
+    }
 }
 
 async function saveEntityEdits() {
@@ -144,9 +151,13 @@ async function saveEntityEdits() {
         });
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || '保存失败');
+        selectedEntity = data.entity;
+        document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
         await loadEntities();
-        await loadEntityMemories(data.entity);
-        status.textContent = '实体已保存。';
+        const reloaded = await loadEntityMemories(data.entity);
+        status.textContent = reloaded
+            ? '名称、类型和别名已保存；实体概况未更改。'
+            : '名称、类型和别名已保存，但详情重新加载失败。';
     } catch (error) {
         status.textContent = error.message;
     } finally {
@@ -244,10 +255,14 @@ async function saveEntityProfileDraft() {
         }
         if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
         if (!data.entity || !data.profile) throw new Error('保存接口没有返回持久化后的实体概况');
+        selectedEntity = data.entity;
+        document.getElementById('entity-profile-current').textContent = formatEntityProfile(data.profile, selectedEntity.description);
         cancelEntityProfileDraft();
         await loadEntities();
-        await loadEntityMemories(data.entity);
-        status.textContent = '实体概况已保存。';
+        const reloaded = await loadEntityMemories(data.entity);
+        status.textContent = reloaded
+            ? '实体概况已保存并重新加载。'
+            : '实体概况已保存并显示，但关联记忆重新加载失败。';
     } catch (error) {
         console.error('实体概况保存失败:', error);
         status.textContent = `实体概况保存失败：${error.message}`;
