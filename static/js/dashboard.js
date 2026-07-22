@@ -221,25 +221,39 @@ async function generateEntityProfileDraft() {
 async function saveEntityProfileDraft() {
     if (!selectedEntity || !pendingEntityProfile) return;
     const status = document.getElementById('entity-status');
+    const button = document.getElementById('entity-profile-save');
     const editedSummary = document.getElementById('entity-profile-summary-edit').value.trim();
     if (!editedSummary) {
         status.textContent = '实体摘要不能为空。';
         return;
     }
     pendingEntityProfile = { ...pendingEntityProfile, summary: editedSummary.slice(0, 200) };
-    const response = await fetch(`/api/entities/${selectedEntity.id}/profile`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile: pendingEntityProfile }),
-    });
-    const data = await response.json();
-    if (!response.ok || data.error) {
-        status.textContent = data.error || '保存失败';
-        return;
+    button.disabled = true;
+    status.textContent = '正在保存实体概况…';
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/profile`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile: pendingEntityProfile }),
+        });
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (_) {
+            throw new Error(`保存接口返回 HTTP ${response.status}：${responseText.slice(0, 160) || '空响应'}`);
+        }
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        if (!data.entity || !data.profile) throw new Error('保存接口没有返回持久化后的实体概况');
+        cancelEntityProfileDraft();
+        await loadEntities();
+        await loadEntityMemories(data.entity);
+        status.textContent = '实体概况已保存。';
+    } catch (error) {
+        console.error('实体概况保存失败:', error);
+        status.textContent = `实体概况保存失败：${error.message}`;
+    } finally {
+        button.disabled = false;
     }
-    cancelEntityProfileDraft();
-    await loadEntities();
-    await loadEntityMemories(data.entity);
-    status.textContent = '实体概况已保存。';
 }
 
 function cancelEntityProfileDraft() {

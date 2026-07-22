@@ -141,26 +141,60 @@ importance 分数 1-10，10 最重要。
 
 
 ENTITY_OUTPUT_GUIDANCE = """
-
-For every returned memory object, also return an `entities` array. Each entity must be a
-specific named person, place, organization, project, object, pet, activity, or event that
-is explicitly present in that memory. Do not invent entities and do not use pronouns or
-generic nouns. Format each entity as {"name": "display name", "type":
-"person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0-1.0}.
-If no explicit named entity exists, return an empty array.
-Never return either conversation participant as an entity. In particular, exclude 晏晏,
-Huxley, 栖, 向野, 用户, user, the user, first-person pronouns, and any configured
-user or AI participant name.
+For each returned memory, include an `entities` array containing only explicit,
+stable named entities that are useful as recurring long-term memory anchors.
+Allowed types:
+person|place|organization|project|object|pet|activity|event|other
+Return each entity as:
+{"name":"display name","type":"...","confidence":0.0-1.0}
+Exclude:
+- either conversation participant, pronouns, generic nouns, and invented names;
+- code or implementation artifacts such as functions, classes, variables,
+  configuration keys, API operations, filenames, paths, URLs, and commands;
+- incidental libraries, models, frameworks, APIs, or software terms.
+A technical product or tool may be kept only when the memory clearly establishes
+durable personal significance or recurring use. Omit candidates below 0.65
+confidence. If none qualify, return an empty array.
 """
+
+ENTITY_MIN_CONFIDENCE = 0.65
+ENTITY_FILE_EXTENSIONS = (
+    "py|pyw|js|jsx|ts|tsx|json|ya?ml|toml|ini|cfg|md|txt|csv|sql|html?|css|"
+    "sh|ps1|bat|cmd|exe|dll|so|log|xml"
+)
+
+
+def _is_code_like_entity_name(name: str) -> bool:
+    """Reject identifiers and file/path tokens that are not durable memory entities."""
+    value = str(name or "").strip().strip("`'\"")
+    if not value:
+        return False
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+", value):
+        return True
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\(.*\)", value):
+        return True
+    if re.fullmatch(rf"[^\s\\/]+\.({ENTITY_FILE_EXTENSIONS})", value, re.IGNORECASE):
+        return True
+    if re.search(rf"(^|[\\/])[^\\/]+\.({ENTITY_FILE_EXTENSIONS})$", value, re.IGNORECASE):
+        return True
+    if re.match(r"^(?:[A-Za-z]:[\\/]|\.{0,2}[\\/])", value):
+        return True
+    return False
 
 
 def _exclude_user_entities(entities) -> List:
-    """Drop user-self references before they can reach the entity store."""
+    """Drop participants, code-like names, and weak candidates before persistence."""
     result = []
     for entity in entities if isinstance(entities, list) else []:
         name = entity if isinstance(entity, str) else entity.get("name", "") if isinstance(entity, dict) else ""
         normalized = re.sub(r"\s+", " ", str(name).strip()).casefold()
-        if normalized and normalized not in EXCLUDED_ENTITY_NAMES:
+        try:
+            confidence = float(entity.get("confidence", 1.0)) if isinstance(entity, dict) else 1.0
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if (normalized and normalized not in EXCLUDED_ENTITY_NAMES
+                and confidence >= ENTITY_MIN_CONFIDENCE
+                and not _is_code_like_entity_name(name)):
             result.append(entity)
     return result
 
@@ -320,6 +354,11 @@ Extract only explicit named entities from these memory records.
 Return JSON in this format:
 [{{"memory_id": 1, "entities": [{{"name": "...", "type": "person|place|organization|project|object|pet|activity|event|other", "confidence": 0.0}}]}}]
 Omit records without entities. Do not use pronouns or generic nouns. Do not invent names.
+Only keep stable, recurring long-term anchors. Exclude functions, methods, classes,
+variables, constants, environment variables, database fields, API operations, filenames,
+paths, URLs, commands, configuration keys, and temporary technical labels. Do not keep a
+library, model, framework, API, or software term unless the memory explicitly establishes
+durable personal significance. Use confidence below 0.65 when unsure.
 Never return the user herself (including 晏晏, 用户, user, or the user) as an entity.
 
 {items}"""

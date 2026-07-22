@@ -109,6 +109,30 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
             [{"name": "Alice", "type": "person"}],
         )
 
+    def test_code_identifiers_and_files_are_not_entities(self):
+        entities = [
+            {"name": "home_garden_blind_chest", "type": "other", "confidence": 0.99},
+            {"name": "render_page()", "type": "other", "confidence": 0.99},
+            {"name": "DATABASE_URL", "type": "other", "confidence": 0.99},
+            {"name": "main.py", "type": "other", "confidence": 0.99},
+            {"name": "src/utils.js", "type": "other", "confidence": 0.99},
+            {"name": "Alice", "type": "person", "confidence": 0.99},
+            {"name": "上海", "type": "place", "confidence": 0.95},
+        ]
+        self.assertEqual(
+            [item["name"] for item in memory_extractor._exclude_user_entities(entities)],
+            ["Alice", "上海"],
+        )
+
+    def test_low_confidence_entity_is_not_persisted(self):
+        self.assertEqual(
+            memory_extractor._exclude_user_entities([
+                {"name": "可能只是术语", "type": "other", "confidence": 0.4},
+                {"name": "长期项目", "type": "project", "confidence": 0.85},
+            ]),
+            [{"name": "长期项目", "type": "project", "confidence": 0.85}],
+        )
+
     def test_all_zero_scores_stay_zero(self):
         self.assertEqual(database._min_max_normalize({1: 0.0, 2: 0.0}), {1: 0.0, 2: 0.0})
 
