@@ -109,6 +109,9 @@ async function loadEntityMemories(entity) {
     pendingEntityProfile = null;
     document.getElementById('entity-profile-draft').style.display = 'none';
     document.getElementById('entity-memory-title').textContent = `${selectedEntity.name} 的实体详情`;
+    document.getElementById('entity-name-edit').value = selectedEntity.name || '';
+    document.getElementById('entity-type-edit').value = selectedEntity.entity_type || 'other';
+    document.getElementById('entity-aliases-edit').value = (selectedEntity.aliases || []).join('\n');
     document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
     const list = document.getElementById('entity-memory-list');
     list.replaceChildren();
@@ -120,6 +123,53 @@ async function loadEntityMemories(entity) {
         list.appendChild(item);
     });
     document.getElementById('entity-memory-card').style.display = 'block';
+}
+
+async function saveEntityEdits() {
+    if (!selectedEntity) return;
+    const status = document.getElementById('entity-status');
+    const button = document.getElementById('entity-save');
+    const name = document.getElementById('entity-name-edit').value.trim();
+    const entityType = document.getElementById('entity-type-edit').value;
+    const aliases = document.getElementById('entity-aliases-edit').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (!name) {
+        status.textContent = '实体显示名称不能为空。';
+        return;
+    }
+    button.disabled = true;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, entity_type: entityType, aliases }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '保存失败');
+        await loadEntities();
+        await loadEntityMemories(data.entity);
+        status.textContent = '实体已保存。';
+    } catch (error) {
+        status.textContent = error.message;
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function deleteSelectedEntity() {
+    if (!selectedEntity) return;
+    const memoryCount = selectedEntity.memory_count ?? document.getElementById('entity-memory-list').children.length;
+    if (!confirm(`确定仅删除实体“${selectedEntity.name}”吗？\n\n将删除其别名、概况和 ${memoryCount} 条记忆关联，但不会删除任何原始记忆。`)) return;
+    const status = document.getElementById('entity-status');
+    const response = await fetch(`/api/entities/${selectedEntity.id}`, { method: 'DELETE' });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        status.textContent = data.error || '删除失败';
+        return;
+    }
+    selectedEntity = null;
+    pendingEntityProfile = null;
+    document.getElementById('entity-memory-card').style.display = 'none';
+    await loadEntities();
+    status.textContent = '实体已删除，原始记忆已保留。';
 }
 
 function parseEntityProfile(profile) {
@@ -1813,20 +1863,20 @@ async function deleteSingleMessage(msgId) {
 
 // 删除对话
 async function deleteConversation(sessionId) {
-    if (!confirm('确定删除这个对话吗？（可在回收站恢复）')) return;
+    if (!confirm('确定永久删除这个对话吗？此操作不可恢复。')) return;
     
     try {
         const resp = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
         const data = await resp.json();
-        if (data.error) {
-            alert('删除失败: ' + data.error);
+        if (!resp.ok || data.error) {
+            alert('删除失败: ' + (data.error || 'HTTP ' + resp.status));
             return;
         }
         closeConvDetail();
         if (convIsSearchMode) {
-            searchConversations();
+            await searchConversations();
         } else {
-            loadConversationList(convCurrentPage);
+            await loadConversationList(convCurrentPage);
         }
     } catch(e) {
         alert('请求失败: ' + e.message);
@@ -1867,7 +1917,7 @@ async function batchDeleteConversations() {
     const checked = document.querySelectorAll('.conv-checkbox:checked');
     if (checked.length === 0) return;
     
-    if (!confirm(`确定删除选中的 ${checked.length} 个对话吗？（可在回收站恢复）`)) return;
+    if (!confirm(`确定永久删除选中的 ${checked.length} 个对话吗？此操作不可恢复。`)) return;
     
     const sessionIds = Array.from(checked).map(cb => cb.value);
     
@@ -1878,15 +1928,16 @@ async function batchDeleteConversations() {
             body: JSON.stringify({ session_ids: sessionIds })
         });
         const data = await resp.json();
-        if (data.error) {
-            alert('批量删除失败: ' + data.error);
+        if (!resp.ok || data.error) {
+            alert('批量删除失败: ' + (data.error || 'HTTP ' + resp.status));
             return;
         }
-        
+        const pageAfterDelete = checked.length === document.querySelectorAll('.conv-checkbox').length
+            ? Math.max(1, convCurrentPage - 1) : convCurrentPage;
         if (convIsSearchMode) {
-            searchConversations();
+            await searchConversations();
         } else {
-            loadConversationList(convCurrentPage);
+            await loadConversationList(pageAfterDelete);
         }
     } catch(e) {
         alert('请求失败: ' + e.message);

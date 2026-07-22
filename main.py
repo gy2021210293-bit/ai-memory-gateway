@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile
+from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile
@@ -1767,6 +1767,23 @@ async def api_get_entity_memories(entity_id: int):
     return {"entity": entity, "memories": await get_entity_memories(entity_id)}
 
 
+@app.put("/api/entities/{entity_id}")
+async def api_update_entity(entity_id: int, request: Request):
+    result = await update_entity(entity_id, await request.json())
+    if result.get("error"):
+        status_code = 404 if result["error"] == "实体不存在" else 409 if "冲突" in result["error"] or "已存在" in result["error"] or "已是实体" in result["error"] or "已属于实体" in result["error"] else 400
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.delete("/api/entities/{entity_id}")
+async def api_delete_entity(entity_id: int):
+    result = await delete_entity(entity_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
 @app.post("/api/entities/{entity_id}/profile/draft")
 async def api_generate_entity_profile_draft(entity_id: int):
     """Generate but do not persist an entity-profile draft."""
@@ -2504,7 +2521,9 @@ async def api_delete_conversation(session_id: str):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     try:
-        await delete_conversation(session_id)
+        deleted = await delete_conversation(session_id)
+        if not deleted:
+            return JSONResponse(status_code=404, content={"error": "对话不存在或已被删除"})
         return {"status": "ok"}
     except Exception as e:
         return {"error": str(e)}
@@ -2516,10 +2535,14 @@ async def api_batch_delete(request: Request):
         return {"error": "记忆系统未启用"}
     try:
         body = await request.json()
-        ids = body.get("session_ids", [])
-        if ids:
-            await batch_delete_conversations(ids)
-        return {"status": "ok", "deleted": len(ids)}
+        raw_ids = body.get("session_ids", [])
+        if not isinstance(raw_ids, list):
+            return JSONResponse(status_code=400, content={"error": "session_ids 必须是数组"})
+        ids = list(dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip()))
+        deleted = await batch_delete_conversations(ids)
+        if ids and deleted == 0:
+            return JSONResponse(status_code=404, content={"error": "选中的对话不存在或已被删除"})
+        return {"status": "ok", "deleted": deleted, "requested": len(ids)}
     except Exception as e:
         return {"error": str(e)}
 

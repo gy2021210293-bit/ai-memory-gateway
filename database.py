@@ -1476,15 +1476,32 @@ async def get_conversations_paginated(page: int = 1, per_page: int = 20):
 async def delete_conversation(session_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM conversations WHERE session_id = $1", session_id)
-        await conn.execute("DELETE FROM session_cache_state WHERE session_id = $1", session_id)
+        async with conn.transaction():
+            deleted = await conn.fetch(
+                "DELETE FROM conversations WHERE session_id = $1 RETURNING id", session_id
+            )
+            await conn.execute("DELETE FROM session_cache_state WHERE session_id = $1", session_id)
+            await conn.execute("DELETE FROM token_usage WHERE session_id = $1", session_id)
+    return bool(deleted)
 
 
 async def batch_delete_conversations(session_ids: list):
+    if not session_ids:
+        return 0
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM conversations WHERE session_id = ANY($1)", session_ids)
-        await conn.execute("DELETE FROM session_cache_state WHERE session_id = ANY($1)", session_ids)
+        async with conn.transaction():
+            deleted = await conn.fetch(
+                "DELETE FROM conversations WHERE session_id = ANY($1::text[]) RETURNING session_id",
+                session_ids,
+            )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = ANY($1::text[])", session_ids
+            )
+            await conn.execute(
+                "DELETE FROM token_usage WHERE session_id = ANY($1::text[])", session_ids
+            )
+    return len({row["session_id"] for row in deleted})
 
 
 async def merge_sessions_to_target(source_ids: list, target_id: str) -> dict:
@@ -2126,6 +2143,44 @@ def normalize_entity_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
 
 
+ENTITY_TYPES = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}
+
+
+def normalize_entity_update(data: dict) -> dict:
+    """Validate editable entity fields and deduplicate aliases by lookup key."""
+    name = str(data.get("name", "")).strip()
+    normalized_name = normalize_entity_name(name)
+    if not normalized_name:
+        raise ValueError("实体显示名称不能为空")
+    if is_excluded_entity_name(name):
+        raise ValueError("对话参与者不能作为普通实体")
+
+    entity_type = str(data.get("entity_type", "")).strip().lower()
+    if entity_type not in ENTITY_TYPES:
+        raise ValueError("实体类型无效")
+
+    raw_aliases = data.get("aliases", [])
+    if not isinstance(raw_aliases, list):
+        raise ValueError("aliases 必须是数组")
+    aliases = []
+    seen = set()
+    for raw_alias in raw_aliases:
+        alias = str(raw_alias).strip()
+        normalized_alias = normalize_entity_name(alias)
+        if not normalized_alias or normalized_alias == normalized_name or normalized_alias in seen:
+            continue
+        if is_excluded_entity_name(alias):
+            raise ValueError("对话参与者不能作为实体别名")
+        aliases.append({"alias": alias, "normalized_alias": normalized_alias})
+        seen.add(normalized_alias)
+    return {
+        "name": name,
+        "normalized_name": normalized_name,
+        "entity_type": entity_type,
+        "aliases": aliases,
+    }
+
+
 def is_user_entity_name(name: str) -> bool:
     return normalize_entity_name(name) in USER_ENTITY_NAMES
 
@@ -2229,6 +2284,76 @@ async def get_entity_detail(entity_id: int):
             GROUP BY e.id
         """, entity_id)
         return dict(row) if row else None
+
+
+async def update_entity(entity_id: int, data: dict):
+    """Update an entity and replace its aliases after checking the shared name namespace."""
+    try:
+        value = normalize_entity_update(data)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    alias_keys = [item["normalized_alias"] for item in value["aliases"]]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            current = await conn.fetchrow("SELECT id FROM entities WHERE id = $1 FOR UPDATE", entity_id)
+            if not current:
+                return {"error": "实体不存在"}
+
+            name_owner = await conn.fetchrow(
+                "SELECT id, name FROM entities WHERE normalized_name = $1 AND id <> $2",
+                value["normalized_name"], entity_id,
+            )
+            if name_owner:
+                return {"error": f"实体名称“{value['name']}”已存在，请使用“合并实体”功能"}
+            alias_owner = await conn.fetchrow(
+                """SELECT ea.entity_id, ea.alias, e.name
+                   FROM entity_aliases ea JOIN entities e ON e.id = ea.entity_id
+                   WHERE ea.normalized_alias = $1 AND ea.entity_id <> $2""",
+                value["normalized_name"], entity_id,
+            )
+            if alias_owner:
+                return {"error": f"名称“{value['name']}”已是实体“{alias_owner['name']}”的别名"}
+
+            if alias_keys:
+                entity_conflict = await conn.fetchrow(
+                    "SELECT id, name FROM entities WHERE normalized_name = ANY($1::text[]) AND id <> $2",
+                    alias_keys, entity_id,
+                )
+                if entity_conflict:
+                    return {"error": f"别名与实体“{entity_conflict['name']}”的名称冲突"}
+                alias_conflict = await conn.fetchrow(
+                    """SELECT ea.alias, e.name FROM entity_aliases ea
+                       JOIN entities e ON e.id = ea.entity_id
+                       WHERE ea.normalized_alias = ANY($1::text[]) AND ea.entity_id <> $2""",
+                    alias_keys, entity_id,
+                )
+                if alias_conflict:
+                    return {"error": f"别名“{alias_conflict['alias']}”已属于实体“{alias_conflict['name']}”"}
+
+            await conn.execute(
+                """UPDATE entities SET name = $2, normalized_name = $3, entity_type = $4, updated_at = NOW()
+                   WHERE id = $1""",
+                entity_id, value["name"], value["normalized_name"], value["entity_type"],
+            )
+            await conn.execute("DELETE FROM entity_aliases WHERE entity_id = $1", entity_id)
+            if value["aliases"]:
+                await conn.executemany(
+                    "INSERT INTO entity_aliases (entity_id, alias, normalized_alias) VALUES ($1, $2, $3)",
+                    [(entity_id, item["alias"], item["normalized_alias"]) for item in value["aliases"]],
+                )
+    return {"status": "ok", "entity": await get_entity_detail(entity_id)}
+
+
+async def delete_entity(entity_id: int):
+    """Delete only the entity; FK cascades remove aliases, profile fields, and memory links."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM entities WHERE id = $1", entity_id)
+    if result == "DELETE 0":
+        return {"error": "实体不存在"}
+    return {"status": "ok", "entity_id": entity_id}
 
 
 async def save_entity_profile(entity_id: int, profile: dict, evidence_ids: list, model: str):

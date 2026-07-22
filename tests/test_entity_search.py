@@ -34,6 +34,43 @@ class FakeConnection:
         return self.rows
 
 
+class FakeContext:
+    def __init__(self, value=None):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class FakeEntityConnection:
+    def __init__(self, fetchrows=None, execute_result="DELETE 1"):
+        self.fetchrows = list(fetchrows or [])
+        self.execute_result = execute_result
+        self.calls = []
+
+    def transaction(self):
+        return FakeContext()
+
+    async def fetchrow(self, sql, *args):
+        self.calls.append(("fetchrow", sql, args))
+        return self.fetchrows.pop(0) if self.fetchrows else None
+
+    async def execute(self, sql, *args):
+        self.calls.append(("execute", sql, args))
+        return self.execute_result
+
+
+class FakePool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return FakeContext(self.conn)
+
+
 class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
     def test_message_time_uses_configured_timezone(self):
         rendered = memory_extractor._format_message_time(
@@ -139,6 +176,59 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(profile["relationship"]), 120)
         self.assertEqual(len(profile["stable_facts"]), 6)
         self.assertTrue(all(len(item) <= 80 for item in profile["stable_facts"]))
+
+    def test_entity_update_normalizes_and_deduplicates_aliases(self):
+        value = database.normalize_entity_update({
+            "name": "  Alice  ", "entity_type": "PERSON",
+            "aliases": [" Ally ", "ally", "Alice", ""],
+        })
+        self.assertEqual(value["name"], "Alice")
+        self.assertEqual(value["entity_type"], "person")
+        self.assertEqual(value["aliases"], [{"alias": "Ally", "normalized_alias": "ally"}])
+
+    async def test_entity_rename_collision_requires_merge(self):
+        conn = FakeEntityConnection(fetchrows=[{"id": 1}, {"id": 2, "name": "Alice"}])
+        old_get_pool = database.get_pool
+        database.get_pool = lambda: _async_value(FakePool(conn))
+        try:
+            result = await database.update_entity(1, {"name": "Alice", "entity_type": "person", "aliases": []})
+        finally:
+            database.get_pool = old_get_pool
+        self.assertIn("合并实体", result["error"])
+        self.assertFalse(any(call[0] == "execute" for call in conn.calls))
+
+    async def test_entity_alias_cannot_use_another_entity_name(self):
+        conn = FakeEntityConnection(fetchrows=[
+            {"id": 1}, None, None, {"id": 2, "name": "Alice"},
+        ])
+        old_get_pool = database.get_pool
+        database.get_pool = lambda: _async_value(FakePool(conn))
+        try:
+            result = await database.update_entity(1, {
+                "name": "Bob", "entity_type": "person", "aliases": [" alice "],
+            })
+        finally:
+            database.get_pool = old_get_pool
+        self.assertIn("冲突", result["error"])
+        self.assertFalse(any(call[0] == "execute" for call in conn.calls))
+
+    async def test_delete_entity_only_deletes_entity_row(self):
+        conn = FakeEntityConnection()
+        old_get_pool = database.get_pool
+        database.get_pool = lambda: _async_value(FakePool(conn))
+        try:
+            result = await database.delete_entity(7)
+        finally:
+            database.get_pool = old_get_pool
+        self.assertEqual(result["status"], "ok")
+        execute_calls = [call for call in conn.calls if call[0] == "execute"]
+        self.assertEqual(len(execute_calls), 1)
+        self.assertIn("DELETE FROM entities", execute_calls[0][1])
+        self.assertNotIn("memories", execute_calls[0][1])
+
+
+async def _async_value(value):
+    return value
 
 
 if __name__ == "__main__":
