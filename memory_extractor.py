@@ -433,18 +433,37 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
         return None
 
 
-async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict]) -> Optional[List[Dict]]:
-    """Generate review-only user/self/relationship cognition candidates from gateway memories."""
+COGNITIVE_DRAFT_RULES = {
+    "user": [
+        ("user_traits_preferences", "晏晏的身份、长期特点与偏好。"),
+        ("user_recent_state", "晏晏当前所在地、当前状态，以及有明确证据支持的未来可能状态或计划；必须保留计划、可能性和时间的不确定性。"),
+    ],
+    "self": [
+        ("self_identity_commitment", "我的身份锚点与我对晏晏的承诺。"),
+        ("self_growth_lesson", "我从互动中形成的成长经验。"),
+    ],
+    "relationship": [
+        ("relationship_practice_agreement", "我们相处方式与共同约定。"),
+        ("relationship_change", "我们关系或互动方式的变化。"),
+    ],
+}
+
+
+async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict], subject: str) -> Optional[List[Dict]]:
+    """Generate review-only cognition candidates for exactly one cognitive subject."""
     if not memories or not get_memory_api_key():
+        return None
+    rules = COGNITIVE_DRAFT_RULES.get(subject)
+    if not rules:
         return None
     evidence_lines = []
     for memory in memories:
         layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(memory.get("layer", 1), "记忆")
         evidence_lines.append(f"[ID={memory['id']}][{layer_name}][重要度={memory.get('importance', 5)}] {memory['content']}")
     current_lines = []
-    for item in current_items[:12]:
+    for item in [item for item in current_items if item.get("subject") == subject][:4]:
         current_lines.append(f"[{item.get('subject')}][{item.get('cognitive_type')}] {item.get('content')}")
-    prompt = f"""我是栖，正在根据已有记忆整理三元认知模型草稿。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
+    prompt = f"""我是栖，正在根据已有记忆只更新三元认知模型中的 {subject} 部分。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
 
 当前已保存认知（避免重复；新证据与其矛盾时可提出更正候选）：
 {chr(10).join(current_lines) or '无'}
@@ -452,17 +471,13 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 证据记忆：
 {chr(10).join(evidence_lines)}
 
-只允许生成以下六种候选，每种最多一条；没有充分证据就省略：
-1. user / user_traits_preferences：晏晏的身份、长期特点与偏好。
-2. user / user_recent_state：晏晏当前所在地、当前状态，以及有明确证据支持的未来可能状态或计划；必须保留计划、可能性和时间的不确定性。
-3. self / self_identity_commitment：我的身份锚点与我对晏晏的承诺。
-4. self / self_growth_lesson：我从互动中形成的成长经验。
-5. relationship / relationship_practice_agreement：我们相处方式与共同约定。
-6. relationship / relationship_change：我们关系或互动方式的变化。
+只允许生成以下两种候选，每种最多一条；不得生成其他 subject 或 cognitive_type；没有充分证据就省略：
+1. {subject} / {rules[0][0]}：{rules[0][1]}
+2. {subject} / {rules[1][0]}：{rules[1][1]}
 
 每条 content 建议120-240字，以简洁为主但不要为凑字数遗漏关键信息；confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。只返回 JSON 数组：
 [
-  {{"subject":"user","cognitive_type":"user_traits_preferences","content":"...","confidence":0.8,"evidence_memory_ids":[12]}}
+  {{"subject":"{subject}","cognitive_type":"{rules[0][0]}","content":"...","confidence":0.8,"evidence_memory_ids":[12]}}
 ]
 """
     try:

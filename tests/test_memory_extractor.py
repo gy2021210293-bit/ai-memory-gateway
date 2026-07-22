@@ -43,6 +43,41 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("max_tokens", call.kwargs["json"])
         self.assertIn("只返回最终 JSON 数组", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
 
+    async def test_cognitive_draft_prompt_is_limited_to_one_subject(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_cognitive_draft(
+                [{"id": 1, "content": "证据", "layer": 1, "importance": 8}],
+                [
+                    {"subject": "user", "cognitive_type": "user_recent_state", "content": "用户旧认知"},
+                    {"subject": "self", "cognitive_type": "self_growth_lesson", "content": "自我旧认知"},
+                ],
+                "self",
+            )
+
+        self.assertEqual(result, [])
+        prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("self_identity_commitment", prompt)
+        self.assertIn("self_growth_lesson", prompt)
+        self.assertIn("自我旧认知", prompt)
+        self.assertNotIn("user_traits_preferences", prompt)
+        self.assertNotIn("relationship_change", prompt)
+        self.assertNotIn("用户旧认知", prompt)
+
+    async def test_cognitive_draft_rejects_unknown_subject(self):
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"):
+            result = await memory_extractor.generate_cognitive_draft(
+                [{"id": 1, "content": "证据"}], [], "unknown",
+            )
+        self.assertIsNone(result)
+
 
 if __name__ == "__main__":
     unittest.main()

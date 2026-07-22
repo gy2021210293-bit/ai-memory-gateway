@@ -1702,18 +1702,26 @@ async def api_get_cognitive_items():
 
 
 @app.post("/api/cognitive-items/draft")
-async def api_generate_cognitive_draft():
-    """Generate evidence-backed candidates without persisting them."""
+async def api_generate_cognitive_draft(request: Request):
+    """Generate evidence-backed candidates for one subject without persisting them."""
+    data = await request.json()
+    subject = str(data.get("subject", "")).strip().lower()
+    rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES.get(subject)
+    if not rules:
+        return JSONResponse(status_code=400, content={"error": "subject 必须是 user、self 或 relationship"})
+    allowed_types = {rule[0] for rule in rules}
     memories = await get_memories_for_cognitive_draft(80)
     if not memories:
         return JSONResponse(status_code=400, content={"error": "没有可用于生成认知草稿的活跃记忆"})
-    raw_draft = await generate_cognitive_draft(memories, await list_cognitive_items())
+    raw_draft = await generate_cognitive_draft(memories, await list_cognitive_items(), subject)
     if raw_draft is None:
         return JSONResponse(status_code=502, content={"error": "认知草稿模型调用失败，现有认知未改变"})
     allowed_memory_ids = {int(memory["id"]) for memory in memories}
     draft, seen_types = [], set()
     for raw_item in raw_draft:
         if not isinstance(raw_item, dict):
+            continue
+        if raw_item.get("subject") != subject or raw_item.get("cognitive_type") not in allowed_types:
             continue
         try:
             item = normalize_cognitive_item_input(raw_item)
@@ -1724,7 +1732,7 @@ async def api_generate_cognitive_draft():
             continue
         draft.append(item)
         seen_types.add(item["cognitive_type"])
-    return {"status": "draft", "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
+    return {"status": "draft", "subject": subject, "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
             "evidence_count": len(memories)}
 
 

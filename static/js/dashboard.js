@@ -365,24 +365,29 @@ function renderCognitiveItems() {
     });
 }
 
-async function generateCognitiveDraft() {
-    const button = document.getElementById('cognition-draft-generate');
+async function generateCognitiveDraft(subject) {
+    const buttons = document.querySelectorAll('.cognition-draft-generate');
     const status = document.getElementById('cognition-status');
-    button.disabled = true;
-    status.textContent = '正在根据已有记忆生成认知草稿…';
+    const subjectLabel = COGNITION_SUBJECT_LABELS[subject];
+    if (!subjectLabel) return;
+    buttons.forEach(button => { button.disabled = true; });
+    status.textContent = `正在根据已有记忆更新${subjectLabel}认知草稿…`;
     try {
-        const response = await fetch('/api/cognitive-items/draft', { method: 'POST' });
+        const response = await fetch('/api/cognitive-items/draft', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subject }),
+        });
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || '生成失败');
         pendingCognitiveDrafts = data.items || [];
         renderCognitiveDrafts(data);
         status.textContent = pendingCognitiveDrafts.length
-            ? `已生成 ${pendingCognitiveDrafts.length} 条草稿（模型：${data.model}）。请逐条确认保存。`
-            : '模型没有发现证据充分的新认知草稿。';
+            ? `已生成 ${subjectLabel}的 ${pendingCognitiveDrafts.length} 条草稿（模型：${data.model}）。请逐条确认保存。`
+            : `模型没有发现证据充分的${subjectLabel}新草稿。`;
     } catch (error) {
         status.textContent = error.message;
     } finally {
-        button.disabled = false;
+        buttons.forEach(button => { button.disabled = false; });
     }
 }
 
@@ -391,7 +396,8 @@ function renderCognitiveDrafts(meta = {}) {
     root.replaceChildren();
     root.style.display = '';
     const heading = document.createElement('h3');
-    heading.textContent = `模型草稿（证据来自 ${meta.evidence_count || '已有'} 条记忆，尚未保存）`;
+    const subjectLabel = COGNITION_SUBJECT_LABELS[meta.subject];
+    heading.textContent = `${subjectLabel || '认知'}草稿（证据来自 ${meta.evidence_count || '已有'} 条记忆，尚未保存）`;
     root.appendChild(heading);
     if (!pendingCognitiveDrafts.length) {
         const empty = document.createElement('p');

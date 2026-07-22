@@ -535,9 +535,13 @@
                     <p class="section-desc">维护栖对晏晏、对自己以及对双方关系的六项核心理解。草稿只供预览，确认保存后才会进入聊天上下文。</p>
                 </div>
                 <div class="card">
-                    <div class="toolbar" style="justify-content:space-between">
-                        <span class="section-desc">基于最多80条高信号活跃记忆生成草稿，复用记忆模型。</span>
-                        <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft()">根据已有记忆生成草稿</button>
+                    <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
+                        <span class="section-desc">基于最多80条高信号活跃记忆，分别生成对应认知草稿；不会自动保存。</span>
+                        <div class="toolbar">
+                            <button class="btn btn-secondary cognition-draft-generate" onclick="generateCognitiveDraft('user')">更新用户认知</button>
+                            <button class="btn btn-secondary cognition-draft-generate" onclick="generateCognitiveDraft('self')">更新 AI 自我认知</button>
+                            <button class="btn btn-secondary cognition-draft-generate" onclick="generateCognitiveDraft('relationship')">更新关系认知</button>
+                        </div>
                     </div>
                     <div id="cognition-draft-list" style="display:none;margin-top:16px"></div>
                 </div>
