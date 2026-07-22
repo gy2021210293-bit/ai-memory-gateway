@@ -13,6 +13,7 @@
 
 - Treat this gateway and its PostgreSQL database as the sole source of truth for conversations and memories.
 - Dashboard conversation deletion is permanent; there is no conversation recycle bin. Single and batch deletion transactionally remove conversation rows, the matching session cache, and matching token-usage rows, return the real number of deleted sessions, and preserve independently extracted long-term memories.
+- Dashboard HTML and `static/js/dashboard.js` can be cached independently by the browser or deployment CDN. When new HTML buttons depend on new JavaScript functions, bump the dashboard script query version; entity deletion and split cognitive-draft buttons initially appeared inert because the template still referenced cached `dashboard.js?v=3.9`, fixed by advancing it to `v=4.0`.
 - Add the Memory Constellations experience as a dashboard visualization module, not as a second memory gateway or parallel database.
 - SiliconFlow can be used through its OpenAI-compatible APIs for both chat and embeddings; semantic retrieval should remain attached to the gateway's existing vector-search path.
 - The constellation is a read-only `/constellation` page. It reuses the original project's canvas renderer and visual styling while consuming the gateway's `/api/memories`; visualization does not maintain a separate memory database.
