@@ -58,6 +58,10 @@ def apply_runtime_config(key: str, value: str) -> None:
     }:
         globals()[key] = str(value)
 
+def should_defer_extraction(assistant_tool_calls: Optional[list]) -> bool:
+    """A response that requests another tool is not the final conversation turn."""
+    return bool(assistant_tool_calls)
+
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
 

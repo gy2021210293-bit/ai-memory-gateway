@@ -30,7 +30,7 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -1078,6 +1078,11 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                     await save_message(session_id, "user", user_msg, model)
                     await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
         
+        # 工具链尚未结束：状态已经保存，但等最终回答后再提取一次记忆。
+        if should_defer_extraction(assistant_tool_calls):
+            print("⏭️  assistant 仍在请求工具，延后到工具链最终回答再提取记忆")
+            return
+
         # 2. 检查是否需要提取记忆
         if not MEMORY_EXTRACT_ENABLED:
             print(f"⏭️  记忆提取已关闭（MEMORY_EXTRACT_ENABLED=false）")

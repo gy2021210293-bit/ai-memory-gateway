@@ -16,6 +16,42 @@ class _AsyncClientContext:
 
 
 class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
+    def test_tool_call_response_defers_extraction_until_final_answer(self):
+        tool_calls = [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }]
+
+        self.assertTrue(memory_extractor.should_defer_extraction(tool_calls))
+        self.assertFalse(memory_extractor.should_defer_extraction(None))
+        self.assertFalse(memory_extractor.should_defer_extraction([]))
+
+    def test_apply_runtime_config_updates_memory_provider_and_fallback(self):
+        original = {
+            key: getattr(memory_extractor, key)
+            for key in (
+                "API_KEY",
+                "API_BASE_URL",
+                "MEMORY_API_KEY",
+                "MEMORY_API_BASE_URL",
+                "MEMORY_MODEL",
+            )
+        }
+        try:
+            memory_extractor.apply_runtime_config("API_KEY", "main-key")
+            memory_extractor.apply_runtime_config("API_BASE_URL", "https://main.example/chat")
+            memory_extractor.apply_runtime_config("MEMORY_API_KEY", "")
+            memory_extractor.apply_runtime_config("MEMORY_API_BASE_URL", "")
+            memory_extractor.apply_runtime_config("MEMORY_MODEL", "memory-model")
+
+            self.assertEqual(memory_extractor.get_memory_api_key(), "main-key")
+            self.assertEqual(memory_extractor.get_memory_api_base_url(), "https://main.example/chat")
+            self.assertEqual(memory_extractor.MEMORY_MODEL, "memory-model")
+        finally:
+            for key, value in original.items():
+                memory_extractor.apply_runtime_config(key, value)
+
     async def test_retries_when_reasoning_has_no_json_array(self):
         first = Mock()
         first.status_code = 200
