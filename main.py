@@ -20,7 +20,7 @@ import asyncio
 import secrets
 import httpx
 from datetime import datetime, timedelta, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +33,7 @@ import database as _db_module  # 用于 /api/settings 热更新 database.py 全�
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
+from upstream_compat import normalize_chat_request
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -196,7 +197,9 @@ def invalidate_system_prompt_cache():
 async def lifespan(app: FastAPI):
     """应用启动时初始化数据库，关闭时断开连接"""
     global PARTITION_SESSION_ID
-    if MEMORY_ENABLED:
+    # Dashboard configuration lives in PostgreSQL, so load it even when the
+    # Zeabur environment currently disables memory; the DB value has priority.
+    if MEMORY_ENABLED or _db_module.DATABASE_URL:
         try:
             await init_tables()
             await ensure_token_usage_table()
@@ -240,29 +243,27 @@ async def lifespan(app: FastAPI):
                             continue
                         if key in _RESTORE_MAIN:
                             globals()[key] = _RESTORE_MAIN[key](val)
+                            _memory_extractor_module.apply_runtime_config(key, val)
                             restored.append(key)
                         elif key in _RESTORE_DB:
                             setattr(_db_module, key, _RESTORE_DB[key](val))
                             restored.append(key)
                         elif key == "MEMORY_MODEL":
                             os.environ["MEMORY_MODEL"] = str(val)
+                            _memory_extractor_module.apply_runtime_config(key, val)
                             restored.append(key)
                         elif key == "MEMORY_API_KEY":
                             globals()[key] = str(val)
-                            import memory_extractor as _me_mod
-                            _me_mod.MEMORY_API_KEY = str(val)
-                            restored.append(key)
-                        elif key == "MEMORY_API_BASE_URL":
-                            globals()[key] = str(val)
-                            import memory_extractor as _me_mod2
-                            _me_mod2.MEMORY_API_BASE_URL = str(val)
+                            _memory_extractor_module.apply_runtime_config(key, val)
                             restored.append(key)
                     if restored:
                         print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
             except Exception as e:
                 print(f"[warning] 恢复面板配置失败: {e}")
             
-            if not MEMORY_EXTRACT_ENABLED:
+            if not MEMORY_ENABLED:
+                print("ℹ️  记忆系统已由 Dashboard 配置关闭")
+            elif not MEMORY_EXTRACT_ENABLED:
                 print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
             
             # 分区缓存：从DB读取活跃对话线ID
@@ -283,8 +284,7 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    if MEMORY_ENABLED:
-        await close_pool()
+    await close_pool()
 
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
@@ -374,21 +374,21 @@ def _format_matched_entity_overview(memories: list) -> str:
         lines.append(f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）{description}{detail_text}")
     return "\n".join(lines)
 
-async def build_system_prompt_with_memories(user_message: str) -> str:
+async def build_system_prompt_with_memories(user_message: str, base_system_prompt: str) -> str:
     """
     构建带记忆的 system prompt
     1. 用用户消息搜索相关记忆
     2. 格式化成文本拼接到人设后面
     """
     if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
-        return SYSTEM_PROMPT
+        return base_system_prompt
     
     try:
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
         cognitive_text = format_cognitive_items_for_prompt(await list_cognitive_items(active_only=True))
 
         if not memories and not cognitive_text:
-            return SYSTEM_PROMPT
+            return base_system_prompt
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
         entity_map = {mem["id"]: mem.get("entities", []) for mem in memories}
@@ -412,7 +412,7 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
         
         cognitive_section = f"\n{cognitive_text}\n" if cognitive_text else ""
-        enhanced_prompt = f"""{SYSTEM_PROMPT}
+        enhanced_prompt = f"""{base_system_prompt}
 
 {cognitive_section}
 
@@ -439,7 +439,7 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         
     except Exception as e:
         print(f"⚠️  记忆检索失败: {e}，使用纯人设")
-        return SYSTEM_PROMPT
+        return base_system_prompt
 
 
 # ============================================================
@@ -1347,9 +1347,10 @@ async def _chat_completions_inner(request: Request):
         
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
         
-        partition_prompt = SYSTEM_PROMPT
+        effective_system_prompt = await get_system_prompt()
+        partition_prompt = effective_system_prompt
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
-            partition_prompt = (SYSTEM_PROMPT or "") + MEMORY_USAGE_GUIDE
+            partition_prompt = (effective_system_prompt or "") + MEMORY_USAGE_GUIDE
         messages = await build_partitioned_messages(
             session_id, all_msgs, partition_prompt, user_message
         )
@@ -1357,11 +1358,12 @@ async def _chat_completions_inner(request: Request):
     
     else:
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
-        if not skip_conversation_log and (SYSTEM_PROMPT or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message)):
+        effective_system_prompt = await get_system_prompt()
+        if not skip_conversation_log and (effective_system_prompt or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message)):
             if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
-                enhanced_prompt = await build_system_prompt_with_memories(user_message)
+                enhanced_prompt = await build_system_prompt_with_memories(user_message, effective_system_prompt)
             else:
-                enhanced_prompt = SYSTEM_PROMPT
+                enhanced_prompt = effective_system_prompt
             
             if enhanced_prompt:
                 has_system = any(msg.get("role") == "system" for msg in messages)
@@ -1380,6 +1382,13 @@ async def _chat_completions_inner(request: Request):
     if not model:
         model = DEFAULT_MODEL
     body["model"] = model
+
+    removed_temperature = normalize_chat_request(body, API_BASE_URL)
+    if removed_temperature is not None:
+        print(
+            f"ℹ️  Moonshot {model} 不接受客户端 temperature={removed_temperature}，已移除并使用模型默认值",
+            flush=True,
+        )
     
     # ---------- cache_control 兼容性处理 ----------
     if CACHE_PARTITION_ENABLED and not _is_anthropic_model(model):
@@ -1433,7 +1442,7 @@ async def _chat_completions_inner(request: Request):
     
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model, original_messages, skip_conversation_log, tool_messages),
+            safe_stream_and_capture(headers, body, session_id, user_message, model, original_messages, skip_conversation_log, tool_messages),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -1479,6 +1488,72 @@ async def _chat_completions_inner(request: Request):
                 return JSONResponse(status_code=response.status_code, content=error_content)
 
 
+async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = 15.0):
+    """Yield upstream bytes and SSE comments while the upstream is silent."""
+    iterator = response.aiter_bytes().__aiter__()
+    pending_chunk = None
+    try:
+        while True:
+            if pending_chunk is None:
+                pending_chunk = asyncio.create_task(anext(iterator))
+
+            done, _ = await asyncio.wait({pending_chunk}, timeout=interval_seconds)
+            if not done:
+                yield b": keep-alive\n\n", True, None
+                continue
+
+            try:
+                chunk = pending_chunk.result()
+            except StopAsyncIteration:
+                return
+            pending_chunk = None
+            yield chunk, False, None
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+        yield _upstream_stream_error_event(exc), False, exc
+    except httpx.HTTPError as exc:
+        yield _upstream_stream_error_event(exc), False, exc
+    finally:
+        if pending_chunk is not None and not pending_chunk.done():
+            pending_chunk.cancel()
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await pending_chunk
+
+
+def _upstream_stream_error_event(exc: Exception) -> bytes:
+    error_payload = {
+        "error": {
+            "message": f"Upstream stream interrupted: {type(exc).__name__}",
+            "type": "upstream_stream_error",
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+async def safe_stream_and_capture(*args, **kwargs):
+    """Keep transport failures inside the already-started SSE response."""
+    session_id = args[2] if len(args) > 2 else kwargs.get("session_id", "")
+    try:
+        async for chunk in stream_and_capture(*args, **kwargs):
+            yield chunk
+    except asyncio.CancelledError:
+        print(f"ℹ️  客户端断开，已取消上游流: session={session_id}", flush=True)
+        raise
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+        print(
+            f"❌ 上游流建立或关闭失败: session={session_id}, "
+            f"type={type(exc).__name__}, detail={exc}",
+            flush=True,
+        )
+        yield _upstream_stream_error_event(exc)
+    except httpx.HTTPError as exc:
+        print(
+            f"❌ 上游HTTP流异常: session={session_id}, "
+            f"type={type(exc).__name__}, detail={exc}",
+            flush=True,
+        )
+        yield _upstream_stream_error_event(exc)
+
+
 async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
@@ -1487,7 +1562,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
     
-    async with httpx.AsyncClient(timeout=300) as client:
+    stream_error = None
+    timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
             # 打印上游响应头（排查thinking问题用）
             upstream_ct = response.headers.get("content-type", "")
@@ -1501,9 +1578,21 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             error_body_parts = []
             is_error = response.status_code != 200
             
-            async for chunk in response.aiter_bytes():
+            async for chunk, is_heartbeat, chunk_error in _iterate_upstream_with_heartbeat(response):
                 # 原始字节直接透传给客户端
                 yield chunk
+
+                if is_heartbeat:
+                    continue
+
+                if chunk_error is not None:
+                    stream_error = chunk_error
+                    print(
+                        f"❌ 上游流中断: session={session_id}, "
+                        f"type={type(chunk_error).__name__}, detail={chunk_error}",
+                        flush=True,
+                    )
+                    continue
                 
                 if is_error:
                     error_body_parts.append(chunk)
@@ -1557,6 +1646,13 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+
+    if stream_error and (assistant_msg or assistant_reasoning):
+        print(
+            f"💾 上游中断前的部分回复将继续保存: content={len(assistant_msg)}字符, "
+            f"reasoning={len(assistant_reasoning or '')}字符",
+            flush=True,
+        )
     
     if assistant_reasoning:
         print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
@@ -3095,9 +3191,7 @@ async def save_settings(request: Request):
                         globals()[key] = ""
                     elif key in _DB_VARS:
                         setattr(_db_module, key, "")
-                    if key == "MEMORY_API_KEY":
-                        import memory_extractor as _me_mod
-                        _me_mod.MEMORY_API_KEY = ""
+                    _memory_extractor_module.apply_runtime_config(key, "")
                     os.environ[key] = ""
                     updated.append(key)
                     continue
@@ -3117,12 +3211,7 @@ async def save_settings(request: Request):
                 typed_value = _MAIN_VARS[key](value)
                 globals()[key] = typed_value
                 os.environ[key] = str(value)
-                if key == "MEMORY_API_KEY":
-                    import memory_extractor as _me_mod
-                    _me_mod.MEMORY_API_KEY = str(value)
-                if key == "MEMORY_API_BASE_URL":
-                    import memory_extractor as _me_mod2
-                    _me_mod2.MEMORY_API_BASE_URL = str(value)
+                _memory_extractor_module.apply_runtime_config(key, typed_value)
                 updated.append(key)
                 print(f"[settings] {key} = {typed_value}")
 
@@ -3136,6 +3225,7 @@ async def save_settings(request: Request):
             elif key in _ENV_ONLY:
                 typed_value = _ENV_ONLY[key](value)
                 os.environ[key] = str(typed_value)
+                _memory_extractor_module.apply_runtime_config(key, typed_value)
                 updated.append(key)
                 print(f"[settings] {key} = {typed_value} (env)")
 

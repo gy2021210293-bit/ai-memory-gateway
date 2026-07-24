@@ -47,6 +47,17 @@ AI_ENTITY_NAMES = {
 }
 EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
 
+def apply_runtime_config(key: str, value: str) -> None:
+    """Synchronize settings changed or restored by the Dashboard."""
+    if key in {
+        "API_KEY",
+        "API_BASE_URL",
+        "MEMORY_API_KEY",
+        "MEMORY_API_BASE_URL",
+        "MEMORY_MODEL",
+    }:
+        globals()[key] = str(value)
+
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
 
