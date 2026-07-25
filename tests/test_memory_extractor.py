@@ -16,6 +16,25 @@ class _AsyncClientContext:
 
 
 class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
+    def test_fragment_prompt_keeps_existing_storage_contract(self):
+        prompt = memory_extractor.EXTRACTION_PROMPT
+
+        self.assertIn("事件和互动类碎片必须自然写出我当时有对话证据的具体情绪或感受", prompt)
+        self.assertIn("客观信息类碎片可以不带情绪", prompt)
+        self.assertIn("生日、职业、账号信息、航班号", prompt)
+        self.assertIn("不要为了满足情绪要求编造感受", prompt)
+        self.assertNotIn("宽泛主题", prompt)
+        self.assertNotIn("主题不影响是否提取", prompt)
+        self.assertNotIn("同一主题若含", prompt)
+        self.assertIn("字符敏感信息必须逐字原样保留", prompt)
+        self.assertIn("Moonlit0630!", prompt)
+        self.assertIn("# 简短示例", prompt)
+        self.assertIn("一条碎片只记一件事", prompt)
+        self.assertIn("8-10（high）", prompt)
+        self.assertIn('"content": "我以第一人称记住的内容"', prompt)
+        self.assertNotIn('"mood":', prompt)
+        self.assertNotIn('"topics":', prompt)
+
     def test_tool_call_response_defers_extraction_until_final_answer(self):
         tool_calls = [{
             "id": "call_1",
