@@ -1,6 +1,6 @@
 import { loadUniverse, universe, conById, GALAXIES } from './data.js';
 import { view, onViewChange, gotoUniverse, gotoGalaxy, gotoConstellation, gotoStar, goUp } from './state.js';
-import { initRender, resizeRender, drawFrame, hitTest, onDataLoaded, resetCamera, zoomBy, panBy, rebuildLayouts } from './render.js';
+import { initRender, resizeRender, drawFrame, hitTest, onDataLoaded, resetCamera, zoomBy, panBy, rebuildLayouts } from './render.js?v=4';
 
 const mc = document.getElementById('mc');
 const $ = id => document.getElementById(id);

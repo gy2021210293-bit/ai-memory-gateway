@@ -61,11 +61,11 @@ function prerenderBg() {
     const c = bgSprite.getContext('2d');
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     // 深空底色：多层暗色 radial
-    c.fillStyle = '#020410'; c.fillRect(0, 0, W, H);
+    c.fillStyle = '#09071a'; c.fillRect(0, 0, W, H);
     const rng = mulberry32(7741);
-    [[.18, .25, 232, .5], [.78, .6, 252, .42], [.45, .85, 215, .35], [.6, .15, 268, .3]].forEach(([nx, ny, hue, a]) => {
+    [[.16, .22, 278, .46], [.82, .22, 215, .38], [.78, .78, 338, .34], [.25, .86, 28, .28]].forEach(([nx, ny, hue, a]) => {
         const g = c.createRadialGradient(nx * W, ny * H, 0, nx * W, ny * H, Math.max(W, H) * .42);
-        g.addColorStop(0, `hsla(${hue},55%,10%,${a})`);
+        g.addColorStop(0, `hsla(${hue},58%,18%,${a})`);
         g.addColorStop(1, 'transparent');
         c.fillStyle = g; c.fillRect(0, 0, W, H);
     });
@@ -74,7 +74,7 @@ function prerenderBg() {
     c.translate(W / 2, H / 2); c.rotate(-0.42);
     const band = c.createLinearGradient(0, -H * .22, 0, H * .22);
     band.addColorStop(0, 'transparent');
-    band.addColorStop(.5, 'rgba(120,135,200,0.05)');
+    band.addColorStop(.5, 'rgba(225,205,244,0.08)');
     band.addColorStop(1, 'transparent');
     c.fillStyle = band;
     c.fillRect(-Math.max(W, H), -H * .25, Math.max(W, H) * 2, H * .5);
@@ -91,7 +91,7 @@ function prerenderBg() {
     }
     bgStars.forEach(s => {
         c.beginPath(); c.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-        c.fillStyle = `rgba(208,218,255,${s.a})`; c.fill();
+        c.fillStyle = `rgba(242,231,255,${s.a})`; c.fill();
     });
 }
 
@@ -106,7 +106,7 @@ function drawBgFrame(T) {
     twinkleSet.forEach(s => {
         const ta = s.a * (.4 + .6 * Math.abs(Math.sin(T * .7 + s.t)));
         bx.beginPath(); bx.arc(s.x, s.y, s.r * 1.2, 0, Math.PI * 2);
-        bx.fillStyle = `rgba(215,225,255,${ta})`; bx.fill();
+        bx.fillStyle = `rgba(248,237,255,${ta})`; bx.fill();
     });
 }
 
@@ -130,14 +130,14 @@ function prerenderNebula(galaxyId, radius) {
         const byp = ctr + Math.sin(ang) * dist;
         const br = radius * (0.35 + rng() * 0.5);
         const hueOff = (rng() - 0.5) * 30;
-        const alpha = 0.05 + rng() * 0.06;
+        const alpha = 0.06 + rng() * 0.07;
         c.save();
         c.translate(bxp, byp);
         c.rotate(rng() * Math.PI);
         c.scale(1, 0.55 + rng() * 0.45);
         const grad = c.createRadialGradient(0, 0, 0, 0, 0, br);
-        grad.addColorStop(0, `hsla(${(g.hue + hueOff + 360) % 360},65%,58%,${alpha})`);
-        grad.addColorStop(0.55, `hsla(${(g.hue + hueOff + 360) % 360},60%,45%,${alpha * 0.45})`);
+        grad.addColorStop(0, `hsla(${(g.hue + hueOff + 360) % 360},62%,68%,${alpha})`);
+        grad.addColorStop(0.55, `hsla(${(g.hue + hueOff + 360) % 360},56%,54%,${alpha * 0.48})`);
         grad.addColorStop(1, 'transparent');
         c.fillStyle = grad;
         c.beginPath(); c.arc(0, 0, br, 0, Math.PI * 2); c.fill();
@@ -149,7 +149,7 @@ function prerenderNebula(galaxyId, radius) {
     c.rotate(rng() * Math.PI);
     const dust = c.createLinearGradient(0, -radius * 0.18, 0, radius * 0.18);
     dust.addColorStop(0, 'transparent');
-    dust.addColorStop(0.5, 'rgba(4,6,16,0.32)');
+    dust.addColorStop(0.5, 'rgba(18,12,36,0.24)');
     dust.addColorStop(1, 'transparent');
     c.fillStyle = dust;
     c.fillRect(-radius * 1.1, -radius * 0.2, radius * 2.2, radius * 0.4);
@@ -161,7 +161,7 @@ function prerenderNebula(galaxyId, radius) {
         const dist = Math.sqrt(rng()) * radius * 0.9;
         c.beginPath();
         c.arc(ctr + Math.cos(ang) * dist, ctr + Math.sin(ang) * dist, rng() * 0.9 + 0.15, 0, Math.PI * 2);
-        c.fillStyle = `hsla(${g.hue},50%,75%,${rng() * 0.22 + 0.04})`;
+        c.fillStyle = `hsla(${g.hue},55%,82%,${rng() * 0.20 + 0.05})`;
         c.fill();
     }
     nebulaSprites.set(galaxyId, { canvas: cv, size });
@@ -251,14 +251,14 @@ function drawStar(x, y, r, rgb, conf, alpha, pulse, isHov, isSel, T, lifecycle) 
         const er = Math.max(0.8, r * 0.7);
         const breathe = 0.6 + 0.4 * Math.abs(Math.sin(T * 0.4 + x * 0.01));
         const eg = ctx.createRadialGradient(x, y, 0, x, y, er * 2.5);
-        eg.addColorStop(0, `rgba(200,80,60,${0.35 * alpha * breathe})`);
+        eg.addColorStop(0, `rgba(218,112,143,${0.35 * alpha * breathe})`);
         eg.addColorStop(1, 'transparent');
         ctx.beginPath(); ctx.arc(x, y, er * 2.5, 0, Math.PI * 2); ctx.fillStyle = eg; ctx.fill();
         ctx.beginPath(); ctx.arc(x, y, er * 0.4, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255,140,100,${0.5 * alpha * breathe})`; ctx.fill();
+        ctx.fillStyle = `rgba(255,184,176,${0.5 * alpha * breathe})`; ctx.fill();
         if (isHov || isSel) {
             ctx.beginPath(); ctx.arc(x, y, er * 3, 0, Math.PI * 2);
-            ctx.strokeStyle = `rgba(200,90,70,0.3)`; ctx.lineWidth = 0.6;
+            ctx.strokeStyle = `rgba(225,134,156,0.3)`; ctx.lineWidth = 0.6;
             ctx.setLineDash([2, 4]); ctx.stroke(); ctx.setLineDash([]);
         }
         return;
@@ -267,10 +267,10 @@ function drawStar(x, y, r, rgb, conf, alpha, pulse, isHov, isSel, T, lifecycle) 
         // 残骸：灰白小点，几乎熄灭
         const fr = Math.max(0.5, r * 0.45);
         ctx.beginPath(); ctx.arc(x, y, fr, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(150,155,170,${0.28 * alpha})`; ctx.fill();
+        ctx.fillStyle = `rgba(178,171,195,${0.28 * alpha})`; ctx.fill();
         if (isHov || isSel) {
             ctx.beginPath(); ctx.arc(x, y, fr * 4, 0, Math.PI * 2);
-            ctx.strokeStyle = 'rgba(160,165,180,0.25)'; ctx.lineWidth = 0.5;
+            ctx.strokeStyle = 'rgba(194,184,210,0.25)'; ctx.lineWidth = 0.5;
             ctx.setLineDash([2, 4]); ctx.stroke(); ctx.setLineDash([]);
         }
         return;
@@ -312,7 +312,7 @@ function drawStar(x, y, r, rgb, conf, alpha, pulse, isHov, isSel, T, lifecycle) 
 function drawBridge(x1, y1, x2, y2, weight, alpha) {
     const w = Math.min(1.6, 0.4 + weight * 0.06);
     ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
-    ctx.strokeStyle = `rgba(150,170,230,${Math.min(0.3, 0.05 + weight * 0.012) * alpha})`;
+    ctx.strokeStyle = `rgba(196,176,235,${Math.min(0.3, 0.05 + weight * 0.012) * alpha})`;
     ctx.lineWidth = w;
     ctx.setLineDash([2, 7]);
     ctx.stroke();

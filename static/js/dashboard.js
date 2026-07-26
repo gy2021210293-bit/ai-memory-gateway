@@ -740,8 +740,8 @@ function renderTable(mems, startIndex) {
             '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"></td>' +
             '<td class="col-id">' + (startIndex + i + 1) + mergeInfo + '</td>' +
             '<td class="col-layer">' + layerSelect + '</td>' +
-            '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
-            '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
+            '<td class="col-title"><textarea class="title-input" id="t_' + m.id + '" rows="3" placeholder="无标题">' + escHtml(titleDisplay) + '</textarea></td>' +
+            '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '" rows="6">' + escHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
             '<td class="col-time">' + fmtTime(m.created_at) + '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
