@@ -1376,7 +1376,7 @@ body {
     isolation: isolate;
     background:
         radial-gradient(circle at 9% 12%, rgba(211, 195, 236, 0.72) 0, rgba(211, 195, 236, 0) 31%),
-        radial-gradient(circle at 88% 10%, rgba(247, 224, 218, 0.72) 0, rgba(247, 224, 218, 0) 29%),
+        radial-gradient(circle at 92% 7%, rgba(220, 234, 246, 0.58) 0, rgba(224, 235, 247, 0.28) 9%, rgba(224, 235, 247, 0) 18%),
         radial-gradient(circle at 78% 78%, rgba(250, 217, 218, 0.66) 0, rgba(250, 217, 218, 0) 34%),
         radial-gradient(circle at 18% 90%, rgba(250, 226, 198, 0.70) 0, rgba(250, 226, 198, 0) 31%),
         linear-gradient(145deg, #faf8f3 0%, #f7f4fa 48%, #f8f5f0 100%);
@@ -1497,12 +1497,12 @@ body::after {
 
 .nav-item.active {
     color: white;
-    border-color: rgba(255, 255, 255, 0.72);
-    background: linear-gradient(125deg, #8062ad 0%, #8c75b8 46%, #7795bb 100%);
+    border-color: rgba(255, 255, 255, 0.78);
+    background: linear-gradient(125deg, #80608F 0%, #A26758 100%);
     box-shadow:
-        0 10px 24px rgba(100, 70, 146, 0.24),
-        0 0 20px rgba(160, 198, 224, 0.22),
-        inset 0 1px rgba(255, 255, 255, 0.28);
+        0 10px 24px rgba(100, 73, 116, 0.22),
+        0 0 18px rgba(196, 137, 117, 0.24),
+        inset 0 1px rgba(255, 255, 255, 0.34);
 }
 
 .nav-item.active::after {
@@ -1707,12 +1707,12 @@ body::after {
 
 .btn-primary {
     color: white;
-    background: linear-gradient(125deg, #76549f, #8b70b5 52%, #7898bc);
+    background: linear-gradient(125deg, #80608F, #A26758);
 }
 
 .btn-primary:hover {
-    background: linear-gradient(125deg, #67468f, #7c5fa8 52%, #6688ad);
-    box-shadow: 0 12px 26px rgba(93, 64, 133, 0.22), 0 0 20px rgba(132, 182, 213, 0.17);
+    background: linear-gradient(125deg, #72527f, #945849);
+    box-shadow: 0 12px 26px rgba(91, 63, 105, 0.24), 0 0 20px rgba(196, 137, 117, 0.18);
 }
 
 .btn-secondary {
@@ -1743,6 +1743,19 @@ body::after {
 
 .btn-danger:hover {
     background: linear-gradient(125deg, #9e4053, #b75b70);
+}
+
+.btn-cleanup {
+    color: white;
+    border-color: rgba(255, 255, 255, 0.72);
+    background: linear-gradient(125deg, #80608F, #A26758);
+    box-shadow: 0 8px 18px rgba(100, 73, 116, 0.22), inset 0 1px rgba(255, 255, 255, 0.34);
+}
+
+.btn-cleanup:hover {
+    color: white;
+    background: linear-gradient(125deg, #72527f, #945849);
+    box-shadow: 0 11px 24px rgba(91, 63, 105, 0.24), 0 0 18px rgba(196, 137, 117, 0.20);
 }
 
 .btn-accent {
@@ -1834,8 +1847,8 @@ body::after {
 .layer-tab.active {
     color: white;
     border-color: rgba(255, 255, 255, 0.62);
-    background: linear-gradient(125deg, #7d5fa7, #839ac0);
-    box-shadow: 0 8px 18px rgba(92, 67, 132, 0.18);
+    background: linear-gradient(125deg, #80608F, #A26758);
+    box-shadow: 0 8px 18px rgba(100, 73, 116, 0.22);
 }
 
 .layer-badge.layer-1 {
