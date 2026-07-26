@@ -1496,13 +1496,17 @@ body::after {
 }
 
 .nav-item.active {
-    color: white;
+    color: #403744;
     border-color: rgba(255, 255, 255, 0.78);
-    background: linear-gradient(125deg, #80608F 0%, #A26758 100%);
+    background: linear-gradient(125deg, rgba(225, 211, 236, 0.90) 0%, rgba(246, 220, 228, 0.84) 48%, rgba(249, 229, 210, 0.80) 82%, rgba(224, 235, 244, 0.64) 100%);
     box-shadow:
-        0 10px 24px rgba(100, 73, 116, 0.22),
-        0 0 18px rgba(196, 137, 117, 0.24),
-        inset 0 1px rgba(255, 255, 255, 0.34);
+        0 8px 22px rgba(100, 78, 119, 0.10),
+        0 0 18px rgba(226, 170, 190, 0.12),
+        inset 0 1px rgba(255, 255, 255, 0.58);
+}
+
+.nav-item.active .nav-icon svg {
+    stroke: currentColor;
 }
 
 .nav-item.active::after {
@@ -1707,12 +1711,13 @@ body::after {
 
 .btn-primary {
     color: white;
-    background: linear-gradient(125deg, #80608F, #A26758);
+    background: linear-gradient(125deg, #735887 0%, #865F79 48%, #91675F 82%, #727688 100%);
+    box-shadow: 0 7px 16px rgba(79, 56, 94, 0.14), 0 0 14px rgba(216, 157, 182, 0.10);
 }
 
 .btn-primary:hover {
-    background: linear-gradient(125deg, #72527f, #945849);
-    box-shadow: 0 12px 26px rgba(91, 63, 105, 0.24), 0 0 20px rgba(196, 137, 117, 0.18);
+    background: linear-gradient(125deg, #664A79 0%, #76516A 48%, #80594F 82%, #626676 100%);
+    box-shadow: 0 9px 20px rgba(73, 49, 88, 0.18), 0 0 16px rgba(213, 153, 179, 0.14);
 }
 
 .btn-secondary {
@@ -1746,16 +1751,16 @@ body::after {
 }
 
 .btn-cleanup {
-    color: white;
-    border-color: rgba(255, 255, 255, 0.72);
-    background: linear-gradient(125deg, #80608F, #A26758);
-    box-shadow: 0 8px 18px rgba(100, 73, 116, 0.22), inset 0 1px rgba(255, 255, 255, 0.34);
+    color: #403744;
+    border-color: rgba(255, 255, 255, 0.76);
+    background: linear-gradient(125deg, rgba(225, 211, 236, 0.90) 0%, rgba(246, 220, 228, 0.84) 48%, rgba(249, 229, 210, 0.80) 82%, rgba(224, 235, 244, 0.64) 100%);
+    box-shadow: 0 7px 16px rgba(100, 78, 119, 0.09), 0 0 14px rgba(226, 170, 190, 0.10), inset 0 1px rgba(255, 255, 255, 0.58);
 }
 
 .btn-cleanup:hover {
-    color: white;
-    background: linear-gradient(125deg, #72527f, #945849);
-    box-shadow: 0 11px 24px rgba(91, 63, 105, 0.24), 0 0 18px rgba(196, 137, 117, 0.20);
+    color: #352d3a;
+    background: linear-gradient(125deg, rgba(219, 202, 232, 0.96) 0%, rgba(241, 209, 220, 0.90) 48%, rgba(245, 219, 197, 0.86) 82%, rgba(215, 229, 240, 0.70) 100%);
+    box-shadow: 0 9px 20px rgba(100, 78, 119, 0.12), 0 0 16px rgba(226, 170, 190, 0.13);
 }
 
 .btn-accent {
@@ -1845,10 +1850,15 @@ body::after {
 }
 
 .layer-tab.active {
-    color: white;
-    border-color: rgba(255, 255, 255, 0.62);
-    background: linear-gradient(125deg, #80608F, #A26758);
-    box-shadow: 0 8px 18px rgba(100, 73, 116, 0.22);
+    color: #403744;
+    border-color: rgba(255, 255, 255, 0.76);
+    background: linear-gradient(125deg, rgba(225, 211, 236, 0.90) 0%, rgba(246, 220, 228, 0.84) 48%, rgba(249, 229, 210, 0.80) 82%, rgba(224, 235, 244, 0.64) 100%);
+    box-shadow: 0 7px 16px rgba(100, 78, 119, 0.09), 0 0 14px rgba(226, 170, 190, 0.10);
+}
+
+.layer-tab.active span {
+    color: #504558;
+    background: rgba(82, 65, 94, 0.08);
 }
 
 .layer-badge.layer-1 {
