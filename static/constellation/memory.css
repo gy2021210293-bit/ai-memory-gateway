@@ -544,30 +544,9 @@ body {
 }
 
 .gpill {
-    position: relative;
-    isolation: isolate;
-    overflow: visible;
     color: rgba(205, 192, 229, 0.62);
     border-color: rgba(213, 188, 236, 0.13);
     background: rgba(255, 255, 255, 0.035);
-}
-
-.gpill::after,
-.stardust-btn::after {
-    content: "";
-    position: absolute;
-    inset: -8px;
-    z-index: -1;
-    pointer-events: none;
-    opacity: 0;
-    transform: scale(1.45);
-    background:
-        radial-gradient(circle at 9% 44%, rgba(211, 166, 235, 0.82) 0 1px, transparent 1.8px),
-        radial-gradient(circle at 30% 4%, rgba(145, 197, 231, 0.78) 0 1px, transparent 1.8px),
-        radial-gradient(circle at 86% 24%, rgba(245, 169, 199, 0.78) 0 1px, transparent 1.8px),
-        radial-gradient(circle at 91% 82%, rgba(242, 194, 149, 0.72) 0 1px, transparent 1.8px),
-        radial-gradient(circle at 18% 91%, rgba(170, 192, 236, 0.76) 0 1px, transparent 1.8px);
-    transition: opacity .2s ease, transform .45s cubic-bezier(.16, 1, .3, 1);
 }
 
 .gpill:hover {
@@ -575,12 +554,6 @@ body {
     border-color: var(--gc, rgba(218, 187, 242, 0.38));
     background: linear-gradient(125deg, rgba(191, 148, 220, 0.16), rgba(133, 182, 216, 0.13), rgba(232, 155, 188, 0.12));
     box-shadow: 0 0 18px rgba(197, 151, 224, 0.12);
-}
-
-.gpill:hover::after,
-.stardust-btn:hover::after {
-    opacity: .88;
-    transform: scale(.92);
 }
 
 .gpill.active {
@@ -646,9 +619,6 @@ body {
 }
 
 .stardust-btn {
-    position: relative;
-    isolation: isolate;
-    overflow: visible;
     color: rgba(216, 197, 237, 0.62);
     border-color: rgba(218, 189, 239, 0.18);
 }

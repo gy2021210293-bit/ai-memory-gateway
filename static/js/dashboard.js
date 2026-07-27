@@ -2102,7 +2102,7 @@ function renderThreadList(threads) {
                     <button class="btn btn-sm" onclick="renameThread('${t.session_id}')">改名</button>
                     <button class="btn btn-sm" onclick="openSummaryModal('${t.session_id}')">摘要</button>
                     ${!isActive ? `<button class="btn btn-sm btn-primary" onclick="switchThread('${t.session_id}')">切换到此</button>` : ''}
-                    ${!isActive ? `<button class="btn btn-sm" onclick="deleteThread('${t.session_id}', ${t.message_count || 0})" style="color: var(--error);">删除</button>` : ''}
+                    ${!isActive ? `<button class="btn btn-sm btn-danger" onclick="deleteThread('${t.session_id}', ${t.message_count || 0})">删除</button>` : ''}
                 </div>
             </div>
             <div style="color: var(--text-muted); font-size: 13px; line-height: 1.5;">
