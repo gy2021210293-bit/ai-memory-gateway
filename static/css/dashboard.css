@@ -31,6 +31,16 @@
     --dream-primary-hover: linear-gradient(125deg, rgba(187, 163, 205, 0.98) 0%, rgba(228, 185, 205, 0.95) 54%, rgba(237, 205, 178, 0.93) 86%, rgba(202, 220, 234, 0.80) 100%);
     --dream-danger-bg: linear-gradient(125deg, rgba(250, 230, 235, 0.96), rgba(243, 199, 209, 0.90));
     --dream-danger-hover: linear-gradient(125deg, rgba(247, 218, 225, 0.98), rgba(237, 184, 198, 0.94));
+    --dream-soft-edge: rgba(116, 88, 128, 0.12);
+    --dream-primary-edge: rgba(142, 103, 153, 0.16);
+    --dream-float-shadow:
+        0 10px 24px rgba(82, 63, 95, 0.10),
+        0 2px 7px rgba(133, 99, 145, 0.05),
+        inset 0 1px rgba(255, 255, 255, 0.36);
+    --dream-float-hover-shadow:
+        0 13px 28px rgba(82, 63, 95, 0.13),
+        0 3px 9px rgba(133, 99, 145, 0.07),
+        inset 0 1px rgba(255, 255, 255, 0.40);
     --radius: 20px;
     --radius-sm: 12px;
     --radius-xs: 8px;
@@ -1504,12 +1514,9 @@ body::after {
 
 .nav-item.active {
     color: #403744;
-    border-color: rgba(255, 255, 255, 0.78);
+    border-color: var(--dream-soft-edge);
     background: var(--dream-control-bg);
-    box-shadow:
-        0 8px 22px rgba(100, 78, 119, 0.10),
-        0 0 18px rgba(226, 170, 190, 0.12),
-        inset 0 1px rgba(255, 255, 255, 0.58);
+    box-shadow: var(--dream-float-shadow);
 }
 
 .nav-item.active .nav-icon svg {
@@ -1674,16 +1681,17 @@ body::after {
 
 .btn {
     color: var(--dream-control-text);
-    border: 1px solid rgba(255, 255, 255, 0.72);
+    border: 1px solid var(--dream-soft-edge);
     background: var(--dream-control-bg);
-    box-shadow: 0 6px 15px rgba(92, 68, 128, 0.07), inset 0 1px rgba(255, 255, 255, 0.52);
+    box-shadow: var(--dream-float-shadow);
     transform: translateY(0);
 }
 
 .btn:not(:disabled):hover {
     color: #372f3d;
     background: var(--dream-control-hover);
-    transform: translateY(-1px);
+    box-shadow: var(--dream-float-hover-shadow);
+    transform: translateY(-2px);
 }
 
 .btn:focus-visible,
@@ -1696,14 +1704,15 @@ body::after {
 
 .btn-primary {
     color: #423648;
+    border-color: var(--dream-primary-edge);
     background: var(--dream-primary-bg);
-    box-shadow: 0 7px 17px rgba(91, 67, 111, 0.10), 0 0 14px rgba(222, 171, 193, 0.10), inset 0 1px rgba(255, 255, 255, 0.44);
+    box-shadow: var(--dream-float-shadow);
 }
 
 .btn-primary:hover {
     color: #352b3b;
     background: var(--dream-primary-hover);
-    box-shadow: 0 9px 20px rgba(91, 67, 111, 0.13), 0 0 16px rgba(222, 171, 193, 0.13);
+    box-shadow: var(--dream-float-hover-shadow);
 }
 
 #mem-pagination .btn-primary,
@@ -1718,7 +1727,7 @@ body::after {
 
 .btn-secondary {
     color: var(--dream-control-text);
-    border-color: rgba(255, 255, 255, 0.72);
+    border-color: var(--dream-soft-edge);
     background: var(--dream-control-bg);
 }
 
@@ -1753,15 +1762,15 @@ body::after {
 
 .btn-cleanup {
     color: var(--dream-control-text);
-    border-color: rgba(255, 255, 255, 0.76);
+    border-color: var(--dream-soft-edge);
     background: var(--dream-control-bg);
-    box-shadow: 0 7px 16px rgba(100, 78, 119, 0.09), 0 0 14px rgba(226, 170, 190, 0.10), inset 0 1px rgba(255, 255, 255, 0.58);
+    box-shadow: var(--dream-float-shadow);
 }
 
 .btn-cleanup:hover {
     color: #352d3a;
     background: var(--dream-control-hover);
-    box-shadow: 0 9px 20px rgba(100, 78, 119, 0.12), 0 0 16px rgba(226, 170, 190, 0.13);
+    box-shadow: var(--dream-float-hover-shadow);
 }
 
 .btn-accent {
@@ -1854,9 +1863,9 @@ body::after {
 
 .tab.active {
     color: var(--dream-control-text);
-    border: 1px solid rgba(255, 255, 255, 0.76);
+    border: 1px solid var(--dream-soft-edge);
     background: var(--dream-control-bg);
-    box-shadow: 0 7px 16px rgba(91, 67, 129, 0.08);
+    box-shadow: var(--dream-float-shadow);
 }
 
 .layer-tab {
@@ -1873,9 +1882,9 @@ body::after {
 
 .layer-tab.active {
     color: #403744;
-    border-color: rgba(255, 255, 255, 0.76);
+    border-color: var(--dream-soft-edge);
     background: var(--dream-control-bg);
-    box-shadow: 0 7px 16px rgba(100, 78, 119, 0.09), 0 0 14px rgba(226, 170, 190, 0.10);
+    box-shadow: var(--dream-float-shadow);
 }
 
 .layer-tab.active span {
