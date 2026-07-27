@@ -32,15 +32,14 @@
     --dream-danger-bg: linear-gradient(125deg, rgba(250, 230, 235, 0.96), rgba(243, 199, 209, 0.90));
     --dream-danger-hover: linear-gradient(125deg, rgba(247, 218, 225, 0.98), rgba(237, 184, 198, 0.94));
     --dream-soft-edge: rgba(116, 88, 128, 0.12);
+    --dream-surface-edge: rgba(126, 99, 145, 0.13);
     --dream-primary-edge: rgba(142, 103, 153, 0.16);
     --dream-float-shadow:
         0 10px 24px rgba(82, 63, 95, 0.10),
-        0 2px 7px rgba(133, 99, 145, 0.05),
-        inset 0 1px rgba(255, 255, 255, 0.36);
+        0 2px 7px rgba(133, 99, 145, 0.05);
     --dream-float-hover-shadow:
         0 13px 28px rgba(82, 63, 95, 0.13),
-        0 3px 9px rgba(133, 99, 145, 0.07),
-        inset 0 1px rgba(255, 255, 255, 0.40);
+        0 3px 9px rgba(133, 99, 145, 0.07);
     --radius: 20px;
     --radius-sm: 12px;
     --radius-xs: 8px;
@@ -1371,8 +1370,7 @@ body {
     --shadow-sm: 0 8px 22px rgba(91, 72, 126, 0.08);
     --shadow:
         0 18px 42px rgba(91, 72, 126, 0.10),
-        0 6px 18px rgba(86, 136, 172, 0.07),
-        inset 0 1px 0 rgba(255, 255, 255, 0.80);
+        0 6px 18px rgba(86, 136, 172, 0.07);
     --shadow-md:
         0 20px 48px rgba(88, 64, 126, 0.16),
         0 8px 24px rgba(210, 139, 154, 0.10);
@@ -1437,7 +1435,7 @@ body::after {
 
 .sidebar {
     background: linear-gradient(165deg, rgba(255, 255, 255, 0.72), rgba(248, 243, 253, 0.58));
-    border-right: 1px solid rgba(255, 255, 255, 0.78);
+    border-right: 1px solid var(--dream-surface-edge);
     box-shadow:
         12px 0 38px rgba(92, 72, 128, 0.09),
         inset -1px 0 rgba(128, 98, 173, 0.08);
@@ -1466,10 +1464,10 @@ body::after {
     place-items: center;
     width: 40px;
     height: 40px;
-    border: 1px solid rgba(255, 255, 255, 0.80);
+    border: 1px solid var(--dream-soft-edge);
     border-radius: 14px;
     background: linear-gradient(145deg, rgba(226, 214, 240, 0.84), rgba(232, 243, 250, 0.72));
-    box-shadow: 0 8px 20px rgba(103, 73, 145, 0.13), inset 0 1px rgba(255, 255, 255, 0.88);
+    box-shadow: 0 8px 20px rgba(103, 73, 145, 0.13);
 }
 
 .logo svg {
@@ -1565,7 +1563,7 @@ body::after {
 .stats-bar,
 .modal-content,
 .floating-bar {
-    border: 1px solid rgba(255, 255, 255, 0.74);
+    border: 1px solid var(--dream-surface-edge);
     background: linear-gradient(145deg, rgba(255, 255, 255, 0.69), rgba(252, 249, 255, 0.53));
     box-shadow: var(--shadow);
     -webkit-backdrop-filter: var(--glass-blur);
@@ -1646,7 +1644,7 @@ body::after {
     color: var(--text);
     border-color: rgba(118, 96, 151, 0.21);
     background: rgba(255, 255, 255, 0.61);
-    box-shadow: inset 0 1px rgba(255, 255, 255, 0.82), 0 5px 14px rgba(101, 78, 139, 0.04);
+    box-shadow: 0 5px 14px rgba(101, 78, 139, 0.04);
     -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
 }
@@ -1698,8 +1696,8 @@ body::after {
 .nav-item:focus-visible,
 .tab:focus-visible,
 .layer-tab:focus-visible {
-    outline: 3px solid rgba(126, 95, 173, 0.24);
-    outline-offset: 3px;
+    outline: none;
+    box-shadow: var(--dream-float-hover-shadow), 0 0 0 2px rgba(126, 95, 173, 0.32);
 }
 
 .btn-primary {
@@ -1720,9 +1718,9 @@ body::after {
 #mem-pagination .btn-primary:hover,
 #conv-pagination .btn-primary:hover {
     color: var(--dream-control-text);
-    border-color: rgba(180, 154, 197, 0.24);
+    border-color: var(--dream-primary-edge);
     background: var(--dream-control-hover);
-    box-shadow: 0 6px 14px rgba(92, 68, 128, 0.08), inset 0 1px rgba(255, 255, 255, 0.52);
+    box-shadow: var(--dream-float-shadow);
 }
 
 .btn-secondary {
@@ -1751,7 +1749,7 @@ body::after {
     color: #7a3f4c;
     border-color: rgba(231, 167, 182, 0.34);
     background: var(--dream-danger-bg);
-    box-shadow: 0 6px 15px rgba(159, 78, 98, 0.09), inset 0 1px rgba(255, 255, 255, 0.48);
+    box-shadow: 0 6px 15px rgba(159, 78, 98, 0.09);
 }
 
 .btn-danger:hover {
@@ -1843,7 +1841,7 @@ body::after {
 .tabs {
     gap: 6px;
     padding: 5px;
-    border: 1px solid rgba(255, 255, 255, 0.68);
+    border: 1px solid var(--dream-surface-edge);
     border-radius: 16px;
     background: rgba(255, 255, 255, 0.34);
     box-shadow: var(--shadow-sm);
@@ -1871,7 +1869,7 @@ body::after {
 .layer-tab {
     border-color: rgba(119, 98, 151, 0.17);
     background: rgba(255, 255, 255, 0.47);
-    box-shadow: inset 0 1px rgba(255, 255, 255, 0.70);
+    box-shadow: 0 5px 13px rgba(100, 78, 119, 0.05);
 }
 
 .layer-tab:hover {
@@ -1927,8 +1925,8 @@ body::after {
 }
 
 .msg {
-    border-color: rgba(255, 255, 255, 0.62);
-    box-shadow: inset 0 1px rgba(255, 255, 255, 0.58);
+    border-color: var(--dream-surface-edge);
+    box-shadow: 0 6px 16px rgba(100, 78, 119, 0.05);
     -webkit-backdrop-filter: blur(12px);
     backdrop-filter: blur(12px);
 }
@@ -1957,8 +1955,7 @@ body::after {
 .modal-content {
     box-shadow:
         0 30px 70px rgba(69, 48, 93, 0.22),
-        0 0 38px rgba(177, 139, 207, 0.16),
-        inset 0 1px rgba(255, 255, 255, 0.84);
+        0 0 38px rgba(177, 139, 207, 0.16);
 }
 
 .floating-bar {
@@ -2009,7 +2006,7 @@ body::after {
 .toggle input:checked + .toggle-slider {
     border-color: rgba(169, 135, 187, 0.28);
     background: var(--dream-primary-bg);
-    box-shadow: 0 0 16px rgba(178, 139, 197, 0.18), inset 0 1px rgba(255, 255, 255, 0.34);
+    box-shadow: 0 0 16px rgba(178, 139, 197, 0.18);
 }
 
 .settings-field input[type="range"] {
@@ -2018,12 +2015,12 @@ body::after {
 
 .settings-field input[type="range"]::-webkit-slider-thumb {
     background: var(--dream-primary-bg);
-    box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.54), 0 3px 10px rgba(87, 62, 120, 0.18);
+    box-shadow: 0 0 0 2px rgba(126, 95, 173, 0.20), 0 3px 10px rgba(87, 62, 120, 0.18);
 }
 
 .settings-field input[type="range"]::-moz-range-thumb {
     background: var(--dream-primary-bg);
-    box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.54), 0 3px 10px rgba(87, 62, 120, 0.18);
+    box-shadow: 0 0 0 2px rgba(126, 95, 173, 0.20), 0 3px 10px rgba(87, 62, 120, 0.18);
 }
 
 @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
@@ -2099,12 +2096,10 @@ body::after {
         display: block;
         margin-bottom: 14px;
         padding: 14px;
-        border: 1px solid rgba(255, 255, 255, 0.76);
+        border: 1px solid var(--dream-surface-edge);
         border-radius: 16px;
         background: linear-gradient(145deg, rgba(255, 255, 255, 0.60), rgba(244, 238, 250, 0.46));
-        box-shadow:
-            0 12px 28px rgba(91, 72, 126, 0.09),
-            inset 0 1px rgba(255, 255, 255, 0.80);
+        box-shadow: 0 12px 28px rgba(91, 72, 126, 0.09);
     }
 
     .data-table tbody tr:last-child {
