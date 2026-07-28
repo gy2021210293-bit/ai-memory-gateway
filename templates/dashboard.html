@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memory Gateway</title>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=5.6">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=5.8">
 </head>
 <body>
     <div class="dashboard">
@@ -507,16 +507,44 @@
                         <button class="btn btn-danger" id="entity-delete" onclick="deleteSelectedEntity()">仅删除实体</button>
                         <span class="section-desc">删除实体不会删除原始记忆。</span>
                     </div>
-                    <h4 style="margin:16px 0 8px">当前实体概况</h4>
+                    <div class="toolbar" style="justify-content:space-between;margin-top:16px">
+                        <h4 style="margin:0">当前实体概况</h4>
+                        <button class="btn btn-secondary" id="entity-profile-edit" onclick="startEntityProfileEdit()">手动编辑概况</button>
+                    </div>
                     <pre id="entity-profile-current" style="white-space:pre-wrap;line-height:1.6"></pre>
                     <div id="entity-profile-draft" style="display:none;margin:16px 0">
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                        <div class="entity-profile-editor-grid">
                             <div><h4>保存中的概况</h4><pre id="entity-profile-old" style="white-space:pre-wrap;line-height:1.6"></pre></div>
                             <div>
-                                <h4>模型生成的新草稿（可修改）</h4>
-                                <label for="entity-profile-summary-edit" class="section-desc">摘要（最多200字，保存时覆盖旧摘要）</label>
-                                <textarea id="entity-profile-summary-edit" class="textarea" rows="6" maxlength="200"></textarea>
-                                <pre id="entity-profile-new" style="white-space:pre-wrap;line-height:1.6"></pre>
+                                <h4 id="entity-profile-editor-title">待保存概况（所有字段均可修改）</h4>
+                                <div class="form-group">
+                                    <label for="entity-profile-summary-edit">摘要（必填，最多200字）</label>
+                                    <textarea id="entity-profile-summary-edit" class="textarea" rows="5" maxlength="200"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="entity-profile-relationship-edit">关系（最多120字）</label>
+                                    <textarea id="entity-profile-relationship-edit" class="textarea" rows="2" maxlength="120"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="entity-profile-stable-facts-edit">稳定事实（每行一项，最多6项，每项80字）</label>
+                                    <textarea id="entity-profile-stable-facts-edit" class="textarea" rows="4"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="entity-profile-recent-updates-edit">近期动态（每行一项，最多6项，每项80字）</label>
+                                    <textarea id="entity-profile-recent-updates-edit" class="textarea" rows="4"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="entity-profile-preferences-edit">重要偏好（每行一项，最多6项，每项80字）</label>
+                                    <textarea id="entity-profile-preferences-edit" class="textarea" rows="4"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="entity-profile-uncertainties-edit">待确认信息（每行一项，最多6项，每项80字）</label>
+                                    <textarea id="entity-profile-uncertainties-edit" class="textarea" rows="4"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label for="entity-profile-evidence-edit">证据记忆 ID（必填，用空格、逗号或换行分隔）</label>
+                                    <textarea id="entity-profile-evidence-edit" class="textarea" rows="3" placeholder="#12, #18"></textarea>
+                                </div>
                             </div>
                         </div>
                         <div class="toolbar" style="margin-top:12px">
@@ -778,6 +806,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.5"></script>
+    <script src="/static/js/dashboard.js?v=4.6"></script>
 </body>
 </html>

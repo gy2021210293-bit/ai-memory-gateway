@@ -56,6 +56,7 @@ if (_gatewayKey) {
 let allEntities = [];
 let selectedEntity = null;
 let pendingEntityProfile = null;
+let selectedEntityMemoryIds = new Set();
 
 async function loadEntities() {
     const status = document.getElementById('entity-status');
@@ -109,6 +110,7 @@ async function loadEntityMemories(entity) {
         if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
         selectedEntity = data.entity || entity;
         pendingEntityProfile = null;
+        selectedEntityMemoryIds = new Set((data.memories || []).map(memory => Number(memory.id)));
         document.getElementById('entity-profile-draft').style.display = 'none';
         document.getElementById('entity-memory-title').textContent = `${selectedEntity.name} 的实体详情`;
         document.getElementById('entity-name-edit').value = selectedEntity.name || '';
@@ -121,7 +123,7 @@ async function loadEntityMemories(entity) {
             const item = document.createElement('div');
             item.className = 'memory-item';
             item.style.marginBottom = '8px';
-            item.textContent = memory.content;
+            item.textContent = `#${memory.id} ${memory.content}`;
             list.appendChild(item);
         });
         document.getElementById('entity-memory-card').style.display = 'block';
@@ -178,6 +180,7 @@ async function deleteSelectedEntity() {
     }
     selectedEntity = null;
     pendingEntityProfile = null;
+    selectedEntityMemoryIds = new Set();
     document.getElementById('entity-memory-card').style.display = 'none';
     await loadEntities();
     status.textContent = '实体已删除，原始记忆已保留。';
@@ -205,6 +208,86 @@ function formatEntityProfile(profile, fallback = '') {
         .map(([title, content]) => `${title}：${Array.isArray(content) ? content.join('；') : content}`).join('\n');
 }
 
+const ENTITY_PROFILE_LIST_FIELDS = [
+    ['stable_facts', 'entity-profile-stable-facts-edit', '稳定事实'],
+    ['recent_updates', 'entity-profile-recent-updates-edit', '近期动态'],
+    ['preferences', 'entity-profile-preferences-edit', '重要偏好'],
+    ['uncertainties', 'entity-profile-uncertainties-edit', '待确认信息'],
+];
+
+function fillEntityProfileEditor(profile) {
+    const value = parseEntityProfile(profile) || {};
+    document.getElementById('entity-profile-summary-edit').value = value.summary || '';
+    document.getElementById('entity-profile-relationship-edit').value = value.relationship || '';
+    ENTITY_PROFILE_LIST_FIELDS.forEach(([key, elementId]) => {
+        document.getElementById(elementId).value = Array.isArray(value[key]) ? value[key].join('\n') : '';
+    });
+    document.getElementById('entity-profile-evidence-edit').value =
+        (value.evidence_memory_ids || []).map(id => `#${id}`).join('\n');
+}
+
+function readEntityProfileList(elementId, label) {
+    const values = document.getElementById(elementId).value
+        .split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (values.length > 6) throw new Error(`${label}最多填写6项。`);
+    const tooLong = values.find(value => value.length > 80);
+    if (tooLong) throw new Error(`${label}每项最多80字：“${tooLong.slice(0, 20)}…”`);
+    return values;
+}
+
+function readEntityProfileEvidenceIds() {
+    const tokens = document.getElementById('entity-profile-evidence-edit').value
+        .split(/[\s,，;；]+/).map(value => value.trim()).filter(Boolean);
+    const ids = [];
+    for (const token of tokens) {
+        const value = token.replace(/^#/, '');
+        if (!/^\d+$/.test(value)) throw new Error(`证据记忆 ID 格式错误：${token}`);
+        const id = Number(value);
+        if (!selectedEntityMemoryIds.has(id)) throw new Error(`证据记忆 #${id} 不属于当前实体。`);
+        if (!ids.includes(id)) ids.push(id);
+    }
+    if (!ids.length) throw new Error('至少保留一条属于当前实体的证据记忆。');
+    return ids;
+}
+
+function collectEntityProfileEditor() {
+    const summary = document.getElementById('entity-profile-summary-edit').value.trim();
+    const relationship = document.getElementById('entity-profile-relationship-edit').value.trim();
+    if (!summary) throw new Error('实体摘要不能为空。');
+    if (summary.length > 200) throw new Error('实体摘要最多200字。');
+    if (relationship.length > 120) throw new Error('关系最多120字。');
+    const profile = { summary, relationship };
+    ENTITY_PROFILE_LIST_FIELDS.forEach(([key, elementId, label]) => {
+        profile[key] = readEntityProfileList(elementId, label);
+    });
+    profile.evidence_memory_ids = readEntityProfileEvidenceIds();
+    return profile;
+}
+
+function openEntityProfileEditor(profile, title) {
+    pendingEntityProfile = parseEntityProfile(profile) || {};
+    document.getElementById('entity-profile-old').textContent =
+        formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
+    document.getElementById('entity-profile-editor-title').textContent = title;
+    fillEntityProfileEditor(pendingEntityProfile);
+    document.getElementById('entity-profile-draft').style.display = 'block';
+}
+
+function startEntityProfileEdit() {
+    if (!selectedEntity) return;
+    const current = parseEntityProfile(selectedEntity.profile_json) || {
+        summary: selectedEntity.description || '',
+        relationship: '',
+        stable_facts: [],
+        recent_updates: [],
+        preferences: [],
+        uncertainties: [],
+        evidence_memory_ids: [],
+    };
+    openEntityProfileEditor(current, '手动编辑概况（所有字段均可修改）');
+    document.getElementById('entity-status').textContent = '正在编辑当前概况，保存前不会修改数据库。';
+}
+
 async function generateEntityProfileDraft() {
     if (!selectedEntity) return;
     const status = document.getElementById('entity-status');
@@ -215,13 +298,8 @@ async function generateEntityProfileDraft() {
         const response = await fetch(`/api/entities/${selectedEntity.id}/profile/draft`, { method: 'POST' });
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || '生成失败');
-        pendingEntityProfile = data.draft;
-        document.getElementById('entity-profile-old').textContent = formatEntityProfile(data.current_profile, selectedEntity.description);
-        document.getElementById('entity-profile-summary-edit').value = data.draft.summary || '';
-        const draftDetails = { ...data.draft, summary: '' };
-        document.getElementById('entity-profile-new').textContent = formatEntityProfile(draftDetails);
-        document.getElementById('entity-profile-draft').style.display = 'block';
-        status.textContent = '草稿已生成，请比较后确认。';
+        openEntityProfileEditor(data.draft, '模型生成的新草稿（所有字段均可修改）');
+        status.textContent = '草稿已生成，可修改全部字段后确认。';
     } catch (error) {
         status.textContent = error.message;
     } finally {
@@ -233,12 +311,12 @@ async function saveEntityProfileDraft() {
     if (!selectedEntity || !pendingEntityProfile) return;
     const status = document.getElementById('entity-status');
     const button = document.getElementById('entity-profile-save');
-    const editedSummary = document.getElementById('entity-profile-summary-edit').value.trim();
-    if (!editedSummary) {
-        status.textContent = '实体摘要不能为空。';
+    try {
+        pendingEntityProfile = collectEntityProfileEditor();
+    } catch (error) {
+        status.textContent = error.message;
         return;
     }
-    pendingEntityProfile = { ...pendingEntityProfile, summary: editedSummary.slice(0, 200) };
     button.disabled = true;
     status.textContent = '正在保存实体概况…';
     try {

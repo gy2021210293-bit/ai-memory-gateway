@@ -1601,7 +1601,14 @@ body::after {
 }
 
 .data-table {
-    min-width: 1040px;
+    min-width: 0;
+    table-layout: fixed;
+}
+
+.data-table th,
+.data-table td {
+    padding-left: 6px;
+    padding-right: 6px;
 }
 
 .data-table .col-actions {
@@ -1621,14 +1628,56 @@ body::after {
     background: rgba(244, 239, 248, 0.98);
 }
 
-.col-title {
-    width: 210px;
-    min-width: 210px;
+.entity-profile-editor-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 16px;
 }
 
-.col-content {
-    width: 46%;
-    min-width: 430px;
+.data-table .col-check {
+    width: 32px;
+}
+
+.data-table .col-id {
+    width: 38px;
+}
+
+.data-table .col-layer {
+    width: 64px;
+}
+
+.data-table .col-title {
+    width: 116px;
+    min-width: 0;
+}
+
+.data-table .col-content {
+    width: auto;
+    min-width: 0;
+}
+
+.data-table .col-importance {
+    width: 56px;
+}
+
+.data-table .col-time {
+    width: 92px;
+}
+
+.data-table .col-actions {
+    width: 126px;
+}
+
+.data-table .layer-select {
+    width: 100%;
+    min-width: 0;
+    padding-left: 3px;
+    padding-right: 3px;
+}
+
+.data-table .row-actions {
+    flex-wrap: wrap;
+    gap: 6px;
 }
 
 .title-input {
@@ -2071,6 +2120,10 @@ body::after {
 }
 
 @media (max-width: 768px) {
+    .entity-profile-editor-grid {
+        grid-template-columns: 1fr;
+    }
+
     .sidebar {
         width: 72px;
     }
