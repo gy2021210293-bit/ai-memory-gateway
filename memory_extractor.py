@@ -243,7 +243,10 @@ def _format_message_time(value, fallback: datetime) -> str:
     return parsed.astimezone(local_tz).strftime("%Y-%m-%d %H:%M %A UTC%z")
 
 
-async def extract_memories(messages: List[Dict[str, str]], existing_memories: List[str] = None) -> List[Dict]:
+async def extract_memories(
+    messages: List[Dict[str, str]],
+    existing_memories: List[str] = None,
+) -> Optional[List[Dict]]:
     """
     从对话消息中提取记忆
 
@@ -252,12 +255,12 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         existing_memories: 已有记忆内容列表，用于去重对比
 
     返回：
-        记忆列表，格式 [{"content": "...", "importance": N}, ...]
+        成功时返回记忆列表（可以为空）；请求或解析失败时返回 None
     """
     api_key = get_memory_api_key()
     if not api_key:
         print("⚠️  API_KEY 未设置，跳过记忆提取")
-        return []
+        return None
 
     if not messages:
         return []
@@ -305,7 +308,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
             if response.status_code != 200:
                 print(f"⚠️  记忆提取请求失败: {response.status_code} {response.text[:300]}")
-                return []
+                return None
 
             data = response.json()
 
@@ -340,14 +343,14 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                 )
                 if retry_response.status_code != 200:
                     print(f"⚠️  记忆提取重试失败: {retry_response.status_code} {retry_response.text[:300]}")
-                    return []
+                    return None
                 retry_text = _extract_response_content(retry_response.json())
                 try:
                     memories = parse_json_array(retry_text)
                 except ValueError as retry_error:
                     print(f"⚠️  记忆提取重试结果仍无法解析: {retry_error}")
                     print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
-                    return []
+                    return None
 
             # 验证格式
             valid_memories = []
@@ -364,10 +367,10 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
     except json.JSONDecodeError as e:
         print(f"⚠️  记忆提取结果解析失败: {e}")
-        return []
+        return None
     except Exception as e:
         print(f"⚠️  记忆提取出错: {e}")
-        return []
+        return None
 
 
 async def extract_entities_from_memories(memories: List[Dict]) -> Optional[Dict[int, List[Dict]]]:

@@ -172,6 +172,19 @@ async def init_tables():
                 updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+
+        # 每条对话线独立的记忆提取进度。首次见到旧对话线时从现有末尾开始，
+        # 避免部署后把全部历史重复送入提取模型。
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_extraction_state (
+                session_id                 TEXT PRIMARY KEY,
+                last_extracted_message_id  INTEGER NOT NULL DEFAULT 0,
+                pending_rounds              INTEGER NOT NULL DEFAULT 0,
+                claim_token                 TEXT,
+                claim_started_at            TIMESTAMPTZ,
+                updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
         
         # ---- 三层记忆架构字段（layer / title / is_active / merged_from / event_date）----
         # layer: 1=原始碎片, 2=事件记忆, 3=核心记忆
@@ -612,6 +625,118 @@ async def get_recent_messages(session_id: str, limit: int = 20):
             session_id, limit,
         )
         return list(reversed(rows))
+
+
+async def ensure_memory_extraction_state(session_id: str):
+    """在写入新一轮消息前建立进度基线；已有状态保持不变。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO memory_extraction_state (
+                session_id, last_extracted_message_id, pending_rounds, updated_at
+            )
+            SELECT $1, COALESCE(MAX(id), 0), 0, NOW()
+            FROM conversations
+            WHERE session_id = $1
+            ON CONFLICT (session_id) DO NOTHING
+        """, session_id)
+
+
+async def record_memory_extraction_round(session_id: str, interval: int, claim_token: str) -> dict:
+    """持久化一轮完成进度，并在达到间隔时原子领取该对话线的提取任务。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            progress = await conn.fetchrow("""
+                UPDATE memory_extraction_state
+                SET pending_rounds = pending_rounds + 1, updated_at = NOW()
+                WHERE session_id = $1
+                RETURNING pending_rounds
+            """, session_id)
+            if not progress:
+                raise RuntimeError(f"记忆提取进度未初始化: {session_id}")
+
+            claim = await conn.fetchrow("""
+                UPDATE memory_extraction_state
+                SET claim_token = $3, claim_started_at = NOW(), updated_at = NOW()
+                WHERE session_id = $1
+                  AND pending_rounds >= $2
+                  AND (
+                      claim_token IS NULL
+                      OR claim_started_at < NOW() - INTERVAL '5 minutes'
+                  )
+                RETURNING pending_rounds AS claimed_rounds, last_extracted_message_id
+            """, session_id, interval, claim_token)
+            if not claim:
+                return {
+                    "should_extract": False,
+                    "pending_rounds": int(progress["pending_rounds"]),
+                }
+
+            through_message_id = await conn.fetchval(
+                "SELECT COALESCE(MAX(id), $2) FROM conversations WHERE session_id = $1",
+                session_id, claim["last_extracted_message_id"],
+            )
+            return {
+                "should_extract": True,
+                "claim_token": claim_token,
+                "claimed_rounds": int(claim["claimed_rounds"]),
+                "last_extracted_message_id": int(claim["last_extracted_message_id"]),
+                "through_message_id": int(through_message_id),
+            }
+
+
+async def get_messages_for_memory_extraction(
+    session_id: str,
+    after_message_id: int,
+    through_message_id: int,
+) -> list:
+    """读取本次 claim 覆盖的、尚未成功提取的 user/assistant 消息。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, role, content, metadata, created_at
+            FROM conversations
+            WHERE session_id = $1
+              AND id > $2
+              AND id <= $3
+              AND role IN ('user', 'assistant')
+            ORDER BY id
+        """, session_id, after_message_id, through_message_id)
+        return [dict(row) for row in rows]
+
+
+async def complete_memory_extraction(
+    session_id: str,
+    claim_token: str,
+    through_message_id: int,
+    claimed_rounds: int,
+) -> bool:
+    """成功后推进游标，并保留提取期间新累积的轮数。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE memory_extraction_state
+            SET last_extracted_message_id = GREATEST(last_extracted_message_id, $3),
+                pending_rounds = GREATEST(pending_rounds - $4, 0),
+                claim_token = NULL,
+                claim_started_at = NULL,
+                updated_at = NOW()
+            WHERE session_id = $1 AND claim_token = $2
+        """, session_id, claim_token, through_message_id, claimed_rounds)
+        return result == "UPDATE 1"
+
+
+async def release_memory_extraction_claim(session_id: str, claim_token: str) -> bool:
+    """失败时释放 claim，但不清零轮数或推进游标。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE memory_extraction_state
+            SET claim_token = NULL, claim_started_at = NULL, updated_at = NOW()
+            WHERE session_id = $1 AND claim_token = $2
+        """, session_id, claim_token)
+        return result == "UPDATE 1"
 
 
 async def search_conversations(query: str, limit: int = 20, offset: int = 0):
@@ -1481,6 +1606,7 @@ async def delete_conversation(session_id: str):
                 "DELETE FROM conversations WHERE session_id = $1 RETURNING id", session_id
             )
             await conn.execute("DELETE FROM session_cache_state WHERE session_id = $1", session_id)
+            await conn.execute("DELETE FROM memory_extraction_state WHERE session_id = $1", session_id)
             await conn.execute("DELETE FROM token_usage WHERE session_id = $1", session_id)
     return bool(deleted)
 
@@ -1499,22 +1625,62 @@ async def batch_delete_conversations(session_ids: list):
                 "DELETE FROM session_cache_state WHERE session_id = ANY($1::text[])", session_ids
             )
             await conn.execute(
+                "DELETE FROM memory_extraction_state WHERE session_id = ANY($1::text[])", session_ids
+            )
+            await conn.execute(
                 "DELETE FROM token_usage WHERE session_id = ANY($1::text[])", session_ids
             )
     return len({row["session_id"] for row in deleted})
 
 
 async def merge_sessions_to_target(source_ids: list, target_id: str) -> dict:
+    source_ids = list(dict.fromkeys(sid for sid in source_ids if sid != target_id))
     if not source_ids:
         return {'merged_sessions': 0, 'merged_messages': 0, 'merged_token_records': 0}
     pool = await get_pool()
     async with pool.acquire() as conn:
-        msg_count = await conn.fetchval("SELECT COUNT(*) FROM conversations WHERE session_id = ANY($1)", source_ids)
-        await conn.execute("UPDATE conversations SET session_id = $1 WHERE session_id = ANY($2)", target_id, source_ids)
-        token_count = await conn.fetchval("SELECT COUNT(*) FROM token_usage WHERE session_id = ANY($1)", source_ids)
-        await conn.execute("UPDATE token_usage SET session_id = $1 WHERE session_id = ANY($2)", target_id, source_ids)
-        await conn.execute("DELETE FROM session_cache_state WHERE session_id = ANY($1)", source_ids)
-        return {'merged_sessions': len(source_ids), 'merged_messages': msg_count or 0, 'merged_token_records': token_count or 0}
+        async with conn.transaction():
+            progress_ids = [target_id, *source_ids]
+            progress = await conn.fetchrow("""
+                SELECT COUNT(*) AS state_count,
+                       MIN(last_extracted_message_id) AS last_extracted_message_id,
+                       COALESCE(SUM(pending_rounds), 0) AS pending_rounds
+                FROM memory_extraction_state
+                WHERE session_id = ANY($1::text[])
+            """, progress_ids)
+            msg_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = ANY($1)", source_ids
+            )
+            await conn.execute(
+                "UPDATE conversations SET session_id = $1 WHERE session_id = ANY($2)",
+                target_id, source_ids,
+            )
+            token_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM token_usage WHERE session_id = ANY($1)", source_ids
+            )
+            await conn.execute(
+                "UPDATE token_usage SET session_id = $1 WHERE session_id = ANY($2)",
+                target_id, source_ids,
+            )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = ANY($1)", source_ids
+            )
+            await conn.execute(
+                "DELETE FROM memory_extraction_state WHERE session_id = ANY($1::text[])",
+                progress_ids,
+            )
+            if progress and progress["state_count"]:
+                await conn.execute("""
+                    INSERT INTO memory_extraction_state (
+                        session_id, last_extracted_message_id, pending_rounds, updated_at
+                    )
+                    VALUES ($1, $2, $3, NOW())
+                """, target_id, progress["last_extracted_message_id"], progress["pending_rounds"])
+            return {
+                'merged_sessions': len(source_ids),
+                'merged_messages': msg_count or 0,
+                'merged_token_records': token_count or 0,
+            }
 
 
 async def list_all_session_cache_states() -> list:
@@ -1561,19 +1727,27 @@ async def delete_session_cache_state(session_id: str):
 
 
 async def rename_session_id(old_id: str, new_id: str) -> bool:
-    """重命名对话线ID（事务内同时修改三个表）"""
+    """重命名对话线ID（事务内同步缓存、消息、Token 和提取进度）"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             # 检查新ID是否已存在
-            exists = await conn.fetchval(
-                "SELECT 1 FROM session_cache_state WHERE session_id = $1", new_id
-            )
+            exists = await conn.fetchval("""
+                SELECT 1 FROM session_cache_state WHERE session_id = $1
+                UNION ALL
+                SELECT 1 FROM memory_extraction_state WHERE session_id = $1
+                LIMIT 1
+            """, new_id)
             if exists:
                 return False
             # session_cache_state
             await conn.execute(
                 "UPDATE session_cache_state SET session_id = $1 WHERE session_id = $2",
+                new_id, old_id
+            )
+            # memory_extraction_state
+            await conn.execute(
+                "UPDATE memory_extraction_state SET session_id = $1 WHERE session_id = $2",
                 new_id, old_id
             )
             # conversations

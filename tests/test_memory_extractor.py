@@ -98,6 +98,31 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("max_tokens", call.kwargs["json"])
         self.assertIn("只返回最终 JSON 数组", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
 
+    async def test_failed_request_is_distinct_from_successful_empty_result(self):
+        failed = Mock()
+        failed.status_code = 503
+        failed.text = "unavailable"
+
+        empty = Mock()
+        empty.status_code = 200
+        empty.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
+
+        client = AsyncMock()
+        client.post.side_effect = [failed, empty]
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            failed_result = await memory_extractor.extract_memories(
+                [{"role": "user", "content": "第一次"}], existing_memories=[]
+            )
+            empty_result = await memory_extractor.extract_memories(
+                [{"role": "user", "content": "第二次"}], existing_memories=[]
+            )
+
+        self.assertIsNone(failed_result)
+        self.assertEqual(empty_result, [])
+
     async def test_cognitive_draft_prompt_is_limited_to_one_subject(self):
         response = Mock()
         response.status_code = 200

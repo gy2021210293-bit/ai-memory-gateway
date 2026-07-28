@@ -26,9 +26,10 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_recent_messages, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
+from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction
 import memory_extractor as _memory_extractor_module
@@ -55,7 +56,8 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
 PORT = int(os.getenv("PORT", "8080"))
 
 # 网关访问密钥（强烈建议设置！）
-# 设置后所有非公开端点都需要鉴权，二选一：
+# 设置后所有非公开端点都需要鉴权，三选一：
+#   - 标准方式：Authorization: Bearer 你的密钥（OpenAI 兼容客户端）
 #   - 请求头方式：X-Gateway-Key: 你的密钥（客户端/API 调用）
 #   - URL参数方式：?gateway_key=你的密钥（方便浏览器访问 dashboard）
 # 不设置则跳过鉴权（兼容旧部署，仅建议内网环境使用）
@@ -96,9 +98,6 @@ def get_active_session_id() -> str:
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
-
-# 轮次计数器
-_round_counter = 0
 
 # 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
@@ -301,6 +300,23 @@ templates = Jinja2Templates(directory="templates")
 # 不需要鉴权的路径（根路径精确匹配，其余按前缀匹配）
 PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico")
 
+
+def _get_provided_gateway_key(headers, query_params):
+    """读取自定义密钥、URL 参数或 OpenAI 客户端使用的 Bearer 密钥。"""
+    provided_key = (
+        headers.get("X-Gateway-Key", "")
+        or query_params.get("gateway_key", "")
+    )
+    if provided_key:
+        return provided_key
+
+    authorization = headers.get("Authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer":
+        return token.strip()
+    return ""
+
+
 @app.middleware("http")
 async def gateway_auth_middleware(request: Request, call_next):
     """检查 GATEWAY_SECRET，保护所有非公开端点"""
@@ -325,17 +341,19 @@ async def gateway_auth_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # 从 header 或 query 参数获取密钥
-    provided_key = (
-        request.headers.get("X-Gateway-Key", "")
-        or request.query_params.get("gateway_key", "")
-    )
+    # 兼容 OpenAI 客户端的 Authorization: Bearer，也保留原有鉴权方式
+    provided_key = _get_provided_gateway_key(request.headers, request.query_params)
 
     # compare_digest 防时序侧信道攻击
     if not secrets.compare_digest(provided_key, GATEWAY_SECRET):
         return JSONResponse(
             status_code=401,
-            content={"error": "Unauthorized. Provide X-Gateway-Key header or gateway_key parameter."},
+            content={
+                "error": (
+                    "Unauthorized. Provide Authorization: Bearer <gateway key>, "
+                    "X-Gateway-Key header, or gateway_key parameter."
+                )
+            },
         )
 
     return await call_next(request)
@@ -1008,25 +1026,41 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
     记忆提取受 MEMORY_EXTRACT_INTERVAL 控制：
     - 0: 禁用自动提取
     - 1: 每轮提取（默认）
-    - N: 每 N 轮提取一次
+    - N: 每条对话线各自累计 N 轮后提取一次
     对话记录始终保存，不受间隔影响（除非 skip_conversation_log=True）。
     
-    context_messages: 客户端发来的原始对话上下文（不含system prompt），
-                      用于让提取模型从完整上下文中提取记忆。
+    context_messages: 客户端发来的原始对话上下文（保留调用兼容）；
+                      提取进度和消息边界以 PostgreSQL 为准。
     skip_conversation_log: 跳过对话存储（标题生成等辅助请求时使用）
     tool_messages: 客户端发来的工具结果消息列表
     assistant_tool_calls: response中assistant的工具调用列表（如果有）
     assistant_reasoning: response中assistant的reasoning_content（deepseek thinking mode）
     """
-    global _round_counter
-    
+    extraction_claim = None
+
     try:
         # Debug: 打印存储分支判断依据
         print(f"💾 process_memories_background: user_msg={bool(user_msg)}, tool_messages={len(tool_messages) if tool_messages else 0}, "
               f"assistant_tool_calls={len(assistant_tool_calls) if assistant_tool_calls else 0}, skip={skip_conversation_log}")
         if tool_messages:
             print(f"💾 tool详情: {[{'role': m.get('role'), 'tool_call_id': m.get('tool_call_id', '?')} for m in tool_messages]}")
-        
+
+        progress_ready = False
+        should_track_progress = (
+            not skip_conversation_log
+            and MEMORY_EXTRACT_ENABLED
+            and MEMORY_EXTRACT_INTERVAL > 0
+        )
+        if should_track_progress:
+            try:
+                # 必须在本轮消息写入前建立基线，避免首次部署时重放旧历史。
+                await ensure_memory_extraction_state(session_id)
+                progress_ready = True
+            except Exception as e:
+                print(f"⚠️ 初始化对话线 {session_id} 的记忆提取进度失败: {e}")
+
+        completed_round = False
+
         # 1. 存储对话记录（除非明确跳过）
         if skip_conversation_log:
             print(f"⏭️  跳过对话存储（辅助请求）")
@@ -1050,6 +1084,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 ast_meta = json.dumps(ast_meta_dict) if ast_meta_dict else None
                 await save_message(session_id, "assistant", assistant_msg or "", model, metadata=ast_meta)
                 print(f"🔧 存储: {len(tool_messages)}条tool + 1条assistant" + (" (含tool_calls)" if assistant_tool_calls else "") + (" (含reasoning)" if assistant_reasoning else ""))
+                completed_round = not assistant_tool_calls
         else:
             # 普通对话或首次工具调用
             ast_meta_dict = {}
@@ -1074,10 +1109,15 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                     else:
                         await save_message(session_id, "user", user_msg, model)
                         await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
+                        completed_round = True
                 else:
                     await save_message(session_id, "user", user_msg, model)
                     await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
-        
+                    completed_round = True
+
+        if skip_conversation_log:
+            return
+
         # 工具链尚未结束：状态已经保存，但等最终回答后再提取一次记忆。
         if should_defer_extraction(assistant_tool_calls):
             print("⏭️  assistant 仍在请求工具，延后到工具链最终回答再提取记忆")
@@ -1091,41 +1131,70 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         if MEMORY_EXTRACT_INTERVAL == 0:
             print(f"⏭️  记忆自动提取已禁用，跳过")
             return
-        
-        _round_counter += 1
-        
-        if MEMORY_EXTRACT_INTERVAL > 1 and (_round_counter % MEMORY_EXTRACT_INTERVAL != 0):
-            print(f"⏭️  轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）")
+
+        if not completed_round:
+            print("⏭️  本次没有形成新的完整对话轮，不累计记忆提取进度")
             return
-        
-        if MEMORY_EXTRACT_INTERVAL > 1:
-            print(f"📝 轮次 {_round_counter}，执行记忆提取")
-        
+
+        if not progress_ready:
+            print(f"⚠️ 对话线 {session_id} 的持久化进度不可用，本轮不执行记忆提取")
+            return
+
+        claim_token = str(uuid.uuid4())
+        extraction_claim = await record_memory_extraction_round(
+            session_id,
+            MEMORY_EXTRACT_INTERVAL,
+            claim_token,
+        )
+        if not extraction_claim["should_extract"]:
+            print(
+                f"⏭️  对话线 {session_id} 的记忆提取进度 "
+                f"{extraction_claim['pending_rounds']}/{MEMORY_EXTRACT_INTERVAL}"
+            )
+            return
+
+        print(
+            f"📝 对话线 {session_id} 已累计 {extraction_claim['claimed_rounds']} 轮，"
+            "执行持久化批次提取"
+        )
+
         # 3. 获取已有记忆，传给提取模型做对比去重
         existing = await get_recent_memories(limit=80)
         existing_contents = [r["content"] for r in existing]
-        
-        # 4. 构建用于提取的消息列表
-        #    截取最近 MEMORY_EXTRACT_INTERVAL 轮对话（每轮=user+assistant共2条）
-        #    而非发送完整上下文，省token
-        tail_count = MEMORY_EXTRACT_INTERVAL * 2
-        try:
-            stored_messages = await get_recent_messages(session_id, limit=max(tail_count * 3, 6))
-            messages_for_extraction = [
-                dict(msg) for msg in stored_messages if msg.get("role") in ("user", "assistant")
-            ][-tail_count:]
-        except Exception as e:
-            print(f"⚠️ 读取带时间戳的对话失败，回退到当前轮: {e}")
-            messages_for_extraction = []
 
+        # 4. 只读取该对话线上次成功游标之后、本次 claim 边界以内的消息。
+        messages_for_extraction = await get_messages_for_memory_extraction(
+            session_id,
+            extraction_claim["last_extracted_message_id"],
+            extraction_claim["through_message_id"],
+        )
         if not messages_for_extraction:
-            messages_for_extraction = [
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": assistant_msg},
-            ]
-        print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮带时间戳的对话提取记忆（{len(messages_for_extraction)} 条消息）")
-        
+            print(f"ℹ️ 对话线 {session_id} 本批次没有可提取的 user/assistant 消息，直接推进游标")
+            await complete_memory_extraction(
+                session_id,
+                extraction_claim["claim_token"],
+                extraction_claim["through_message_id"],
+                extraction_claim["claimed_rounds"],
+            )
+            extraction_claim = None
+            return
+
+        print(
+            f"📝 提取对话线 {session_id} 尚未处理的 {extraction_claim['claimed_rounds']} 轮"
+            f"（{len(messages_for_extraction)} 条 user/assistant 消息，"
+            f"ID {extraction_claim['last_extracted_message_id'] + 1}"
+            f"-{extraction_claim['through_message_id']}）"
+        )
+
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
+        if new_memories is None:
+            await release_memory_extraction_claim(
+                session_id,
+                extraction_claim["claim_token"],
+            )
+            extraction_claim = None
+            print(f"⚠️ 对话线 {session_id} 提取失败，进度保留，等待下轮重试")
+            return
         
         # 过滤垃圾记忆（不靠模型自觉，硬过滤）
         META_BLACKLIST = [
@@ -1152,12 +1221,30 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
             )
             await link_memory_entities(memory_id, mem.get("entities", []))
             await mark_memories_entity_scanned([memory_id])
-        
+
+        progress_completed = await complete_memory_extraction(
+            session_id,
+            extraction_claim["claim_token"],
+            extraction_claim["through_message_id"],
+            extraction_claim["claimed_rounds"],
+        )
+        extraction_claim = None
+        if not progress_completed:
+            print(f"⚠️ 对话线 {session_id} 的提取 claim 已失效，游标未推进")
+
         if filtered_memories:
             total = await get_all_memories_count()
             print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
-            
+
     except Exception as e:
+        if extraction_claim and extraction_claim.get("claim_token"):
+            try:
+                await release_memory_extraction_claim(
+                    session_id,
+                    extraction_claim["claim_token"],
+                )
+            except Exception as release_error:
+                print(f"⚠️ 释放对话线 {session_id} 的提取 claim 失败: {release_error}")
         print(f"⚠️  后台记忆处理失败: {e}")
 
 

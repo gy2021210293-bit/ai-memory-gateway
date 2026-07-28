@@ -83,6 +83,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         sql = "\n".join(call[1] for call in conn.calls)
         self.assertIn("DELETE FROM conversations", sql)
         self.assertIn("DELETE FROM session_cache_state", sql)
+        self.assertIn("DELETE FROM memory_extraction_state", sql)
         self.assertIn("DELETE FROM token_usage", sql)
 
     async def test_batch_delete_returns_real_distinct_session_count(self):

@@ -17,7 +17,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **对话线管理** — 固定 session ID 实现跨平台对话衔接，支持多对话线切换、摘要编辑
 - **对话记录** — 浏览、搜索、批量管理历史对话，支持 session 合并
 - **Token 统计** — 自动记录每次对话的 token 消耗，按 session 汇总显示
-- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有 API 端点需要携带密钥。Dashboard 通过 URL 参数传递密钥，自动注入后续请求
+- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有 API 端点需要携带密钥。兼容标准 `Authorization: Bearer`、`X-Gateway-Key` 和 Dashboard URL 参数
 - **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入
 - **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
 - **聚合记忆检索** — 关键词、可选语义向量和实体名称/别名三路召回；实体命中会聚合其碎片、事件与核心记忆
@@ -102,7 +102,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `MEMORY_MODEL` | 提取记忆用的模型（推荐便宜的小模型） | `anthropic/claude-haiku-4.5` |
 | `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
-| `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
+| `MEMORY_EXTRACT_INTERVAL` | 每条对话线独立的记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
 | `MEMORY_EXTRACT_ENABLED（可选）` | 记忆提取+注入总开关，false时只存消息不提取记忆 | `true` |
 | `TIMEZONE_HOURS` | 时区偏移（小时），用于记忆注入时的日期显示 | `8`（UTC+8） |
 | `FORCE_STREAM（可选）` | 强制所有请求走流式传输（解决部分客户端thinking不显示） | `false` |
@@ -125,7 +125,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 打开 `https://你的网关地址/dashboard` 可以查看所有记忆，支持搜索、编辑内容、调整权重、单条删除和批量删除，以及导入/导出备份。
 
-> 💡 如果设置了 `GATEWAY_SECRET`，访问地址变为 `https://你的网关地址/dashboard?gateway_key=你的密钥`。客户端请求头需加 `X-Gateway-Key: 你的密钥`。
+> 💡 如果设置了 `GATEWAY_SECRET`，访问地址变为 `https://你的网关地址/dashboard?gateway_key=你的密钥`。OpenAI 兼容客户端把“API Key”填写为 `GATEWAY_SECRET` 的值即可，客户端会发送 `Authorization: Bearer <GATEWAY_SECRET>`；仍支持 `X-Gateway-Key: 你的密钥`。
 
 ### 第三阶段：分区缓存（省 token 费）
 
@@ -251,7 +251,7 @@ ai-memory-gateway/
 4. **后台提取** → 用小模型（如 Haiku）从完整对话上下文中提取关键信息
 5. **存入数据库** → 下次对话时可以检索到
 
-提取记忆时，网关会把客户端发来的完整对话上下文（不含 system prompt）传给提取模型，这样能捕捉到跨轮次的信息。通过 `MEMORY_EXTRACT_INTERVAL` 可以控制提取频率：设为 0 禁用自动提取，设为 1 每轮都提，设为 N 则每 N 轮提取一次（适合控制成本）。
+提取记忆时，网关会按对话线从 PostgreSQL 读取“上次成功提取游标之后、本次批次边界以内”的 user/assistant 消息，并保留每条消息的时间戳。`MEMORY_EXTRACT_INTERVAL` 按每条对话线分别累计：设为 0 禁用自动提取，设为 1 每轮都提，设为 N 则该对话线每完成 N 轮提取一次。累计轮数和消息游标会持久化，服务重启不会清零；请求失败或输出解析失败时也不会推进游标，下轮会重试。要让 N 轮落在同一批次，客户端必须持续复用同一个对话线 `session_id`（开启分区对话线是现有的实现方式）。
 
 > **关于聚合搜索：** 关键词和实体名称/别名召回始终启用；实体命中会召回该实体关联的碎片、事件和核心记忆。设置 `MEMORY_VECTOR_ENABLED=true` + `EMBEDDING_API_KEY` 后再加入语义向量一路。支持任何 OpenAI 兼容的 Embedding API；数据库支持 pgvector 时自动启用，否则回退到 Python 端计算余弦相似度。
 
@@ -283,7 +283,7 @@ A: 检查端口设置。Render 默认用 `PORT` 环境变量，确保设置为 `
 A: 如果数据库和网关不在同一个平台，连接字符串末尾可能需要加 `?sslmode=require`。
 
 **Q: 记忆会越来越多影响性能吗？**
-A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。提取记忆时会用客户端发来的完整上下文，token 用量比单轮提取大一些，可以通过 `MEMORY_EXTRACT_INTERVAL` 降低提取频率来控制成本。
+A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。提取记忆时会读取该对话线上尚未成功处理的数据库消息批次，批次越大，单次提取 token 用量越高；可以通过 `MEMORY_EXTRACT_INTERVAL` 在调用频率和单批大小之间取舍。
 
 **Q: 能用免费额度跑吗？**
 A: Render 免费层支持 Web Service + PostgreSQL，网关资源消耗很低，够用（注意免费 PostgreSQL 有 90 天期限）。也可以用 Neon 或 Supabase 的免费 PostgreSQL 作为长期方案。LLM API 费用另算（推荐 OpenRouter，按量付费）。
@@ -326,7 +326,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 - **手动合并** — 在记忆列表勾选多条，打开合并弹窗编辑合并后内容。支持选择目标层级（事件/核心）
 - **撤回合并** — 事件记忆可一键撤回，恢复原始碎片
 - **软删除与恢复** — 删除记忆默认归档（`is_active=false`），可在「显示已归档」中恢复。永久删除需二次确认
-- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有非公开端点需要携带 `X-Gateway-Key` 请求头或 `?gateway_key=` URL 参数。未设置时跳过鉴权（兼容旧部署）
+- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有非公开端点需要携带 `Authorization: Bearer <密钥>`、`X-Gateway-Key` 请求头或 `?gateway_key=` URL 参数。未设置时跳过鉴权（兼容旧部署）
 - **Dashboard 全面升级** — 分层 Tab 标签页（全部/核心/事件/碎片 + 计数）、层级下拉选择器、标题编辑、底部浮动操作栏（选中后出现）、整理弹窗、合并弹窗、查看合并来源弹窗
 - **去重检查** — 新增三层去重策略（精确匹配 → 包含关系 → Jaccard 相似度），API 可调阈值
 - **搜索过滤** — 所有搜索路径（关键词 + 向量 + 实体）自动跳过已归档记忆
@@ -375,8 +375,8 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 
 ### v2.0（2026-03-01）
 
-- **记忆提取间隔** — 新增 `MEMORY_EXTRACT_INTERVAL` 环境变量，可设置每 N 轮提取一次记忆或禁用自动提取，方便控制 API 成本
-- **完整上下文提取** — 提取记忆时不再只看最新一轮对话，而是使用客户端发来的完整对话上下文，能捕捉到跨轮次的信息
+- **记忆提取间隔** — `MEMORY_EXTRACT_INTERVAL` 按对话线独立累计并持久化游标，可设置每 N 轮提取一次或禁用自动提取；失败批次保留进度等待重试
+- **游标批次提取** — 提取记忆时按对话线读取上次成功游标后的数据库消息，跨轮批次带时间戳且失败可重试
 - **优化记忆注入提示词** — 注入的记忆附带应用规则和交流方式指引，让 AI 更自然地运用记忆而非机械引用
 
 ### v1.0（2026-02-26）
