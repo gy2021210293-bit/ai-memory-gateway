@@ -542,6 +542,71 @@ def _message_text(message: dict) -> str:
     return ""
 
 
+def _extract_dynamic_environment(messages: list) -> tuple[list, str]:
+    """Remove client-marked dynamic environment messages and return the last valid snapshot."""
+    filtered = []
+    snapshot = ""
+    invalid_count = 0
+    for message in messages:
+        metadata = message.get("metadata")
+        is_snapshot = (
+            isinstance(metadata, dict)
+            and metadata.get("dynamic_environment") is True
+        )
+        if not is_snapshot:
+            filtered.append(message)
+            continue
+
+        content = message.get("content")
+        if message.get("role") == "user" and isinstance(content, str):
+            snapshot = content
+        else:
+            invalid_count += 1
+
+    if invalid_count:
+        print(
+            f"[warning] 忽略 {invalid_count} 条无效动态环境快照："
+            "要求 role=user 且 content 为字符串",
+            flush=True,
+        )
+    return filtered, snapshot
+
+
+def _inject_dynamic_environment(
+    messages: list,
+    snapshot: str,
+    merge_with_user: bool = False,
+) -> bool:
+    """Insert a transient snapshot immediately before the latest real user message."""
+    if not snapshot:
+        return False
+
+    target_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if target_index is None:
+        print(
+            "[warning] 动态环境快照未找到对应的真实 user 消息，本次不注入",
+            flush=True,
+        )
+        return False
+
+    if merge_with_user:
+        target = messages[target_index]
+        messages[target_index] = _assemble_current_user_message(
+            [snapshot],
+            target.get("content", ""),
+        )
+    else:
+        messages.insert(target_index, {"role": "user", "content": snapshot})
+    return True
+
+
 def _is_title_generation_request(messages: list) -> bool:
     """Detect client-side title generation prompts that must not enter chat history."""
     user_texts = [
@@ -1312,6 +1377,8 @@ async def chat_completions(request: Request):
 async def _chat_completions_inner(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
+    messages, dynamic_environment = _extract_dynamic_environment(messages)
+    body["messages"] = messages
     
     # ---------- 检测是否应跳过对话存储 ----------
     # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。
@@ -1497,6 +1564,18 @@ async def _chat_completions_inner(request: Request):
                 drives.inject(body.get("messages", []), drives_text)
         except Exception as e:
             print(f"⚠️  [Drivesoid] 注入失败（不影响转发）: {e}")
+
+    # ---------- 客户端动态环境：所有转换完成后，仅注入 Provider 临时消息 ----------
+    if _inject_dynamic_environment(
+        body.get("messages", []),
+        dynamic_environment,
+        merge_with_user=_is_anthropic_model(model),
+    ):
+        print(
+            "[dynamic-environment] 动态环境快照已注入 Provider 临时消息"
+            + ("（已与真实 user 消息合并）" if _is_anthropic_model(model) else ""),
+            flush=True,
+        )
 
     # ---------- 转发请求 ----------
     headers = {
