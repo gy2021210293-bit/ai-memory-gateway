@@ -204,6 +204,36 @@ class MessagePipelineTests(unittest.TestCase):
         self.assertNotIn("battery=80", str(result.provider_messages))
         self.assertEqual(classified.client_system_prompts, ("client rules",))
 
+    def test_invalid_environment_marker_does_not_drop_workflow_user(self):
+        database = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        classified = classify_request([
+            *database,
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "run workflow"}],
+                "metadata": {"dynamic_environment": True},
+            },
+        ])
+
+        self.assertEqual(classified.invalid_dynamic_count, 1)
+        self.assertEqual(classified.latest_user_text, "run workflow")
+        self.assertNotIn("metadata", classified.ordinary_messages[-1])
+
+        result = reconcile_partition_block(
+            database,
+            list(classified.ordinary_messages),
+        )
+
+        self.assertEqual(result.reason, "aligned")
+        self.assertEqual(result.latest_user_text, "run workflow")
+        self.assertEqual(
+            [message["role"] for message in result.provider_messages],
+            ["user"],
+        )
+
     def test_no_new_message_after_alignment_is_rejected(self):
         history = [
             {"role": "user", "content": "old"},

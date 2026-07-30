@@ -1386,7 +1386,7 @@ async def _chat_completions_inner(request: Request):
     body["messages"] = messages
     if classified.invalid_dynamic_count:
         print(
-            f"[warning] 忽略 {classified.invalid_dynamic_count} 条无效动态环境快照",
+            f"[warning] 忽略 {classified.invalid_dynamic_count} 个无效动态环境标记，原消息已保留",
             flush=True,
         )
     

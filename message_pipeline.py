@@ -168,9 +168,9 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
         if isinstance(metadata, dict) and metadata.get("dynamic_environment") is True:
             if message.get("role") == "user" and isinstance(message.get("content"), str):
                 dynamic = message["content"]
+                continue
             else:
                 invalid_dynamic += 1
-            continue
         clean = {key: value for key, value in message.items() if key != "metadata"}
         ordinary.append(clean)
         if clean.get("role") == "system":

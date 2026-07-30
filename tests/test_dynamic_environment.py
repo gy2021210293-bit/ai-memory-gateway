@@ -71,7 +71,7 @@ class DynamicEnvironmentTests(unittest.TestCase):
         self.assertEqual(filtered, messages)
         self.assertEqual(snapshot, "")
 
-    def test_invalid_marked_message_is_removed_without_becoming_snapshot(self):
+    def test_invalid_marker_is_removed_but_original_message_is_preserved(self):
         messages = [
             {
                 "role": "user",
@@ -83,7 +83,13 @@ class DynamicEnvironmentTests(unittest.TestCase):
 
         filtered, snapshot = self.helpers["_extract_dynamic_environment"](messages)
 
-        self.assertEqual(filtered, [{"role": "user", "content": "real request"}])
+        self.assertEqual(filtered, [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "invalid"}],
+            },
+            {"role": "user", "content": "real request"},
+        ])
         self.assertEqual(snapshot, "")
 
     def test_inserts_snapshot_before_latest_user_even_when_tool_is_last(self):
