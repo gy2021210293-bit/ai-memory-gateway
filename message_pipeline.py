@@ -35,6 +35,29 @@ class PersistencePlan:
     skip: bool
 
 
+@dataclass(frozen=True)
+class ReconciledBlock:
+    provider_messages: tuple[Message, ...]
+    persistence_messages: tuple[Message, ...]
+    latest_user_text: str
+    is_tool_chain: bool
+    aligned_count: int
+    alignment_end: int
+    reason: str
+
+
+def _empty_reconciled(reason: str, aligned_count: int = 0, alignment_end: int = -1):
+    return ReconciledBlock(
+        provider_messages=(),
+        persistence_messages=(),
+        latest_user_text="",
+        is_tool_chain=False,
+        aligned_count=aligned_count,
+        alignment_end=alignment_end,
+        reason=reason,
+    )
+
+
 def message_text(message: Message) -> str:
     content = message.get("content", "")
     if isinstance(content, str):
@@ -46,6 +69,31 @@ def message_text(message: Message) -> str:
             if isinstance(block, dict) and block.get("type") == "text"
         )
     return ""
+
+
+def _latest_user_text(messages: list[Message]) -> str:
+    return next(
+        (
+            message_text(message)
+            for message in reversed(messages)
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+
+
+def message_signature(message: Message) -> tuple:
+    tool_call_ids = tuple(sorted(
+        call.get("id")
+        for call in (message.get("tool_calls") or [])
+        if isinstance(call, dict) and call.get("id")
+    ))
+    return (
+        message.get("role", ""),
+        message_text(message),
+        tool_call_ids,
+        message.get("tool_call_id", ""),
+    )
 
 
 def _system_text(message: Message) -> str:
@@ -131,14 +179,6 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
                 systems.append(text)
 
     current, is_tool_chain = extract_current_block(ordinary)
-    latest_user = next(
-        (
-            message_text(message)
-            for message in reversed(ordinary)
-            if message.get("role") == "user"
-        ),
-        "",
-    )
     return ClassifiedRequest(
         raw_messages=tuple(raw),
         ordinary_messages=tuple(ordinary),
@@ -146,9 +186,80 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
         dynamic_environment=dynamic,
         current_block=tuple(current),
         is_tool_chain=is_tool_chain,
-        latest_user_text=latest_user,
+        latest_user_text=_latest_user_text(current),
         invalid_dynamic_count=invalid_dynamic,
     )
+
+
+def reconcile_partition_block(
+    database_messages: list[Message],
+    client_messages: list[Message],
+) -> ReconciledBlock:
+    database = [
+        message for message in database_messages
+        if message.get("role") != "system"
+    ]
+    client = [
+        {key: deepcopy(value) for key, value in message.items() if key != "metadata"}
+        for message in client_messages
+        if message.get("role") != "system"
+    ]
+
+    database_signatures = [message_signature(message) for message in database]
+    client_signatures = [message_signature(message) for message in client]
+    candidates = []
+    maximum = min(len(database_signatures), len(client_signatures))
+    for size in range(maximum, 0, -1):
+        database_suffix = database_signatures[-size:]
+        candidates = [
+            end
+            for end in range(size, len(client_signatures) + 1)
+            if client_signatures[end - size:end] == database_suffix
+        ]
+        if candidates:
+            if len(candidates) != 1:
+                return _empty_reconciled(
+                    "ambiguous_history_alignment",
+                    aligned_count=size,
+                )
+            alignment_end = candidates[0]
+            delta = client[alignment_end:]
+            if not delta:
+                return _empty_reconciled(
+                    "no_new_client_messages",
+                    aligned_count=size,
+                    alignment_end=alignment_end,
+                )
+            logical_block, is_tool_chain = extract_current_block(database + delta)
+            if not logical_block:
+                return _empty_reconciled(
+                    "invalid_aligned_message_sequence",
+                    aligned_count=size,
+                    alignment_end=alignment_end,
+                )
+            return ReconciledBlock(
+                provider_messages=tuple(delta),
+                persistence_messages=tuple(delta),
+                latest_user_text=_latest_user_text(logical_block),
+                is_tool_chain=is_tool_chain,
+                aligned_count=size,
+                alignment_end=alignment_end,
+                reason="aligned",
+            )
+
+    fallback, is_tool_chain = extract_current_block(client)
+    if fallback:
+        return ReconciledBlock(
+            provider_messages=tuple(fallback),
+            persistence_messages=tuple(fallback),
+            latest_user_text=_latest_user_text(fallback),
+            is_tool_chain=is_tool_chain,
+            aligned_count=0,
+            alignment_end=0,
+            reason="strict_tail_fallback",
+        )
+
+    return _empty_reconciled("no_valid_current_block")
 
 
 def combine_system_prompt(gateway_prompt: str, client_prompts: tuple[str, ...]) -> str:

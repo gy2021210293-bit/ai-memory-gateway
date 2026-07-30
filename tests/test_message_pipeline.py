@@ -4,6 +4,7 @@ from message_pipeline import (
     classify_request,
     combine_system_prompt,
     make_persistence_plan,
+    reconcile_partition_block,
 )
 
 
@@ -103,6 +104,148 @@ class MessagePipelineTests(unittest.TestCase):
 
         self.assertFalse(plan.completed_round)
         self.assertEqual(plan.messages[-1]["tool_calls"][0]["id"], "call-1")
+
+    def test_empty_current_block_never_falls_back_to_old_user(self):
+        result = classify_request([
+            {"role": "user", "content": "嗯嗯，可能是网关那边做了清洗"},
+            {"role": "assistant", "content": "old answer"},
+        ])
+
+        self.assertEqual(result.current_block, ())
+        self.assertEqual(result.latest_user_text, "")
+
+    def test_aligns_full_client_history_and_uses_workflow_user(self):
+        database = [
+            {"role": "user", "content": "嗯嗯，可能是网关那边做了清洗"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        client = [
+            {"role": "system", "content": "client rules"},
+            *database,
+            {"role": "user", "content": "执行早安天气工作流"},
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "aligned")
+        self.assertEqual(result.aligned_count, 2)
+        self.assertEqual(result.latest_user_text, "执行早安天气工作流")
+        self.assertEqual(
+            [message["content"] for message in result.provider_messages],
+            ["执行早安天气工作流"],
+        )
+
+    def test_aligns_truncated_client_history_against_database_suffix(self):
+        database = [
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": "older answer"},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent answer"},
+        ]
+        client = [
+            {"role": "assistant", "content": "recent answer"},
+            {"role": "user", "content": "workflow request"},
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "aligned")
+        self.assertEqual(result.aligned_count, 1)
+        self.assertEqual(result.latest_user_text, "workflow request")
+        self.assertEqual(len(result.provider_messages), 1)
+
+    def test_database_tool_prefix_allows_only_new_tool_result(self):
+        database = [
+            {"role": "user", "content": "run workflow"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1"}],
+            },
+        ]
+        client = [
+            *database,
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "aligned")
+        self.assertTrue(result.is_tool_chain)
+        self.assertEqual(result.latest_user_text, "run workflow")
+        self.assertEqual(
+            [message["role"] for message in result.provider_messages],
+            ["tool"],
+        )
+        self.assertEqual(result.persistence_messages, result.provider_messages)
+
+    def test_dynamic_environment_and_system_do_not_participate_in_alignment(self):
+        classified = classify_request([
+            {"role": "system", "content": "client rules"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {
+                "role": "user",
+                "content": "battery=80",
+                "metadata": {"dynamic_environment": True},
+            },
+            {"role": "user", "content": "workflow"},
+        ])
+
+        result = reconcile_partition_block(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+            ],
+            list(classified.ordinary_messages),
+        )
+
+        self.assertEqual(result.latest_user_text, "workflow")
+        self.assertNotIn("battery=80", str(result.provider_messages))
+        self.assertEqual(classified.client_system_prompts, ("client rules",))
+
+    def test_no_new_message_after_alignment_is_rejected(self):
+        history = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+
+        result = reconcile_partition_block(history, history)
+
+        self.assertEqual(result.provider_messages, ())
+        self.assertEqual(result.latest_user_text, "")
+        self.assertEqual(result.reason, "no_new_client_messages")
+
+    def test_mismatched_aligned_tool_chain_is_rejected(self):
+        database = [{"role": "user", "content": "run"}]
+        client = [
+            *database,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1"}],
+            },
+            {"role": "tool", "tool_call_id": "call-x", "content": "bad"},
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.provider_messages, ())
+        self.assertEqual(result.reason, "invalid_aligned_message_sequence")
+
+    def test_ambiguous_history_alignment_is_rejected(self):
+        database = [{"role": "assistant", "content": "same"}]
+        client = [
+            {"role": "assistant", "content": "same"},
+            {"role": "user", "content": "middle"},
+            {"role": "assistant", "content": "same"},
+            {"role": "user", "content": "workflow"},
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.provider_messages, ())
+        self.assertEqual(result.reason, "ambiguous_history_alignment")
 
 
 if __name__ == "__main__":

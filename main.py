@@ -35,7 +35,12 @@ from memory_extractor import extract_memories, score_memories, extract_entities_
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
-from message_pipeline import classify_request, combine_system_prompt, make_persistence_plan
+from message_pipeline import (
+    classify_request,
+    combine_system_prompt,
+    make_persistence_plan,
+    reconcile_partition_block,
+)
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -1395,15 +1400,24 @@ async def _chat_completions_inner(request: Request):
     
     # ---------- 提取用户最新消息 ----------
     user_message = classified.latest_user_text
+    persistence_block = tuple(classified.current_block)
     
     # ---------- 检测工具调用消息 ----------
-    tool_messages = [m for m in messages if m.get("role") == "tool"]
+    tool_messages = [
+        message for message in persistence_block
+        if message.get("role") == "tool"
+    ]
     if tool_messages:
         print(f"🔧 检测到 {len(tool_messages)} 条工具结果消息")
     
     # ---------- 解析稳定活动会话（独立于分区开关） ----------
     session_id = get_active_session_id()
-    if not session_id and not skip_conversation_log and MEMORY_ENABLED:
+    if (
+        not session_id
+        and persistence_block
+        and not skip_conversation_log
+        and MEMORY_ENABLED
+    ):
         session_id = f"thread-{str(uuid.uuid4())[:8]}"
         PARTITION_SESSION_ID = session_id
         await set_gateway_config("partition_session_id", session_id)
@@ -1414,7 +1428,12 @@ async def _chat_completions_inner(request: Request):
     system_task = asyncio.create_task(get_system_prompt())
     drives_task = (
         asyncio.create_task(drives.fetch_context())
-        if drives.is_enabled() and user_message and not skip_conversation_log
+        if (
+            not CACHE_PARTITION_ENABLED
+            and drives.is_enabled()
+            and user_message
+            and not skip_conversation_log
+        )
         else None
     )
     prepared_drives_text = ""
@@ -1425,25 +1444,8 @@ async def _chat_completions_inner(request: Request):
             get_conversation_messages(session_id, limit=10000)
         )
         cognitive_task = asyncio.create_task(build_cognitive_text())
-        memory_task = asyncio.create_task(
-            build_memory_text(user_message)
-            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message
-            else asyncio.sleep(0, result="")
-        )
-        gathered = await asyncio.gather(
-            system_task, history_task, cognitive_task, memory_task,
-            *(tuple([drives_task]) if drives_task else tuple()),
-            return_exceptions=True,
-        )
-        effective_system_prompt = gathered[0] if not isinstance(gathered[0], Exception) else ""
-        db_history = gathered[1] if not isinstance(gathered[1], Exception) else []
-        cognitive_text = gathered[2] if not isinstance(gathered[2], Exception) else ""
-        memory_text = gathered[3] if not isinstance(gathered[3], Exception) else ""
-        if drives_task:
-            prepared_drives_text = (
-                gathered[4] if not isinstance(gathered[4], Exception) else ""
-            )
         try:
+            db_history = await history_task
             db_msgs = []
             for m in (db_history or []):
                 msg = db_row_to_message(m)
@@ -1452,11 +1454,70 @@ async def _chat_completions_inner(request: Request):
         except Exception as e:
             print(f"[warning] 分区模式读取历史失败: {e}")
             db_msgs = []
-        
-        # 提取当前客户端消息块。闭合的本地工具链以请求内 tool_call_id 为准，
-        # 不要求异步落库已完成；更早的客户端历史仍由 DB 权威历史替代。
-        client_new_msgs = [dict(message) for message in classified.current_block]
-        self_contained_tool_chain = classified.is_tool_chain
+
+        reconciled = reconcile_partition_block(db_msgs, messages)
+        print(
+            "[message-align] "
+            f"client_roles={[m.get('role', '?') for m in messages if m.get('role') != 'system']} "
+            f"db_tail_roles={[m.get('role', '?') for m in db_msgs[-8:]]} "
+            f"aligned={reconciled.aligned_count}@{reconciled.alignment_end} "
+            f"current_roles={[m.get('role', '?') for m in reconciled.provider_messages]} "
+            f"tool_chain={reconciled.is_tool_chain} "
+            f"tool_calls={sum(len(m.get('tool_calls') or []) for m in reconciled.provider_messages)} "
+            f"tool_results={sum(m.get('role') == 'tool' for m in reconciled.provider_messages)} "
+            f"result={reconciled.reason}",
+            flush=True,
+        )
+        if not reconciled.provider_messages:
+            for task in (system_task, cognitive_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                system_task,
+                cognitive_task,
+                return_exceptions=True,
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "无法识别本次客户端请求块，请检查消息角色和工具调用顺序",
+                        "type": "invalid_message_sequence",
+                    }
+                },
+            )
+
+        client_new_msgs = [
+            dict(message) for message in reconciled.provider_messages
+        ]
+        persistence_block = tuple(reconciled.persistence_messages)
+        user_message = reconciled.latest_user_text
+        self_contained_tool_chain = reconciled.is_tool_chain
+        memory_task = asyncio.create_task(
+            build_memory_text(user_message)
+            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message
+            else asyncio.sleep(0, result="")
+        )
+        drives_task = (
+            asyncio.create_task(drives.fetch_context())
+            if drives.is_enabled() and user_message
+            else None
+        )
+        gathered = await asyncio.gather(
+            system_task,
+            cognitive_task,
+            memory_task,
+            *(tuple([drives_task]) if drives_task else tuple()),
+            return_exceptions=True,
+        )
+        effective_system_prompt = gathered[0] if not isinstance(gathered[0], Exception) else ""
+        cognitive_text = gathered[1] if not isinstance(gathered[1], Exception) else ""
+        memory_text = gathered[2] if not isinstance(gathered[2], Exception) else ""
+        if drives_task:
+            prepared_drives_text = (
+                gathered[3] if not isinstance(gathered[3], Exception) else ""
+            )
+
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
         db_last = db_msgs[-1] if db_msgs else None
         db_expected_ids = {
@@ -1487,7 +1548,10 @@ async def _chat_completions_inner(request: Request):
         all_msgs = db_msgs + client_new_msgs
         
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
-        tool_messages = [m for m in client_new_msgs if m.get("role") == "tool"]
+        tool_messages = [
+            message for message in persistence_block
+            if message.get("role") == "tool"
+        ]
         
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
         
@@ -1568,7 +1632,7 @@ async def _chat_completions_inner(request: Request):
             print(f"⚠️  [Drivesoid] 注入失败（不影响转发）: {e}")
 
     # ---------- 客户端动态环境：所有转换完成后，仅注入 Provider 临时消息 ----------
-    if _inject_dynamic_environment(
+    if user_message and _inject_dynamic_environment(
         body.get("messages", []),
         dynamic_environment,
         merge_with_user=_is_anthropic_model(model),
@@ -1617,7 +1681,7 @@ async def _chat_completions_inner(request: Request):
         return StreamingResponse(
             safe_stream_and_capture(
                 headers, body, session_id, user_message, model,
-                skip_conversation_log, tuple(classified.current_block),
+                skip_conversation_log, persistence_block,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -1646,7 +1710,7 @@ async def _chat_completions_inner(request: Request):
                 if MEMORY_ENABLED and (user_message or tool_messages):
                     persistence_plan = make_persistence_plan(
                         session_id,
-                        tuple(classified.current_block),
+                        persistence_block,
                         assistant_msg,
                         assistant_tool_calls,
                         assistant_reasoning,
