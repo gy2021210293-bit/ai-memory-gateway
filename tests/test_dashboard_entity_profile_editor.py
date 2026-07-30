@@ -34,8 +34,8 @@ class DashboardEntityProfileEditorTests(unittest.TestCase):
         self.assertIn("selectedEntityMemoryIds.has(id)", self.javascript)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=4.6", self.html)
-        self.assertIn("/static/css/dashboard.css?v=5.8", self.html)
+        self.assertIn("/static/js/dashboard.js?v=4.7", self.html)
+        self.assertIn("/static/css/dashboard.css?v=5.9", self.html)
 
     def test_editor_collapses_to_one_column_on_narrow_screens(self):
         self.assertIn('class="entity-profile-editor-grid"', self.html)

@@ -11,7 +11,7 @@ import os
 import re
 import json
 from typing import Optional, List
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 
 import asyncpg
 
@@ -50,13 +50,16 @@ USER_ENTITY_NAMES = {
     if name.strip()
 }
 
-COGNITIVE_SUBJECTS = {"user", "self", "relationship"}
+COGNITIVE_SUBJECTS = {"user", "self", "relationship", "context"}
 COGNITIVE_TYPE_ORDER = (
+    "user_core", "self_core", "relationship_core", "current_field",
+)
+COGNITIVE_TYPES = set(COGNITIVE_TYPE_ORDER)
+LEGACY_COGNITIVE_TYPES = {
     "user_traits_preferences", "user_recent_state",
     "self_identity_commitment", "self_growth_lesson",
     "relationship_practice_agreement", "relationship_change",
-)
-COGNITIVE_TYPES = set(COGNITIVE_TYPE_ORDER)
+}
 AI_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
     for name in os.getenv("AI_ENTITY_NAMES", "Huxley,栖,向野").split(",")
@@ -64,11 +67,13 @@ AI_ENTITY_NAMES = {
 }
 EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
 COGNITIVE_TYPE_SUBJECTS = {
-    "user_traits_preferences": "user", "user_recent_state": "user",
-    "self_identity_commitment": "self", "self_growth_lesson": "self",
-    "relationship_practice_agreement": "relationship", "relationship_change": "relationship",
+    "user_core": "user",
+    "self_core": "self",
+    "relationship_core": "relationship",
+    "current_field": "context",
 }
 COGNITIVE_ITEM_RECOMMENDED_CHARS = 240
+COGNITIVE_FIELD_REVIEW_DAYS = 14
 
 
 # ============================================================
@@ -94,6 +99,140 @@ async def close_pool():
         await _pool.close()
         _pool = None
         print("✅ 数据库连接池已关闭")
+
+
+def _local_today() -> date:
+    return datetime.now(dt_timezone.utc).astimezone(
+        dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    ).date()
+
+
+def _merge_cognitive_sources(rows: list, labels: list[str]) -> tuple[str, float, list[int]]:
+    contents = []
+    evidence_ids = []
+    confidences = []
+    for row, label in zip(rows, labels):
+        if not row:
+            continue
+        content = str(row.get("content", "")).strip()
+        if content:
+            contents.append(f"{label}：{content}" if label else content)
+        confidences.append(float(row.get("confidence", 0.7)))
+        for value in row.get("evidence_memory_ids", []) or []:
+            memory_id = int(value)
+            if memory_id > 0 and memory_id not in evidence_ids:
+                evidence_ids.append(memory_id)
+    return "\n".join(contents), min(confidences or [0.7]), evidence_ids[:50]
+
+
+async def _migrate_cognitive_model_v2(conn) -> int:
+    """Transactionally migrate the legacy six slots into 三元一场."""
+    migrated = 0
+    async with conn.transaction():
+        await conn.execute("""
+            ALTER TABLE cognitive_items
+            ADD COLUMN IF NOT EXISTS review_after DATE DEFAULT NULL;
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'cognitive_items'::regclass
+                      AND conname = 'cognitive_items_subject_check'
+                      AND pg_get_constraintdef(oid) NOT LIKE '%context%'
+                ) THEN
+                    ALTER TABLE cognitive_items
+                    DROP CONSTRAINT cognitive_items_subject_check;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'cognitive_items'::regclass
+                      AND conname = 'cognitive_items_subject_check'
+                ) THEN
+                    ALTER TABLE cognitive_items
+                    ADD CONSTRAINT cognitive_items_subject_check
+                    CHECK (subject IN ('user', 'self', 'relationship', 'context'));
+                END IF;
+            END $$;
+        """)
+
+        active_rows = [
+            dict(row) for row in await conn.fetch("""
+                SELECT id, subject, cognitive_type, content, confidence,
+                       evidence_memory_ids, status, created_by,
+                       created_at, updated_at, review_after
+                FROM cognitive_items
+                WHERE status = 'active'
+                ORDER BY updated_at DESC, id DESC
+            """)
+        ]
+        latest_by_type = {}
+        duplicate_ids = []
+        for row in active_rows:
+            cognitive_type = row["cognitive_type"]
+            if cognitive_type in latest_by_type:
+                duplicate_ids.append(row["id"])
+            else:
+                latest_by_type[cognitive_type] = row
+        if duplicate_ids:
+            await conn.execute("""
+                UPDATE cognitive_items
+                SET status = 'superseded', updated_at = NOW()
+                WHERE id = ANY($1::int[])
+            """, duplicate_ids)
+
+        migration_specs = (
+            ("user", "user_core", ("user_traits_preferences",), ("",)),
+            (
+                "self", "self_core",
+                ("self_identity_commitment", "self_growth_lesson"),
+                ("身份与承诺", "成长与理解"),
+            ),
+            (
+                "relationship", "relationship_core",
+                ("relationship_practice_agreement", "relationship_change"),
+                ("相处方式与约定", "关系变化与方向"),
+            ),
+            ("context", "current_field", ("user_recent_state",), ("",)),
+        )
+        legacy_ids = []
+        for subject, target_type, source_types, labels in migration_specs:
+            sources = [latest_by_type.get(source_type) for source_type in source_types]
+            legacy_ids.extend(row["id"] for row in sources if row)
+            if latest_by_type.get(target_type):
+                continue
+            content, confidence, evidence_ids = _merge_cognitive_sources(sources, list(labels))
+            if not content:
+                continue
+            review_after = None
+            if target_type == "current_field":
+                updated_at = next(row["updated_at"] for row in sources if row)
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=dt_timezone.utc)
+                local_date = updated_at.astimezone(
+                    dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+                ).date()
+                review_after = local_date + timedelta(days=COGNITIVE_FIELD_REVIEW_DAYS)
+            await conn.execute("""
+                INSERT INTO cognitive_items
+                    (subject, cognitive_type, content, confidence,
+                     evidence_memory_ids, review_after, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6, 'migration')
+            """, subject, target_type, content, confidence, evidence_ids, review_after)
+            migrated += 1
+
+        if legacy_ids:
+            await conn.execute("""
+                UPDATE cognitive_items
+                SET status = 'superseded', updated_at = NOW()
+                WHERE id = ANY($1::int[])
+            """, sorted(set(legacy_ids)))
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cognitive_items_one_active_type
+            ON cognitive_items (cognitive_type)
+            WHERE status = 'active';
+        """)
+    return migrated
 
 
 # ============================================================
@@ -322,15 +461,16 @@ async def init_tables():
             END $$;
         """)
 
-        # ---- 三元认知模型：用户 / AI 自我 / 双方关系 ----
+        # ---- 三元一场认知模型：用户 / AI 自我 / 双方关系 / 当前认知场 ----
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS cognitive_items (
                 id                  SERIAL PRIMARY KEY,
-                subject             TEXT NOT NULL CHECK (subject IN ('user', 'self', 'relationship')),
+                subject             TEXT NOT NULL CHECK (subject IN ('user', 'self', 'relationship', 'context')),
                 cognitive_type      TEXT NOT NULL,
                 content             TEXT NOT NULL,
                 confidence          REAL NOT NULL DEFAULT 0.7 CHECK (confidence >= 0 AND confidence <= 1),
                 evidence_memory_ids INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+                review_after        DATE DEFAULT NULL,
                 status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
                 created_by          TEXT NOT NULL DEFAULT 'manual',
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -338,6 +478,9 @@ async def init_tables():
             );
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cognitive_items_subject_status ON cognitive_items (subject, status);")
+        migrated_cognitive_items = await _migrate_cognitive_model_v2(conn)
+        if migrated_cognitive_items:
+            print(f"✅ 三元一场认知模型已迁移 {migrated_cognitive_items} 个区块")
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -2025,16 +2168,38 @@ async def get_fragments_by_date_range(start_date, end_date):
 
 
 async def get_memories_for_cognitive_draft(limit: int = 80):
-    """Return a bounded, high-signal evidence set for manual cognitive draft generation."""
+    """Return up to 60 high-signal plus 20 recent active memories, deduplicated."""
+    high_signal_limit = min(60, max(0, int(limit)))
+    recent_limit = min(20, max(0, int(limit) - high_signal_limit))
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
+            WITH high_signal AS (
+                SELECT id, content, importance, created_at, layer, title
+                FROM memories
+                WHERE is_active = TRUE
+                ORDER BY layer DESC, importance DESC, created_at DESC
+                LIMIT $1
+            ),
+            recent AS (
+                SELECT id, content, importance, created_at, layer, title
+                FROM memories
+                WHERE is_active = TRUE
+                ORDER BY created_at DESC
+                LIMIT $2
+            )
             SELECT id, content, importance, created_at, layer, title
-            FROM memories
-            WHERE is_active = TRUE
-            ORDER BY layer DESC, importance DESC, created_at DESC
-            LIMIT $1
-        """, limit)
+            FROM (
+                SELECT high_signal.*, 1 AS source_order FROM high_signal
+                UNION ALL
+                SELECT recent.*, 2 AS source_order FROM recent
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM high_signal WHERE high_signal.id = recent.id
+                )
+            ) evidence
+            ORDER BY source_order, layer DESC, importance DESC, created_at DESC
+            LIMIT $3
+        """, high_signal_limit, recent_limit, limit)
         return [dict(row) for row in rows]
 
 
@@ -2727,8 +2892,10 @@ def normalize_cognitive_item_input(data: dict) -> dict:
     subject = str(data.get("subject", "")).strip().lower()
     cognitive_type = str(data.get("cognitive_type", "")).strip().lower()
     content = re.sub(r"\s+", " ", str(data.get("content", "")).strip())
+    if cognitive_type in LEGACY_COGNITIVE_TYPES:
+        raise ValueError("认知模型已升级为“三元一场”，请刷新页面后重试")
     if subject not in COGNITIVE_SUBJECTS:
-        raise ValueError("subject 必须是 user、self 或 relationship")
+        raise ValueError("subject 必须是 user、self、relationship 或 context")
     if cognitive_type not in COGNITIVE_TYPES:
         raise ValueError("不支持的认知类型")
     if COGNITIVE_TYPE_SUBJECTS[cognitive_type] != subject:
@@ -2747,19 +2914,51 @@ def normalize_cognitive_item_input(data: dict) -> dict:
             continue
         if memory_id > 0 and memory_id not in evidence_ids:
             evidence_ids.append(memory_id)
+    review_after = None
+    if cognitive_type == "current_field":
+        raw_review_after = data.get("review_after")
+        if raw_review_after in (None, ""):
+            review_after = _local_today() + timedelta(days=COGNITIVE_FIELD_REVIEW_DAYS)
+        elif isinstance(raw_review_after, datetime):
+            review_after = raw_review_after.date()
+        elif isinstance(raw_review_after, date):
+            review_after = raw_review_after
+        else:
+            try:
+                review_after = date.fromisoformat(str(raw_review_after).strip())
+            except ValueError:
+                raise ValueError("review_after 必须是 YYYY-MM-DD 日期")
     return {
         "subject": subject,
         "cognitive_type": cognitive_type,
         "content": content,
         "confidence": confidence,
         "evidence_memory_ids": evidence_ids[:50],
+        "review_after": review_after,
     }
 
 
-def format_cognitive_items_for_prompt(items: list) -> str:
+def is_cognitive_item_stale(item: dict, today: date = None) -> bool:
+    if item.get("cognitive_type") != "current_field" or not item.get("review_after"):
+        return False
+    review_after = item["review_after"]
+    if isinstance(review_after, str):
+        try:
+            review_after = date.fromisoformat(review_after)
+        except ValueError:
+            return False
+    return review_after <= (today or _local_today())
+
+
+def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
     if not items:
         return ""
-    subject_labels = {"user": "对用户的认知", "self": "AI 自我认知", "relationship": "关系认知"}
+    type_labels = {
+        "user_core": "用户核心",
+        "self_core": "AI 自我核心",
+        "relationship_core": "关系核心",
+        "current_field": "当前认知场",
+    }
     items_by_type = {}
     for item in items:
         cognitive_type = item.get("cognitive_type")
@@ -2767,20 +2966,33 @@ def format_cognitive_items_for_prompt(items: list) -> str:
                 and cognitive_type in COGNITIVE_TYPES
                 and COGNITIVE_TYPE_SUBJECTS[cognitive_type] == item.get("subject")
                 and cognitive_type not in items_by_type):
-            items_by_type[cognitive_type] = str(item.get("content", ""))
+            items_by_type[cognitive_type] = item
 
-    groups = {subject: [] for subject in ("user", "self", "relationship")}
+    sections = []
     for cognitive_type in COGNITIVE_TYPE_ORDER:
         if cognitive_type in items_by_type:
-            subject = COGNITIVE_TYPE_SUBJECTS[cognitive_type]
-            groups[subject].append(f"- [{cognitive_type}] {items_by_type[cognitive_type]}")
-    sections = [f"【{subject_labels[subject]}】\n" + "\n".join(groups[subject])
-                for subject in ("user", "self", "relationship") if groups[subject]]
+            item = items_by_type[cognitive_type]
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
+            except (TypeError, ValueError):
+                confidence = 0.7
+            metadata = [f"置信度 {confidence:.2f}"]
+            if cognitive_type == "current_field":
+                review_after = item.get("review_after")
+                if review_after:
+                    metadata.append(f"复核日 {review_after}")
+                if is_cognitive_item_stale(item, today=today):
+                    metadata.append("可能过时，只能作为背景")
+            sections.append(
+                f"【{type_labels[cognitive_type]}｜{'｜'.join(metadata)}】\n"
+                f"{str(item.get('content', '')).strip()}"
+            )
     if not sections:
         return ""
-    return "【三元认知模型】\n" + "\n\n".join(sections) + (
-        "\n\n使用规则：以当前用户消息为最高优先级；待确认项不能当作事实；"
-        "自然体现相关认知，不要向用户展示内部字段。"
+    return "【三元一场认知模型】\n" + "\n\n".join(sections) + (
+        "\n\n使用规则：当前用户消息，以及其中更明确、更新的日期或状态，始终优先于以上认知；"
+        "置信度较低的内容只能保守参考；标记为“可能过时”的当前认知场只能作为背景，"
+        "不得当作当前事实；自然体现相关认知，不要向用户展示内部字段。"
     )
 
 
@@ -2790,53 +3002,62 @@ async def list_cognitive_items(active_only: bool = False):
         where = "WHERE status = 'active'" if active_only else ""
         rows = await conn.fetch(f"""
             SELECT id, subject, cognitive_type, content, confidence,
-                   evidence_memory_ids, status, created_by, created_at, updated_at
+                   evidence_memory_ids, review_after, status, created_by,
+                   created_at, updated_at
             FROM cognitive_items {where}
-            ORDER BY CASE subject WHEN 'user' THEN 1 WHEN 'self' THEN 2 ELSE 3 END,
+            ORDER BY CASE cognitive_type
+                         WHEN 'user_core' THEN 1
+                         WHEN 'self_core' THEN 2
+                         WHEN 'relationship_core' THEN 3
+                         WHEN 'current_field' THEN 4
+                         ELSE 5
+                     END,
                      updated_at DESC, id DESC
         """)
-        return [dict(row) for row in rows]
+        items = [dict(row) for row in rows]
+        for item in items:
+            item["is_stale"] = is_cognitive_item_stale(item)
+        return items
 
 
 async def save_cognitive_item(data: dict, item_id: int = None):
     item = normalize_cognitive_item_input(data)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        evidence_ids = item["evidence_memory_ids"]
-        if evidence_ids:
-            rows = await conn.fetch("SELECT id FROM memories WHERE id = ANY($1::int[])", evidence_ids)
-            if {row["id"] for row in rows} != set(evidence_ids):
-                return {"error": "包含不存在的证据记忆 ID"}
-        if item_id is None:
-            existing = await conn.fetchrow("""
-                SELECT id FROM cognitive_items
-                WHERE subject = $1 AND cognitive_type = $2 AND status = 'active'
-                ORDER BY updated_at DESC, id DESC LIMIT 1
-            """, item["subject"], item["cognitive_type"])
-            if existing:
-                item_id = existing["id"]
-                await conn.execute("""
-                    UPDATE cognitive_items SET status = 'superseded', updated_at = NOW()
-                    WHERE subject = $1 AND cognitive_type = $2 AND status = 'active' AND id != $3
-                """, item["subject"], item["cognitive_type"], item_id)
-        if item_id is None:
+        async with conn.transaction():
+            evidence_ids = item["evidence_memory_ids"]
+            if evidence_ids:
+                rows = await conn.fetch("SELECT id FROM memories WHERE id = ANY($1::int[])", evidence_ids)
+                if {row["id"] for row in rows} != set(evidence_ids):
+                    return {"error": "包含不存在的证据记忆 ID"}
+            if item_id is not None:
+                existing = await conn.fetchrow("""
+                    SELECT id, subject, cognitive_type, status
+                    FROM cognitive_items
+                    WHERE id = $1 AND status = 'active'
+                    FOR UPDATE
+                """, item_id)
+                if not existing:
+                    return {"error": "认知项不存在"}
+                if (existing["subject"] != item["subject"]
+                        or existing["cognitive_type"] != item["cognitive_type"]):
+                    return {"error": "不能通过编辑改变认知区块"}
+            await conn.execute("""
+                UPDATE cognitive_items
+                SET status = 'superseded', updated_at = NOW()
+                WHERE cognitive_type = $1 AND status = 'active'
+            """, item["cognitive_type"])
             row = await conn.fetchrow("""
                 INSERT INTO cognitive_items
-                    (subject, cognitive_type, content, confidence, evidence_memory_ids)
-                VALUES ($1, $2, $3, $4, $5)
+                    (subject, cognitive_type, content, confidence,
+                     evidence_memory_ids, review_after, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6, 'manual')
                 RETURNING *
             """, item["subject"], item["cognitive_type"], item["content"],
-                 item["confidence"], evidence_ids)
-        else:
-            row = await conn.fetchrow("""
-                UPDATE cognitive_items SET subject = $2, cognitive_type = $3, content = $4,
-                    confidence = $5, evidence_memory_ids = $6, updated_at = NOW()
-                WHERE id = $1 RETURNING *
-            """, item_id, item["subject"], item["cognitive_type"], item["content"],
-                 item["confidence"], evidence_ids)
-            if not row:
-                return {"error": "认知项不存在"}
-    return {"status": "ok", "item": dict(row)}
+                 item["confidence"], evidence_ids, item["review_after"])
+    saved_item = dict(row)
+    saved_item["is_stale"] = is_cognitive_item_stale(saved_item)
+    return {"status": "ok", "item": saved_item}
 
 
 async def delete_cognitive_item(item_id: int):

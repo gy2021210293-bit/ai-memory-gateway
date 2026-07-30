@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memory Gateway</title>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=5.8">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=5.9">
 </head>
 <body>
     <div class="dashboard">
@@ -559,44 +559,30 @@
 
             <section id="section-cognition" class="section">
                 <div class="section-header">
-                    <h1>三元认知模型</h1>
-                    <p class="section-desc">维护栖对晏晏、对自己以及对双方关系的六项核心理解。草稿只供预览，确认保存后才会进入聊天上下文。</p>
+                    <h1>三元一场认知模型</h1>
+                    <p class="section-desc">维护用户核心、AI 自我核心、关系核心与当前认知场。草稿只供预览，逐项确认后才会进入聊天上下文。</p>
                 </div>
                 <div class="card">
                     <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
-                        <span class="section-desc">基于最多80条高信号活跃记忆，分别生成对应认知草稿；不会自动保存。</span>
-                        <div class="toolbar">
-                            <button class="btn btn-secondary cognition-draft-generate" onclick="generateCognitiveDraft('user')">更新用户认知</button>
-                            <button class="btn btn-secondary cognition-draft-generate" onclick="generateCognitiveDraft('self')">更新 AI 自我认知</button>
-                            <button class="btn btn-secondary cognition-draft-generate" onclick="generateCognitiveDraft('relationship')">更新关系认知</button>
-                        </div>
+                        <span class="section-desc">综合最多60条高信号记忆与20条最新记忆，一次审视四个区块；不会自动保存。</span>
+                        <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft()">重新审视认知</button>
                     </div>
+                    <div id="cognition-status" class="section-desc" style="margin-top:10px"></div>
                     <div id="cognition-draft-list" style="display:none;margin-top:16px"></div>
                 </div>
-                <div class="card">
+                <div class="card" id="cognition-editor" style="display:none">
+                    <input id="cognition-subject" type="hidden">
+                    <input id="cognition-type" type="hidden">
+                    <h3 id="cognition-editor-title">编辑认知</h3>
                     <div class="toolbar" style="align-items:flex-end;flex-wrap:wrap">
-                        <label>对象
-                            <select id="cognition-subject" class="input">
-                                <option value="user">晏晏（用户）</option>
-                                <option value="self">栖（AI 自我）</option>
-                                <option value="relationship">双方关系</option>
-                            </select>
-                        </label>
-                        <label>类型
-                            <select id="cognition-type" class="input">
-                                <option value="user_traits_preferences">身份、长期特点与偏好</option>
-                                <option value="user_recent_state">当前所在地、状态与未来计划</option>
-                                <option value="self_identity_commitment">身份锚点与承诺</option>
-                                <option value="self_growth_lesson">成长经验</option>
-                                <option value="relationship_practice_agreement">相处方式与共同约定</option>
-                                <option value="relationship_change">关系变化</option>
-                            </select>
-                        </label>
                         <label>置信度
                             <input id="cognition-confidence" class="input" type="number" min="0" max="1" step="0.05" value="0.7" style="width:100px">
                         </label>
                         <label>证据记忆 ID
                             <input id="cognition-evidence" class="input" placeholder="例如 12, 35" style="width:180px">
+                        </label>
+                        <label id="cognition-review-wrap" style="display:none">下次复核日
+                            <input id="cognition-review-after" class="input" type="date">
                         </label>
                     </div>
                     <label style="display:block;margin-top:14px">认知内容
@@ -604,12 +590,11 @@
                         <small id="cognition-char-hint" class="section-desc">建议控制在 240 字左右，超过仍可保存。</small>
                     </label>
                     <div class="toolbar" style="margin-top:12px">
-                        <button class="btn btn-primary" id="cognition-save" onclick="saveCognitiveItem()">新增认知</button>
-                        <button class="btn btn-secondary" id="cognition-cancel" onclick="cancelCognitiveEdit()" style="display:none">取消编辑</button>
-                        <span id="cognition-status" class="section-desc"></span>
+                        <button class="btn btn-primary" id="cognition-save" onclick="saveCognitiveItem()">保存认知</button>
+                        <button class="btn btn-secondary" id="cognition-cancel" onclick="cancelCognitiveEdit()">取消编辑</button>
                     </div>
                 </div>
-                <div id="cognition-groups"></div>
+                <div id="cognition-groups" class="cognition-grid"></div>
             </section>
 
             <section id="section-settings" class="section">
@@ -806,6 +791,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.6"></script>
+    <script src="/static/js/dashboard.js?v=4.7"></script>
 </body>
 </html>

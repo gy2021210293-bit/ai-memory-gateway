@@ -2053,18 +2053,15 @@ async def api_get_cognitive_items():
 
 
 @app.post("/api/cognitive-items/draft")
-async def api_generate_cognitive_draft(request: Request):
-    """Generate evidence-backed candidates for one subject without persisting them."""
-    data = await request.json()
-    subject = str(data.get("subject", "")).strip().lower()
-    rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES.get(subject)
-    if not rules:
-        return JSONResponse(status_code=400, content={"error": "subject 必须是 user、self 或 relationship"})
-    allowed_types = {rule[0] for rule in rules}
+async def api_generate_cognitive_draft():
+    """Review all four cognition sections without persisting any candidate."""
+    allowed_rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES
     memories = await get_memories_for_cognitive_draft(80)
     if not memories:
         return JSONResponse(status_code=400, content={"error": "没有可用于生成认知草稿的活跃记忆"})
-    raw_draft = await generate_cognitive_draft(memories, await list_cognitive_items(), subject)
+    raw_draft = await generate_cognitive_draft(
+        memories, await list_cognitive_items(active_only=True)
+    )
     if raw_draft is None:
         return JSONResponse(status_code=502, content={"error": "认知草稿模型调用失败，现有认知未改变"})
     allowed_memory_ids = {int(memory["id"]) for memory in memories}
@@ -2072,18 +2069,20 @@ async def api_generate_cognitive_draft(request: Request):
     for raw_item in raw_draft:
         if not isinstance(raw_item, dict):
             continue
-        if raw_item.get("subject") != subject or raw_item.get("cognitive_type") not in allowed_types:
+        cognitive_type = raw_item.get("cognitive_type")
+        expected_rule = allowed_rules.get(cognitive_type)
+        if not expected_rule or raw_item.get("subject") != expected_rule[0]:
             continue
         try:
             item = normalize_cognitive_item_input(raw_item)
         except ValueError:
             continue
         item["evidence_memory_ids"] = [item_id for item_id in item["evidence_memory_ids"] if item_id in allowed_memory_ids]
-        if not item["evidence_memory_ids"] or item["cognitive_type"] in seen_types:
+        if not item["evidence_memory_ids"] or cognitive_type in seen_types:
             continue
         draft.append(item)
-        seen_types.add(item["cognitive_type"])
-    return {"status": "draft", "subject": subject, "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
+        seen_types.add(cognitive_type)
+    return {"status": "draft", "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
             "evidence_count": len(memories)}
 
 

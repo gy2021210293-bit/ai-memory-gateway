@@ -123,7 +123,7 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(failed_result)
         self.assertEqual(empty_result, [])
 
-    async def test_cognitive_draft_prompt_is_limited_to_one_subject(self):
+    async def test_cognitive_draft_prompt_reviews_all_four_sections(self):
         response = Mock()
         response.status_code = 200
         response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
@@ -134,27 +134,29 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
             memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
         ):
             result = await memory_extractor.generate_cognitive_draft(
-                [{"id": 1, "content": "证据", "layer": 1, "importance": 8}],
+                [{"id": 1, "content": "证据", "layer": 1, "importance": 8,
+                  "created_at": "2026-07-30T08:00:00+00:00"}],
                 [
-                    {"subject": "user", "cognitive_type": "user_recent_state", "content": "用户旧认知"},
-                    {"subject": "self", "cognitive_type": "self_growth_lesson", "content": "自我旧认知"},
+                    {"subject": "user", "cognitive_type": "user_core", "content": "用户旧认知"},
+                    {"subject": "self", "cognitive_type": "self_core", "content": "自我旧认知"},
                 ],
-                "self",
             )
 
         self.assertEqual(result, [])
         prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
-        self.assertIn("self_identity_commitment", prompt)
-        self.assertIn("self_growth_lesson", prompt)
+        self.assertIn("user_core", prompt)
+        self.assertIn("self_core", prompt)
+        self.assertIn("relationship_core", prompt)
+        self.assertIn("current_field", prompt)
         self.assertIn("自我旧认知", prompt)
-        self.assertNotIn("user_traits_preferences", prompt)
-        self.assertNotIn("relationship_change", prompt)
-        self.assertNotIn("用户旧认知", prompt)
+        self.assertIn("用户旧认知", prompt)
+        self.assertIn("只有在证据足以形成新认知", prompt)
+        self.assertIn("不能提出删除", prompt)
 
-    async def test_cognitive_draft_rejects_unknown_subject(self):
+    async def test_cognitive_draft_requires_memories(self):
         with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"):
             result = await memory_extractor.generate_cognitive_draft(
-                [{"id": 1, "content": "证据"}], [], "unknown",
+                [], [],
             )
         self.assertIsNone(result)
 

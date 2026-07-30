@@ -504,50 +504,69 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 
 
 COGNITIVE_DRAFT_RULES = {
-    "user": [
-        ("user_traits_preferences", "晏晏的身份、长期特点与偏好。"),
-        ("user_recent_state", "晏晏当前所在地、当前状态，以及有明确证据支持的未来可能状态或计划；必须保留计划、可能性和时间的不确定性。"),
-    ],
-    "self": [
-        ("self_identity_commitment", "我的身份锚点与我对晏晏的承诺。"),
-        ("self_growth_lesson", "我从互动中形成的成长经验。"),
-    ],
-    "relationship": [
-        ("relationship_practice_agreement", "我们相处方式与共同约定。"),
-        ("relationship_change", "我们关系或互动方式的变化。"),
-    ],
+    "user_core": (
+        "user",
+        "晏晏稳定的价值、需求、偏好、敏感点与边界；不要混入一次性的情绪、地点或短期计划。",
+    ),
+    "self_core": (
+        "self",
+        "我的身份、价值、承诺、能力边界，以及被反复证据支持的成长理解。",
+    ),
+    "relationship_core": (
+        "relationship",
+        "我们关系的定义、角色、相处方式、共同约定、稳定互动模式与长期方向。",
+    ),
+    "current_field": (
+        "context",
+        "当前仍然有效的状态、目标、计划与未完成事项；必须保留日期、可能性和时间不确定性。",
+    ),
 }
 
 
-async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict], subject: str) -> Optional[List[Dict]]:
-    """Generate review-only cognition candidates for exactly one cognitive subject."""
+async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict]) -> Optional[List[Dict]]:
+    """Generate evidence-backed review candidates across 三元一场 without saving."""
     if not memories or not get_memory_api_key():
         return None
-    rules = COGNITIVE_DRAFT_RULES.get(subject)
-    if not rules:
-        return None
     evidence_lines = []
+    fallback_time = datetime.now(timezone.utc)
     for memory in memories:
         layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(memory.get("layer", 1), "记忆")
-        evidence_lines.append(f"[ID={memory['id']}][{layer_name}][重要度={memory.get('importance', 5)}] {memory['content']}")
+        memory_time = _format_message_time(memory.get("created_at"), fallback_time)
+        evidence_lines.append(
+            f"[ID={memory['id']}][{layer_name}][重要度={memory.get('importance', 5)}]"
+            f"[时间={memory_time}] {memory['content']}"
+        )
     current_lines = []
-    for item in [item for item in current_items if item.get("subject") == subject][:4]:
-        current_lines.append(f"[{item.get('subject')}][{item.get('cognitive_type')}] {item.get('content')}")
-    prompt = f"""我是栖，正在根据已有记忆只更新三元认知模型中的 {subject} 部分。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
+    for item in current_items:
+        cognitive_type = item.get("cognitive_type")
+        if cognitive_type not in COGNITIVE_DRAFT_RULES or item.get("status", "active") != "active":
+            continue
+        review_text = f"[复核日={item.get('review_after')}]" if item.get("review_after") else ""
+        current_lines.append(
+            f"[{item.get('subject')}][{cognitive_type}][置信度={item.get('confidence', 0.7)}]"
+            f"{review_text} {item.get('content')}"
+        )
+    rule_lines = [
+        f"{index}. {subject} / {cognitive_type}：{description}"
+        for index, (cognitive_type, (subject, description)) in enumerate(
+            COGNITIVE_DRAFT_RULES.items(), start=1
+        )
+    ]
+    prompt = f"""我是栖，正在根据已有记忆整体审视“三元一场”认知模型。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
 
-当前已保存认知（避免重复；新证据与其矛盾时可提出更正候选）：
+当前已保存认知（四部分必须相互一致；新证据与其矛盾时可提出更正候选）：
 {chr(10).join(current_lines) or '无'}
 
 证据记忆：
 {chr(10).join(evidence_lines)}
 
-只允许生成以下两种候选，每种最多一条；不得生成其他 subject 或 cognitive_type；没有充分证据就省略：
-1. {subject} / {rules[0][0]}：{rules[0][1]}
-2. {subject} / {rules[1][0]}：{rules[1][1]}
+只允许生成以下四种候选，每种最多一条：
+{chr(10).join(rule_lines)}
 
-每条 content 建议120-240字，以简洁为主但不要为凑字数遗漏关键信息；confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。只返回 JSON 数组：
+只有在证据足以形成新认知，或足以实质更正当前认知时才输出该部分；没有实质变化就省略。不能提出删除，也不能把生日、账号、航班号等原始事实机械复制为认知。每条 content 建议120-240字，以简洁为主但不要为凑字数遗漏关键信息；confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。current_field 可额外返回 review_after，格式为 YYYY-MM-DD；缺省时系统会使用14天后的日期。只返回 JSON 数组：
 [
-  {{"subject":"{subject}","cognitive_type":"{rules[0][0]}","content":"...","confidence":0.8,"evidence_memory_ids":[12]}}
+  {{"subject":"user","cognitive_type":"user_core","content":"...","confidence":0.8,"evidence_memory_ids":[12]}},
+  {{"subject":"context","cognitive_type":"current_field","content":"...","confidence":0.8,"evidence_memory_ids":[18],"review_after":"2026-08-13"}}
 ]
 """
     try:
@@ -559,11 +578,11 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
                       "messages": [{"role": "user", "content": prompt}]},
             )
         if response.status_code != 200:
-            print(f"⚠️ 三元认知草稿生成失败: {response.status_code} {response.text[:200]}")
+            print(f"⚠️ 三元一场认知草稿生成失败: {response.status_code} {response.text[:200]}")
             return None
         return parse_json_array(_extract_response_content(response.json()))
     except Exception as exc:
-        print(f"⚠️ 三元认知草稿解析失败: {exc}")
+        print(f"⚠️ 三元一场认知草稿解析失败: {exc}")
         return None
 
 
