@@ -779,6 +779,69 @@ def group_by_rounds(history: list) -> list:
     return rounds
 
 
+def _extract_trailing_client_block(messages: list) -> tuple[list, bool]:
+    """
+    Extract the current client suffix.
+
+    Besides trailing user messages, accept one or more structurally closed
+    user -> assistant(tool_calls) -> tool* chains without relying on DB state.
+    """
+    non_system = [message for message in messages if message.get("role") != "system"]
+    if not non_system:
+        return [], False
+
+    cursor = len(non_system) - 1
+    if non_system[cursor].get("role") == "user":
+        while cursor >= 0 and non_system[cursor].get("role") == "user":
+            cursor -= 1
+        block = non_system[cursor + 1:]
+        return [
+            {key: value for key, value in message.items() if key != "metadata"}
+            for message in block
+        ], False
+
+    if non_system[cursor].get("role") != "tool":
+        return [], False
+
+    while cursor >= 0 and non_system[cursor].get("role") == "tool":
+        tool_end = cursor + 1
+        while cursor >= 0 and non_system[cursor].get("role") == "tool":
+            cursor -= 1
+        tools = non_system[cursor + 1:tool_end]
+
+        if cursor < 0:
+            return [], False
+        assistant = non_system[cursor]
+        if assistant.get("role") != "assistant" or not assistant.get("tool_calls"):
+            return [], False
+
+        expected_ids = {
+            tool_call.get("id")
+            for tool_call in assistant.get("tool_calls", [])
+            if tool_call.get("id")
+        }
+        actual_ids = [tool.get("tool_call_id") for tool in tools]
+        if (
+            not expected_ids
+            or any(not tool_id for tool_id in actual_ids)
+            or set(actual_ids) != expected_ids
+        ):
+            return [], False
+
+        cursor -= 1
+
+    if cursor < 0 or non_system[cursor].get("role") != "user":
+        return [], False
+    while cursor > 0 and non_system[cursor - 1].get("role") == "user":
+        cursor -= 1
+
+    block = non_system[cursor:]
+    return [
+        {key: value for key, value in message.items() if key != "metadata"}
+        for message in block
+    ], True
+
+
 def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
     """
     判断是否应该触发A区→摘要的轮转。
@@ -1460,73 +1523,51 @@ async def _chat_completions_inner(request: Request):
             print(f"[warning] 分区模式读取历史失败: {e}")
             db_msgs = []
         
-        # 提取客户端新消息（非system），可能是user、tool、或带tool_calls的assistant
-        client_new_msgs = [m for m in messages if m.get("role") != "system"]
-        # 分区模式下，assistant消息来自上一轮response（DB里已存），过滤掉避免重复
-        client_new_msgs = [m for m in client_new_msgs if m.get("role") != "assistant"]
-        # 分区模式下DB已有完整历史，客户端发来的旧user是冗余的。
-        # 但有些客户端把图片和文字拆成多条连续的user发送（图在前文字在后），
-        # 只留最后一条会把图那条当冗余丢掉（图片不入库，DB里也找不回来）。
-        # 所以按原始消息顺序保留"末尾连续的user块"：历史冗余user总是被assistant隔开，不会混入。
-        tail_user_ids = set()
-        for m in reversed([m for m in messages if m.get("role") != "system"]):
-            if m.get("role") == "user":
-                tail_user_ids.add(id(m))
-            else:
-                break
-        user_msgs = [m for m in client_new_msgs if m.get("role") == "user"]
-        if len(user_msgs) > len(tail_user_ids):
-            client_new_msgs = [
-                m for m in client_new_msgs
-                if m.get("role") != "user" or id(m) in tail_user_ids
-            ]
-            print(f"🔧 去重: 过滤{len(user_msgs)-len(tail_user_ids)}条冗余user，保留末尾连续{len(tail_user_ids)}条")
-        # 工具结果轮次处理：基于DB状态 + 当前轮次tool_call_id精确判断
+        # 提取当前客户端消息块。闭合的本地工具链以请求内 tool_call_id 为准，
+        # 不要求异步落库已完成；更早的客户端历史仍由 DB 权威历史替代。
+        client_new_msgs, self_contained_tool_chain = _extract_trailing_client_block(messages)
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
-        if client_tools:
-            # 判断DB是否处于"等待tool结果"状态（最后一条是assistant(tool_calls)）
-            db_last = db_msgs[-1] if db_msgs else None
-            db_expecting_tool = (db_last and db_last.get("role") == "assistant" and db_last.get("tool_calls"))
-            
-            if not db_expecting_tool:
-                # DB不在等待tool结果 → 客户端的所有tool都是历史残留（含手动删除后的幽灵）
-                stale_ids = [m.get('tool_call_id', '?') for m in client_tools]
-                print(f"🔧 去重: DB未在等待tool结果，丢弃{len(client_tools)}条客户端tool (ids: {stale_ids})")
-                client_new_msgs = [m for m in client_new_msgs if m.get("role") != "tool"]
+        raw_client_tools = [m for m in messages if m.get("role") == "tool"]
+        db_last = db_msgs[-1] if db_msgs else None
+        db_expected_ids = {
+            tool_call.get("id")
+            for tool_call in (db_last.get("tool_calls", []) if db_last else [])
+            if tool_call.get("id")
+        }
+
+        if self_contained_tool_chain:
+            tool_ids = {tool.get("tool_call_id") for tool in client_tools}
+            if (
+                db_last
+                and db_last.get("role") == "assistant"
+                and tool_ids
+                and tool_ids == db_expected_ids
+            ):
+                client_new_msgs = client_tools
+                print(f"🔧 当前工具链已在DB中，保留{len(client_tools)}条tool结果")
             else:
-                # DB在等待tool → 只保留匹配当前轮次assistant(tool_calls)的tool
-                expected_tool_ids = {tc.get("id") for tc in db_last.get("tool_calls", []) if tc.get("id")}
-                new_tools = [m for m in client_tools if m.get("tool_call_id") in expected_tool_ids]
-                stale_tools = [m for m in client_tools if m.get("tool_call_id") not in expected_tool_ids]
-                
-                if stale_tools:
-                    print(f"🔧 去重: 丢弃{len(stale_tools)}条非当前轮次tool (ids: {[m.get('tool_call_id','?') for m in stale_tools]})")
-                if new_tools:
-                    print(f"🔧 保留{len(new_tools)}条当前轮次tool (ids: {[m.get('tool_call_id','?') for m in new_tools]})")
-                
-                # 重建 client_new_msgs（user此时已只剩末尾连续块，全部保回，别把拆条发送的图丢了）
-                tail_users = [m for m in client_new_msgs if m.get("role") == "user"]
-                client_new_msgs = new_tools[:] + tail_users
-                
-                if new_tools:
-                    # Race condition 防护：DB的assistant(tool_calls)已确认存在（db_expecting_tool=True），
-                    # 但仍需检查是否被其他并发请求意外清除
-                    new_tool_ids = {m.get("tool_call_id") for m in new_tools if m.get("tool_call_id")}
-                    db_has_matching_ast = False
-                    for m in db_msgs:
-                        if m.get("role") == "assistant" and m.get("tool_calls"):
-                            ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
-                            if new_tool_ids & ast_tc_ids:
-                                db_has_matching_ast = True
-                                break
-                    if not db_has_matching_ast and new_tool_ids:
-                        for m in messages:
-                            if m.get("role") == "assistant" and m.get("tool_calls"):
-                                ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
-                                if new_tool_ids & ast_tc_ids:
-                                    client_new_msgs.insert(0, m)
-                                    print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
-                                    break
+                print(
+                    "🔧 请求内工具链闭合，保留完整客户端块："
+                    f"{len(client_new_msgs)}条消息 / {len(client_tools)}条tool"
+                )
+        elif raw_client_tools:
+            matched_tools = [
+                tool
+                for tool in raw_client_tools
+                if tool.get("tool_call_id") in db_expected_ids
+            ]
+            client_new_msgs = matched_tools
+            if matched_tools:
+                print(f"🔧 DB工具链降级匹配：保留{len(matched_tools)}条tool结果")
+            else:
+                print(
+                    f"🔧 去重: 丢弃{len(raw_client_tools)}条无请求内闭合关系且DB不匹配的tool"
+                )
+
+        non_system_count = sum(1 for message in messages if message.get("role") != "system")
+        filtered_count = max(0, non_system_count - len(client_new_msgs))
+        if filtered_count:
+            print(f"🔧 去重: 过滤{filtered_count}条客户端历史，保留当前块{len(client_new_msgs)}条")
         all_msgs = db_msgs + client_new_msgs
         
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
