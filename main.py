@@ -26,15 +26,16 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
-from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim
+from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
+from message_pipeline import classify_request, combine_system_prompt, make_persistence_plan
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -94,6 +95,17 @@ def make_cache_control() -> dict:
     return {"type": "ephemeral"}
 
 def get_active_session_id() -> str:
+    return PARTITION_SESSION_ID
+
+
+async def _replace_active_session_before_deletion(session_ids: set[str]) -> str:
+    """Move the active pointer before its conversation is deleted."""
+    global PARTITION_SESSION_ID
+    active_session = get_active_session_id()
+    if active_session and active_session in session_ids:
+        PARTITION_SESSION_ID = f"thread-{str(uuid.uuid4())[:8]}"
+        await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
+        print("🔗 删除前已切换到新的活跃对话线", flush=True)
     return PARTITION_SESSION_ID
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
@@ -265,15 +277,15 @@ async def lifespan(app: FastAPI):
             elif not MEMORY_EXTRACT_ENABLED:
                 print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
             
-            # 分区缓存：从DB读取活跃对话线ID
+            # 活跃对话线独立于分区开关，所有聊天模式共用稳定 session。
+            db_sid = await get_gateway_config("partition_session_id", "")
+            if db_sid:
+                PARTITION_SESSION_ID = db_sid
+                print(f"🔗 活跃对话线(DB): {PARTITION_SESSION_ID}")
+            elif PARTITION_SESSION_ID:
+                await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
+                print(f"🔗 活跃对话线(ENV→DB): {PARTITION_SESSION_ID}")
             if CACHE_PARTITION_ENABLED:
-                db_sid = await get_gateway_config("partition_session_id", "")
-                if db_sid:
-                    PARTITION_SESSION_ID = db_sid
-                    print(f"🔗 活跃对话线(DB): {PARTITION_SESSION_ID}")
-                elif PARTITION_SESSION_ID:
-                    await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
-                    print(f"🔗 活跃对话线(ENV→DB): {PARTITION_SESSION_ID}")
                 print(f"🔒 分区缓存已启用: X={CACHE_PARTITION_X}, 摘要模型={CACHE_SUMMARY_MODEL or '（未配置，纯轮转模式）'}")
         except Exception as e:
             print(f"⚠️  数据库初始化失败: {e}")
@@ -542,64 +554,6 @@ def _message_text(message: dict) -> str:
     return ""
 
 
-def _build_partition_system_prompt(base_prompt: str, messages: list) -> tuple[str, int, int]:
-    """Append client system text to the gateway-owned partition prompt."""
-    client_prompts = []
-    for message in messages:
-        if message.get("role") != "system":
-            continue
-        content = message.get("content", "")
-        if isinstance(content, str):
-            if content:
-                client_prompts.append(content)
-        elif isinstance(content, list):
-            text = "\n".join(
-                block.get("text", "")
-                for block in content
-                if isinstance(block, dict)
-                and block.get("type") == "text"
-                and block.get("text")
-            )
-            if text:
-                client_prompts.append(text)
-
-    client_text = "\n\n".join(client_prompts)
-    combined = "\n\n".join(
-        part for part in (base_prompt or "", client_text) if part
-    )
-    return combined, len(client_prompts), len(client_text)
-
-
-def _extract_dynamic_environment(messages: list) -> tuple[list, str]:
-    """Remove client-marked dynamic environment messages and return the last valid snapshot."""
-    filtered = []
-    snapshot = ""
-    invalid_count = 0
-    for message in messages:
-        metadata = message.get("metadata")
-        is_snapshot = (
-            isinstance(metadata, dict)
-            and metadata.get("dynamic_environment") is True
-        )
-        if not is_snapshot:
-            filtered.append(message)
-            continue
-
-        content = message.get("content")
-        if message.get("role") == "user" and isinstance(content, str):
-            snapshot = content
-        else:
-            invalid_count += 1
-
-    if invalid_count:
-        print(
-            f"[warning] 忽略 {invalid_count} 条无效动态环境快照："
-            "要求 role=user 且 content 为字符串",
-            flush=True,
-        )
-    return filtered, snapshot
-
-
 def _inject_dynamic_environment(
     messages: list,
     snapshot: str,
@@ -762,6 +716,52 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         return ""
 
 
+_partition_summary_tasks = {}
+
+
+async def _run_partition_summary(
+    session_id: str,
+    messages: list,
+    expected_start: int,
+    existing_parts: list,
+):
+    try:
+        summary = await generate_summary(messages, session_id)
+        if not summary:
+            return
+        state = await get_session_cache_state(session_id)
+        if state["a_start_round"] != expected_start:
+            return
+        await save_session_cache_state(
+            session_id,
+            existing_parts + [summary],
+            expected_start + CACHE_PARTITION_X,
+        )
+        print(f"📝 后台摘要轮转完成: session={session_id}", flush=True)
+    finally:
+        _partition_summary_tasks.pop(session_id, None)
+
+
+def _schedule_partition_summary(
+    session_id: str,
+    messages: list,
+    expected_start: int,
+    existing_parts: list,
+):
+    if session_id in _partition_summary_tasks:
+        return
+    task = asyncio.create_task(
+        _run_partition_summary(
+            session_id,
+            [dict(message) for message in messages],
+            expected_start,
+            list(existing_parts),
+        )
+    )
+    _partition_summary_tasks[session_id] = task
+    print(f"📝 摘要轮转已转入后台: session={session_id}", flush=True)
+
+
 def group_by_rounds(history: list) -> list:
     """
     按逻辑轮分组：每个user消息开始一轮，到下一个user前结束。
@@ -777,69 +777,6 @@ def group_by_rounds(history: list) -> list:
     if current_round:
         rounds.append(current_round)
     return rounds
-
-
-def _extract_trailing_client_block(messages: list) -> tuple[list, bool]:
-    """
-    Extract the current client suffix.
-
-    Besides trailing user messages, accept one or more structurally closed
-    user -> assistant(tool_calls) -> tool* chains without relying on DB state.
-    """
-    non_system = [message for message in messages if message.get("role") != "system"]
-    if not non_system:
-        return [], False
-
-    cursor = len(non_system) - 1
-    if non_system[cursor].get("role") == "user":
-        while cursor >= 0 and non_system[cursor].get("role") == "user":
-            cursor -= 1
-        block = non_system[cursor + 1:]
-        return [
-            {key: value for key, value in message.items() if key != "metadata"}
-            for message in block
-        ], False
-
-    if non_system[cursor].get("role") != "tool":
-        return [], False
-
-    while cursor >= 0 and non_system[cursor].get("role") == "tool":
-        tool_end = cursor + 1
-        while cursor >= 0 and non_system[cursor].get("role") == "tool":
-            cursor -= 1
-        tools = non_system[cursor + 1:tool_end]
-
-        if cursor < 0:
-            return [], False
-        assistant = non_system[cursor]
-        if assistant.get("role") != "assistant" or not assistant.get("tool_calls"):
-            return [], False
-
-        expected_ids = {
-            tool_call.get("id")
-            for tool_call in assistant.get("tool_calls", [])
-            if tool_call.get("id")
-        }
-        actual_ids = [tool.get("tool_call_id") for tool in tools]
-        if (
-            not expected_ids
-            or any(not tool_id for tool_id in actual_ids)
-            or set(actual_ids) != expected_ids
-        ):
-            return [], False
-
-        cursor -= 1
-
-    if cursor < 0 or non_system[cursor].get("role") != "user":
-        return [], False
-    while cursor > 0 and non_system[cursor - 1].get("role") == "user":
-        cursor -= 1
-
-    block = non_system[cursor:]
-    return [
-        {key: value for key, value in message.items() if key != "metadata"}
-        for message in block
-    ], True
 
 
 def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
@@ -905,6 +842,8 @@ async def build_partitioned_messages(
     all_messages: list,
     base_prompt: str,
     user_message: str,
+    cognitive_text: str = "",
+    memory_text: str = "",
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -954,7 +893,10 @@ async def build_partitioned_messages(
     a_start_round = state['a_start_round']
     
     if total_rounds < X:
-        return await _build_basic_cached(history, base_prompt, user_message, current_user_msg, summary_parts)
+        return await _build_basic_cached(
+            history, base_prompt, user_message, current_user_msg,
+            summary_parts, cognitive_text, memory_text,
+        )
     
     # 计算A/B区（按逻辑轮切片）
     a_end_round = a_start_round + X
@@ -967,20 +909,15 @@ async def build_partitioned_messages(
     rotation_count = 0
     max_rotations = CACHE_MAX_ROTATIONS if CACHE_PARTITION_TRIGGER == "time" else 999
     while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
+        if CACHE_SUMMARY_MODEL:
+            _schedule_partition_summary(
+                session_id, a_msgs, a_start_round, summary_parts
+            )
+            break
         rotation_count += 1
         trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{CACHE_PARTITION_WINDOW}分钟窗口"
         print(f"🔄 轮转#{rotation_count}: session={session_id}, {trigger_info}")
         
-        new_summary = await generate_summary(a_msgs, session_id)
-        if new_summary:
-            summary_parts.append(new_summary)
-        elif CACHE_SUMMARY_MODEL:
-            # 配置了摘要模型但生成失败（网络/空content等）：中止本次轮转不推进滑窗，
-            # A区消息保留在上下文里，下次请求重试。只有纯轮转模式（模型留空）才无摘要直接滑出。
-            rotation_count -= 1
-            print(f"⚠️ 摘要生成失败，本次轮转中止，下次请求重试（A区消息未丢失）")
-            break
-
         a_start_round += X
         a_end_round = a_start_round + X
         a_round_groups = rounds[a_start_round : a_end_round]
@@ -1044,14 +981,11 @@ async def build_partitioned_messages(
     if current_user_msg:
         parts = [build_time_injection()]
 
-        cognitive_text = await build_cognitive_text()
         if cognitive_text:
             parts.append(cognitive_text)
         
-        if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
-            mem_text = await build_memory_text(user_message)
-            if mem_text:
-                parts.append(mem_text)
+        if memory_text:
+            parts.append(memory_text)
         
         result.append(_assemble_current_user_message(parts, current_user_msg['content']))
 
@@ -1069,6 +1003,8 @@ async def _build_basic_cached(
     user_message: str,
     current_user_msg: dict,
     summary_parts: list = None,
+    cognitive_text: str = "",
+    memory_text: str = "",
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
     summary_parts = summary_parts or []
@@ -1104,14 +1040,11 @@ async def _build_basic_cached(
     if current_user_msg:
         parts = [build_time_injection()]
 
-        cognitive_text = await build_cognitive_text()
         if cognitive_text:
             parts.append(cognitive_text)
         
-        if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
-            mem_text = await build_memory_text(user_message)
-            if mem_text:
-                parts.append(mem_text)
+        if memory_text:
+            parts.append(memory_text)
         
         result.append(_assemble_current_user_message(parts, current_user_msg['content']))
 
@@ -1175,7 +1108,15 @@ async def build_cognitive_text() -> str:
 # 后台记忆处理
 # ============================================================
 
-async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, context_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None, assistant_tool_calls: list = None, assistant_reasoning: str = None):
+async def process_memories_background(
+    session_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    model: str,
+    skip_conversation_log: bool = False,
+    assistant_tool_calls: list = None,
+    persistence_plan=None,
+):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
     
@@ -1185,21 +1126,18 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
     - N: 每条对话线各自累计 N 轮后提取一次
     对话记录始终保存，不受间隔影响（除非 skip_conversation_log=True）。
     
-    context_messages: 客户端发来的原始对话上下文（保留调用兼容）；
-                      提取进度和消息边界以 PostgreSQL 为准。
     skip_conversation_log: 跳过对话存储（标题生成等辅助请求时使用）
-    tool_messages: 客户端发来的工具结果消息列表
     assistant_tool_calls: response中assistant的工具调用列表（如果有）
-    assistant_reasoning: response中assistant的reasoning_content（deepseek thinking mode）
     """
     extraction_claim = None
 
     try:
         # Debug: 打印存储分支判断依据
-        print(f"💾 process_memories_background: user_msg={bool(user_msg)}, tool_messages={len(tool_messages) if tool_messages else 0}, "
-              f"assistant_tool_calls={len(assistant_tool_calls) if assistant_tool_calls else 0}, skip={skip_conversation_log}")
-        if tool_messages:
-            print(f"💾 tool详情: {[{'role': m.get('role'), 'tool_call_id': m.get('tool_call_id', '?')} for m in tool_messages]}")
+        print(
+            f"💾 process_memories_background: user_msg={bool(user_msg)}, "
+            f"assistant_tool_calls={len(assistant_tool_calls) if assistant_tool_calls else 0}, "
+            f"skip={skip_conversation_log}"
+        )
 
         progress_ready = False
         should_track_progress = (
@@ -1220,56 +1158,25 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         # 1. 存储对话记录（除非明确跳过）
         if skip_conversation_log:
             print(f"⏭️  跳过对话存储（辅助请求）")
-        elif tool_messages:
-            # 工具结果轮次：存tool消息 + assistant回复（user消息在之前的轮次已存过）
-            for tm in tool_messages:
-                meta_dict = {}
-                if tm.get("tool_call_id"):
-                    meta_dict["tool_call_id"] = tm["tool_call_id"]
-                if tm.get("name"):
-                    meta_dict["name"] = tm["name"]
-                meta = json.dumps(meta_dict) if meta_dict else None
-                await save_message(session_id, "tool", tm.get("content", ""), model, metadata=meta)
-            
-            if assistant_msg or assistant_tool_calls:
-                ast_meta_dict = {}
-                if assistant_tool_calls:
-                    ast_meta_dict["tool_calls"] = assistant_tool_calls
-                if assistant_reasoning:
-                    ast_meta_dict["reasoning_content"] = assistant_reasoning
-                ast_meta = json.dumps(ast_meta_dict) if ast_meta_dict else None
-                await save_message(session_id, "assistant", assistant_msg or "", model, metadata=ast_meta)
-                print(f"🔧 存储: {len(tool_messages)}条tool + 1条assistant" + (" (含tool_calls)" if assistant_tool_calls else "") + (" (含reasoning)" if assistant_reasoning else ""))
-                completed_round = not assistant_tool_calls
         else:
-            # 普通对话或首次工具调用
-            ast_meta_dict = {}
-            if assistant_tool_calls:
-                ast_meta_dict["tool_calls"] = assistant_tool_calls
-            if assistant_reasoning:
-                ast_meta_dict["reasoning_content"] = assistant_reasoning
-            assistant_meta = json.dumps(ast_meta_dict) if ast_meta_dict else None
-            
-            if assistant_tool_calls:
-                # 首次工具调用：assistant回复包含tool_calls，存user + assistant(tool_calls)
-                await save_message(session_id, "user", user_msg, model)
-                await save_message(session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta)
-                print(f"🔧 存储: user + assistant (含{len(assistant_tool_calls)}个tool_calls)" + (" (含reasoning)" if assistant_reasoning else ""))
-            else:
-                # 纯文字对话：re-roll检测 + 存user + assistant
-                last_user = await get_last_user_content(session_id)
-                if last_user and last_user.strip() == user_msg.strip():
-                    updated = await update_last_assistant_message(session_id, assistant_msg, model)
-                    if updated:
-                        print(f"🔄 检测到re-roll，已覆盖最后一条assistant回复")
-                    else:
-                        await save_message(session_id, "user", user_msg, model)
-                        await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
-                        completed_round = True
-                else:
-                    await save_message(session_id, "user", user_msg, model)
-                    await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
-                    completed_round = True
+            if persistence_plan is None:
+                print("⚠️ 缺少持久化方案，本轮不写入对话", flush=True)
+                return
+            persist_result = await persist_conversation_batch(
+                persistence_plan.session_id,
+                list(persistence_plan.messages),
+                model,
+            )
+            completed_round = (
+                persistence_plan.completed_round
+                and persist_result["inserted"] > 0
+                and not persist_result["rerolled"]
+            )
+            print(
+                "💾 持久化方案: "
+                f"写入{persist_result['inserted']}条"
+                + ("，重新生成覆盖" if persist_result["rerolled"] else "")
+            )
 
         if skip_conversation_log:
             return
@@ -1466,10 +1373,17 @@ async def chat_completions(request: Request):
 
 
 async def _chat_completions_inner(request: Request):
+    global PARTITION_SESSION_ID
     body = await request.json()
-    messages = body.get("messages", [])
-    messages, dynamic_environment = _extract_dynamic_environment(messages)
+    classified = classify_request(body.get("messages", []))
+    messages = [dict(message) for message in classified.ordinary_messages]
+    dynamic_environment = classified.dynamic_environment
     body["messages"] = messages
+    if classified.invalid_dynamic_count:
+        print(
+            f"[warning] 忽略 {classified.invalid_dynamic_count} 条无效动态环境快照",
+            flush=True,
+        )
     
     # ---------- 检测是否应跳过对话存储 ----------
     # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。
@@ -1480,40 +1394,56 @@ async def _chat_completions_inner(request: Request):
         print("⏭️  检测到标题生成请求：跳过分区缓存、记忆注入、对话存储和会话 Token 统计")
     
     # ---------- 提取用户最新消息 ----------
-    user_message = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                user_message = content
-            elif isinstance(content, list):
-                user_message = " ".join(
-                    item.get("text", "") for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                )
-            break
-    
-    # ---------- 构建 system prompt ----------
-    # 先保存原始对话消息（不含 system prompt），用于记忆提取
-    original_messages = [msg for msg in messages if msg.get("role") != "system"]
+    user_message = classified.latest_user_text
     
     # ---------- 检测工具调用消息 ----------
     tool_messages = [m for m in messages if m.get("role") == "tool"]
     if tool_messages:
         print(f"🔧 检测到 {len(tool_messages)} 条工具结果消息")
     
-    # ---------- 生成 session ID ----------
-    session_id = str(uuid.uuid4())[:8]
+    # ---------- 解析稳定活动会话（独立于分区开关） ----------
+    session_id = get_active_session_id()
+    if not session_id and not skip_conversation_log and MEMORY_ENABLED:
+        session_id = f"thread-{str(uuid.uuid4())[:8]}"
+        PARTITION_SESSION_ID = session_id
+        await set_gateway_config("partition_session_id", session_id)
+        print(f"🔗 自动创建活跃对话线: {session_id}", flush=True)
+    if not session_id:
+        session_id = str(uuid.uuid4())[:8]
+
+    system_task = asyncio.create_task(get_system_prompt())
+    drives_task = (
+        asyncio.create_task(drives.fetch_context())
+        if drives.is_enabled() and user_message and not skip_conversation_log
+        else None
+    )
+    prepared_drives_text = ""
     
     # ---------- 分区缓存模式 ----------
     if CACHE_PARTITION_ENABLED and not skip_conversation_log:
-        active_sid = get_active_session_id()
-        if active_sid:
-            session_id = active_sid
-        
-        # 从DB读取历史
+        history_task = asyncio.create_task(
+            get_conversation_messages(session_id, limit=10000)
+        )
+        cognitive_task = asyncio.create_task(build_cognitive_text())
+        memory_task = asyncio.create_task(
+            build_memory_text(user_message)
+            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message
+            else asyncio.sleep(0, result="")
+        )
+        gathered = await asyncio.gather(
+            system_task, history_task, cognitive_task, memory_task,
+            *(tuple([drives_task]) if drives_task else tuple()),
+            return_exceptions=True,
+        )
+        effective_system_prompt = gathered[0] if not isinstance(gathered[0], Exception) else ""
+        db_history = gathered[1] if not isinstance(gathered[1], Exception) else []
+        cognitive_text = gathered[2] if not isinstance(gathered[2], Exception) else ""
+        memory_text = gathered[3] if not isinstance(gathered[3], Exception) else ""
+        if drives_task:
+            prepared_drives_text = (
+                gathered[4] if not isinstance(gathered[4], Exception) else ""
+            )
         try:
-            db_history = await get_conversation_messages(session_id, limit=10000)
             db_msgs = []
             for m in (db_history or []):
                 msg = db_row_to_message(m)
@@ -1525,9 +1455,9 @@ async def _chat_completions_inner(request: Request):
         
         # 提取当前客户端消息块。闭合的本地工具链以请求内 tool_call_id 为准，
         # 不要求异步落库已完成；更早的客户端历史仍由 DB 权威历史替代。
-        client_new_msgs, self_contained_tool_chain = _extract_trailing_client_block(messages)
+        client_new_msgs = [dict(message) for message in classified.current_block]
+        self_contained_tool_chain = classified.is_tool_chain
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
-        raw_client_tools = [m for m in messages if m.get("role") == "tool"]
         db_last = db_msgs[-1] if db_msgs else None
         db_expected_ids = {
             tool_call.get("id")
@@ -1550,20 +1480,6 @@ async def _chat_completions_inner(request: Request):
                     "🔧 请求内工具链闭合，保留完整客户端块："
                     f"{len(client_new_msgs)}条消息 / {len(client_tools)}条tool"
                 )
-        elif raw_client_tools:
-            matched_tools = [
-                tool
-                for tool in raw_client_tools
-                if tool.get("tool_call_id") in db_expected_ids
-            ]
-            client_new_msgs = matched_tools
-            if matched_tools:
-                print(f"🔧 DB工具链降级匹配：保留{len(matched_tools)}条tool结果")
-            else:
-                print(
-                    f"🔧 去重: 丢弃{len(raw_client_tools)}条无请求内闭合关系且DB不匹配的tool"
-                )
-
         non_system_count = sum(1 for message in messages if message.get("role") != "system")
         filtered_count = max(0, non_system_count - len(client_new_msgs))
         if filtered_count:
@@ -1575,13 +1491,15 @@ async def _chat_completions_inner(request: Request):
         
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
         
-        effective_system_prompt = await get_system_prompt()
         partition_prompt = effective_system_prompt
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
             partition_prompt = (effective_system_prompt or "") + MEMORY_USAGE_GUIDE
-        partition_prompt, client_system_count, client_system_chars = (
-            _build_partition_system_prompt(partition_prompt, messages)
+        partition_prompt = combine_system_prompt(
+            partition_prompt,
+            classified.client_system_prompts,
         )
+        client_system_count = len(classified.client_system_prompts)
+        client_system_chars = len("\n\n".join(classified.client_system_prompts))
         if client_system_count:
             print(
                 "[client-system] 分区模式已保留"
@@ -1589,30 +1507,38 @@ async def _chat_completions_inner(request: Request):
                 flush=True,
             )
         messages = await build_partitioned_messages(
-            session_id, all_msgs, partition_prompt, user_message
+            session_id, all_msgs, partition_prompt, user_message,
+            cognitive_text, memory_text,
         )
         body["messages"] = messages
     
     else:
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
-        effective_system_prompt = await get_system_prompt()
-        if not skip_conversation_log and (effective_system_prompt or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message)):
+        effective_system_prompt = await system_task
+        if not skip_conversation_log:
             if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
                 enhanced_prompt = await build_system_prompt_with_memories(user_message, effective_system_prompt)
             else:
                 enhanced_prompt = effective_system_prompt
-            
-            if enhanced_prompt:
-                has_system = any(msg.get("role") == "system" for msg in messages)
-                if has_system:
-                    for i, msg in enumerate(messages):
-                        if msg.get("role") == "system":
-                            messages[i]["content"] = enhanced_prompt + "\n\n" + msg["content"]
-                            break
-                else:
-                    messages.insert(0, {"role": "system", "content": enhanced_prompt})
+
+            final_system_prompt = combine_system_prompt(
+                enhanced_prompt,
+                classified.client_system_prompts,
+            )
+            messages = [
+                dict(message)
+                for message in messages
+                if message.get("role") != "system"
+            ]
+            if final_system_prompt:
+                messages.insert(0, {
+                    "role": "system",
+                    "content": final_system_prompt,
+                })
         
         body["messages"] = messages
+        if drives_task:
+            prepared_drives_text = await drives_task
     
     # ---------- 模型处理 ----------
     model = body.get("model", DEFAULT_MODEL)
@@ -1635,11 +1561,9 @@ async def _chat_completions_inner(request: Request):
     _sanitize_content_types(body.get("messages", []))
 
     # ---------- Drivesoid 情感引擎：转发前注入情感状态 ----------
-    if drives.is_enabled() and user_message and not skip_conversation_log:
+    if prepared_drives_text:
         try:
-            drives_text = await drives.fetch_context()
-            if drives_text:
-                drives.inject(body.get("messages", []), drives_text)
+            drives.inject(body.get("messages", []), prepared_drives_text)
         except Exception as e:
             print(f"⚠️  [Drivesoid] 注入失败（不影响转发）: {e}")
 
@@ -1691,7 +1615,10 @@ async def _chat_completions_inner(request: Request):
     
     if is_stream:
         return StreamingResponse(
-            safe_stream_and_capture(headers, body, session_id, user_message, model, original_messages, skip_conversation_log, tool_messages),
+            safe_stream_and_capture(
+                headers, body, session_id, user_message, model,
+                skip_conversation_log, tuple(classified.current_block),
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -1717,11 +1644,18 @@ async def _chat_completions_inner(request: Request):
                     pass
                 
                 if MEMORY_ENABLED and (user_message or tool_messages):
+                    persistence_plan = make_persistence_plan(
+                        session_id,
+                        tuple(classified.current_block),
+                        assistant_msg,
+                        assistant_tool_calls,
+                        assistant_reasoning,
+                        skip_conversation_log,
+                    )
                     asyncio.create_task(
                         process_memories_background(session_id, user_message, assistant_msg, model,
-                                                    context_messages=original_messages, skip_conversation_log=skip_conversation_log,
-                                                    tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                                    assistant_reasoning=assistant_reasoning)
+                                                    assistant_tool_calls=assistant_tool_calls,
+                                                    persistence_plan=persistence_plan)
                     )
 
                 # ---------- Drivesoid 情感引擎：回复后上报事件 ----------
@@ -1803,7 +1737,7 @@ async def safe_stream_and_capture(*args, **kwargs):
         yield _upstream_stream_error_event(exc)
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = ()):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
     full_reasoning = []
@@ -1922,12 +1856,20 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
     
+    tool_messages = [message for message in current_block if message.get("role") == "tool"]
     if MEMORY_ENABLED and (user_message or tool_messages):
+        persistence_plan = make_persistence_plan(
+            session_id,
+            current_block,
+            assistant_msg,
+            assistant_tool_calls,
+            assistant_reasoning,
+            skip_conversation_log,
+        )
         asyncio.create_task(
             process_memories_background(session_id, user_message, assistant_msg, model,
-                                        context_messages=original_messages, skip_conversation_log=skip_conversation_log,
-                                        tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                        assistant_reasoning=assistant_reasoning)
+                                        assistant_tool_calls=assistant_tool_calls,
+                                        persistence_plan=persistence_plan)
         )
 
     # ---------- Drivesoid 情感引擎：流式回复后上报事件 ----------
@@ -2884,6 +2826,7 @@ async def api_delete_conversation(session_id: str):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     try:
+        await _replace_active_session_before_deletion({session_id})
         deleted = await delete_conversation(session_id)
         if not deleted:
             return JSONResponse(status_code=404, content={"error": "对话不存在或已被删除"})
@@ -2902,6 +2845,7 @@ async def api_batch_delete(request: Request):
         if not isinstance(raw_ids, list):
             return JSONResponse(status_code=400, content={"error": "session_ids 必须是数组"})
         ids = list(dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip()))
+        await _replace_active_session_before_deletion(set(ids))
         deleted = await batch_delete_conversations(ids)
         if ids and deleted == 0:
             return JSONResponse(status_code=404, content={"error": "选中的对话不存在或已被删除"})
@@ -3128,11 +3072,9 @@ async def api_rename_thread(request: Request):
 
 @app.delete("/api/partition/thread/{session_id:path}")
 async def api_delete_thread(session_id: str):
-    """删除对话线（不允许删除当前活跃线）"""
+    """删除对话线；删除活跃线前先切换到新对话线。"""
     try:
-        active_sid = get_active_session_id()
-        if session_id == active_sid:
-            return {"error": "不能删除当前活跃的对话线"}
+        await _replace_active_session_before_deletion({session_id})
         await delete_session_cache_state(session_id)
         print(f"🗑️ 删除对话线: {session_id}")
         return {"status": "ok", "session_id": session_id}

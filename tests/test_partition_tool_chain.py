@@ -1,23 +1,5 @@
-import ast
 import unittest
-from pathlib import Path
-
-
-def _load_helper():
-    source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_extract_trailing_client_block"
-    )
-    namespace = {}
-    exec(
-        compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"),
-        namespace,
-    )
-    return namespace["_extract_trailing_client_block"]
+from message_pipeline import extract_current_block
 
 
 def assistant_call(*call_ids):
@@ -35,7 +17,7 @@ def tool_result(call_id):
 class PartitionToolChainTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.extract = staticmethod(_load_helper())
+        cls.extract = staticmethod(extract_current_block)
 
     def test_keeps_trailing_user_messages(self):
         messages = [

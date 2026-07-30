@@ -1,29 +1,21 @@
-import ast
 import unittest
-from pathlib import Path
+from message_pipeline import classify_request, combine_system_prompt
 
 
-def _load_helper():
-    source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_build_partition_system_prompt"
+def build_prompt(base_prompt, messages):
+    classified = classify_request(messages)
+    client_chars = len("\n\n".join(classified.client_system_prompts))
+    return (
+        combine_system_prompt(base_prompt, classified.client_system_prompts),
+        len(classified.client_system_prompts),
+        client_chars,
     )
-    namespace = {}
-    exec(
-        compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"),
-        namespace,
-    )
-    return namespace["_build_partition_system_prompt"]
 
 
 class PartitionClientSystemTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.build_prompt = staticmethod(_load_helper())
+        cls.build_prompt = staticmethod(build_prompt)
 
     def test_appends_all_client_system_prompts_after_gateway_prompt(self):
         messages = [

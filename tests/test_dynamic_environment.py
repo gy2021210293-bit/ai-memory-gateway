@@ -1,6 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
+from message_pipeline import classify_request
 
 
 def _load_helpers():
@@ -8,7 +9,6 @@ def _load_helpers():
     tree = ast.parse(source)
     wanted = {
         "_assemble_current_user_message",
-        "_extract_dynamic_environment",
         "_inject_dynamic_environment",
     }
     functions = [
@@ -20,6 +20,10 @@ def _load_helpers():
     exec(
         compile(ast.Module(body=functions, type_ignores=[]), "main.py", "exec"),
         namespace,
+    )
+    namespace["_extract_dynamic_environment"] = lambda messages: (
+        list(classify_request(messages).ordinary_messages),
+        classify_request(messages).dynamic_environment,
     )
     return namespace
 

@@ -188,9 +188,10 @@ def _load_background_processor(interval=2):
         "MEMORY_EXTRACT_INTERVAL": interval,
         "should_defer_extraction": lambda calls: bool(calls),
         "ensure_memory_extraction_state": AsyncMock(),
-        "save_message": AsyncMock(),
-        "get_last_user_content": AsyncMock(return_value=""),
-        "update_last_assistant_message": AsyncMock(return_value=False),
+        "persist_conversation_batch": AsyncMock(return_value={
+            "inserted": 2,
+            "rerolled": False,
+        }),
         "record_memory_extraction_round": AsyncMock(),
         "get_recent_memories": AsyncMock(return_value=[]),
         "get_messages_for_memory_extraction": AsyncMock(return_value=[]),
@@ -206,6 +207,17 @@ def _load_background_processor(interval=2):
     return namespace, namespace["process_memories_background"]
 
 
+def _persistence_plan(completed_round=True):
+    return type("Plan", (), {
+        "session_id": "thread-a",
+        "messages": (
+            {"role": "user", "content": "user"},
+            {"role": "assistant", "content": "assistant"},
+        ),
+        "completed_round": completed_round,
+    })()
+
+
 class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_interval_persists_one_round_without_extracting(self):
         namespace, process = _load_background_processor(interval=20)
@@ -214,7 +226,10 @@ class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
             "pending_rounds": 1,
         }
 
-        await process("thread-a", "user", "assistant", "model")
+        await process(
+            "thread-a", "user", "assistant", "model",
+            persistence_plan=_persistence_plan(),
+        )
 
         namespace["ensure_memory_extraction_state"].assert_awaited_once_with("thread-a")
         namespace["record_memory_extraction_round"].assert_awaited_once()
@@ -236,7 +251,10 @@ class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
         ]
         namespace["extract_memories"].return_value = []
 
-        await process("thread-a", "user", "assistant", "model")
+        await process(
+            "thread-a", "user", "assistant", "model",
+            persistence_plan=_persistence_plan(),
+        )
 
         namespace["complete_memory_extraction"].assert_awaited_once_with(
             "thread-a", "claim-a", 14, 2,
@@ -257,7 +275,10 @@ class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
         ]
         namespace["extract_memories"].return_value = None
 
-        await process("thread-a", "user", "assistant", "model")
+        await process(
+            "thread-a", "user", "assistant", "model",
+            persistence_plan=_persistence_plan(),
+        )
 
         namespace["release_memory_extraction_claim"].assert_awaited_once_with(
             "thread-a", "claim-a",
@@ -274,6 +295,7 @@ class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
             "",
             "model",
             assistant_tool_calls=tool_calls,
+            persistence_plan=_persistence_plan(completed_round=False),
         )
 
         namespace["ensure_memory_extraction_state"].assert_awaited_once_with("thread-a")
@@ -291,24 +313,25 @@ class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
             "original user message",
             "final answer",
             "model",
-            tool_messages=[{
-                "role": "tool",
-                "tool_call_id": "call-1",
-                "content": "result",
-            }],
+            persistence_plan=_persistence_plan(),
         )
 
         namespace["record_memory_extraction_round"].assert_awaited_once()
-        self.assertEqual(namespace["save_message"].await_count, 2)
+        namespace["persist_conversation_batch"].assert_awaited_once()
 
     async def test_reroll_does_not_increment_round(self):
         namespace, process = _load_background_processor(interval=20)
-        namespace["get_last_user_content"].return_value = "same prompt"
-        namespace["update_last_assistant_message"].return_value = True
+        namespace["persist_conversation_batch"].return_value = {
+            "inserted": 0,
+            "rerolled": True,
+        }
 
-        await process("thread-a", "same prompt", "replacement answer", "model")
+        await process(
+            "thread-a", "same prompt", "replacement answer", "model",
+            persistence_plan=_persistence_plan(),
+        )
 
-        namespace["update_last_assistant_message"].assert_awaited_once()
+        namespace["persist_conversation_batch"].assert_awaited_once()
         namespace["record_memory_extraction_round"].assert_not_awaited()
 
 

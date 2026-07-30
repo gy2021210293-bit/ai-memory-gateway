@@ -585,6 +585,101 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
         )
 
 
+def _conversation_message_parts(message: dict):
+    role = message.get("role", "")
+    content = message.get("content")
+    metadata = {}
+    for key in ("tool_calls", "reasoning_content", "tool_call_id", "name"):
+        if message.get(key) is not None:
+            metadata[key] = message[key]
+    metadata_text = json.dumps(metadata, ensure_ascii=False, sort_keys=True) if metadata else None
+    return role, content, metadata_text
+
+
+def _conversation_signature(role, content, metadata_text):
+    metadata = {}
+    if metadata_text:
+        try:
+            metadata = json.loads(metadata_text)
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+    tool_ids = tuple(
+        call.get("id") for call in metadata.get("tool_calls", []) if call.get("id")
+    )
+    return (
+        role,
+        content or "",
+        tool_ids,
+        metadata.get("tool_call_id", ""),
+        metadata.get("name", ""),
+    )
+
+
+async def persist_conversation_batch(session_id: str, messages: list, model: str = "") -> dict:
+    """Persist one logical client/assistant batch atomically and idempotently."""
+    if not messages:
+        return {"inserted": 0, "rerolled": False}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            rows = await conn.fetch("""
+                SELECT role, content, metadata
+                FROM conversations
+                WHERE session_id = $1
+                ORDER BY id DESC
+                LIMIT 200
+            """, session_id)
+            existing = list(reversed(rows))
+            incoming_parts = [_conversation_message_parts(message) for message in messages]
+            incoming_signatures = [
+                _conversation_signature(*parts) for parts in incoming_parts
+            ]
+            existing_signatures = [
+                _conversation_signature(row["role"], row["content"], row["metadata"])
+                for row in existing
+            ]
+
+            if (
+                len(incoming_signatures) == 2
+                and incoming_signatures[0][0] == "user"
+                and incoming_signatures[1][0] == "assistant"
+                and len(existing_signatures) >= 2
+                and existing_signatures[-2][0] == "user"
+                and existing_signatures[-2][1] == incoming_signatures[0][1]
+                and existing_signatures[-1][0] == "assistant"
+                and not incoming_signatures[1][2]
+            ):
+                parts = incoming_parts[1]
+                await conn.execute("""
+                    UPDATE conversations
+                    SET content = $1, model = $2, metadata = $3
+                    WHERE id = (
+                        SELECT id FROM conversations
+                        WHERE session_id = $4 AND role = 'assistant'
+                        ORDER BY id DESC LIMIT 1
+                    )
+                """, parts[1], model, parts[2], session_id)
+                return {"inserted": 0, "rerolled": True}
+
+            overlap = 0
+            maximum = min(len(existing_signatures), len(incoming_signatures))
+            for size in range(maximum, 0, -1):
+                if existing_signatures[-size:] == incoming_signatures[:size]:
+                    overlap = size
+                    break
+
+            for role, content, metadata_text in incoming_parts[overlap:]:
+                await conn.execute("""
+                    INSERT INTO conversations (session_id, role, content, model, metadata)
+                    VALUES ($1, $2, $3, $4, $5)
+                """, session_id, role, content, model, metadata_text)
+            return {
+                "inserted": len(incoming_parts) - overlap,
+                "rerolled": False,
+            }
+
+
 async def get_last_user_content(session_id: str) -> str:
     """获取指定session最后一条user消息的content"""
     pool = await get_pool()
