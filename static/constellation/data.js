@@ -65,7 +65,9 @@ export async function loadUniverse() {
     const events = memories.filter(m => Number(m.layer) === 2);
     const cores = memories.filter(m => Number(m.layer) === 3);
     const entityGroups = new Map();
-    memories.forEach(memory => (memory.entities || []).forEach(entity => {
+    memories.forEach(memory => (memory.entities || [])
+        .filter(entity => entity.retrieval_status === 'active')
+        .forEach(entity => {
         const key = Number(entity.id);
         if (!entityGroups.has(key)) entityGroups.set(key, { entity, memories: [] });
         entityGroups.get(key).memories.push(memory);
@@ -73,7 +75,9 @@ export async function loadUniverse() {
     const cons = [...entityGroups.values()].map(({ entity, memories: linked }) =>
         makeConstellation(`n${entity.id}`, entity.name, galaxyForType(entity.type), linked));
 
-    const unlinked = memories.filter(memory => !(memory.entities || []).length && Number(memory.layer) < 3);
+    const unlinked = memories.filter(memory =>
+        !(memory.entities || []).some(entity => entity.retrieval_status === 'active')
+        && Number(memory.layer) < 3);
     if (unlinked.length) cons.push(makeConstellation('unlinked', 'Unlinked memories', 'Life', unlinked));
 
     universe.constellations = cons;

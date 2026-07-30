@@ -68,7 +68,8 @@ async function loadEntities() {
         if (!response.ok || data.error) throw new Error(data.error || '加载失败');
         allEntities = data.entities || [];
         renderEntities();
-        status.textContent = `${allEntities.length} 个实体`;
+        const activeCount = allEntities.filter(entity => entity.retrieval_status === 'active').length;
+        status.textContent = `${allEntities.length} 个实体 · ${activeCount} 个活跃 · ${allEntities.length - activeCount} 个候选`;
     } catch (error) {
         status.textContent = error.message;
     }
@@ -90,16 +91,32 @@ function renderEntities() {
         list.textContent = '还没有实体。新对话会自动提取，也可以回填已有记忆。';
         return;
     }
-    allEntities.forEach(entity => {
-        const row = document.createElement('button');
-        row.type = 'button';
-        row.className = 'memory-item';
-        row.style.cssText = 'width:100%;text-align:left;margin-bottom:8px;cursor:pointer';
-        const aliases = entity.aliases?.length ? ` · 别名：${entity.aliases.join('、')}` : '';
-        row.textContent = `${entity.name} · ${entity.entity_type} · ${entity.memory_count} 条记忆${aliases}`;
-        row.onclick = () => loadEntityMemories(entity);
-        list.appendChild(row);
-    });
+    const renderGroup = (title, entities, collapsed = false) => {
+        const container = collapsed ? document.createElement('details') : document.createElement('section');
+        if (collapsed) {
+            const summary = document.createElement('summary');
+            summary.textContent = `${title}（${entities.length}）`;
+            summary.style.cursor = 'pointer';
+            container.appendChild(summary);
+        } else {
+            const heading = document.createElement('h4');
+            heading.textContent = `${title}（${entities.length}）`;
+            container.appendChild(heading);
+        }
+        entities.forEach(entity => {
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'memory-item';
+            row.style.cssText = 'width:100%;text-align:left;margin-bottom:8px;cursor:pointer';
+            const aliases = entity.aliases?.length ? ` · 别名：${entity.aliases.join('、')}` : '';
+            row.textContent = `${entity.name} · ${entity.entity_type} · 累计证据 ${entity.evidence_count || 0} · 当前记忆 ${entity.memory_count}${aliases}`;
+            row.onclick = () => loadEntityMemories(entity);
+            container.appendChild(row);
+        });
+        list.appendChild(container);
+    };
+    renderGroup('活跃实体', allEntities.filter(entity => entity.retrieval_status === 'active'));
+    renderGroup('候选实体', allEntities.filter(entity => entity.retrieval_status !== 'active'), true);
 }
 
 async function loadEntityMemories(entity) {
@@ -116,6 +133,11 @@ async function loadEntityMemories(entity) {
         document.getElementById('entity-name-edit').value = selectedEntity.name || '';
         document.getElementById('entity-type-edit').value = selectedEntity.entity_type || 'other';
         document.getElementById('entity-aliases-edit').value = (selectedEntity.aliases || []).join('\n');
+        const sourceLabels = { manual: '人工设置', profile: '已确认概况', evidence: '累计证据', candidate: '证据不足' };
+        document.getElementById('entity-lifecycle-summary').textContent =
+            `${selectedEntity.retrieval_status === 'active' ? '活跃实体' : '候选实体'} · ` +
+            `累计原始证据 ${selectedEntity.evidence_count || 0} 条 · 当前关联记忆 ${(data.memories || []).length} 条 · ` +
+            `判定来源：${sourceLabels[selectedEntity.status_source] || selectedEntity.status_source || '自动'}`;
         document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
         const list = document.getElementById('entity-memory-list');
         list.replaceChildren();
@@ -131,6 +153,36 @@ async function loadEntityMemories(entity) {
     } catch (error) {
         status.textContent = `实体详情加载失败：${error.message}`;
         return null;
+    }
+}
+
+async function setEntityRetrievalStatus(statusValue) {
+    if (!selectedEntity) return;
+    const status = document.getElementById('entity-status');
+    const buttons = document.querySelectorAll('[data-entity-status]');
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/status`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: statusValue }),
+        });
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (_) {
+            throw new Error(`状态接口返回 HTTP ${response.status}：${responseText.slice(0, 160) || '空响应'}`);
+        }
+        if (!response.ok || data.error || !data.entity) throw new Error(data.error || `HTTP ${response.status}`);
+        selectedEntity = data.entity;
+        await loadEntities();
+        const reloaded = await loadEntityMemories(data.entity);
+        status.textContent = reloaded ? '实体召回状态已保存。' : '状态已保存，但实体详情重新加载失败。';
+    } catch (error) {
+        status.textContent = `实体状态保存失败：${error.message}`;
+    } finally {
+        buttons.forEach(button => { button.disabled = false; });
     }
 }
 

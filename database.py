@@ -44,6 +44,7 @@ MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 MEMORY_HW_ENTITY = float(os.getenv("MEMORY_HW_ENTITY", "0.25"))
+ENTITY_ACTIVE_EVIDENCE_THRESHOLD = 3
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
     for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
@@ -457,6 +458,32 @@ async def init_tables():
                 END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'entities' AND column_name = 'profile_model') THEN
                     ALTER TABLE entities ADD COLUMN profile_model TEXT DEFAULT NULL;
+                END IF;
+            END $$;
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entities' AND column_name = 'evidence_count'
+                ) THEN
+                    ALTER TABLE entities ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 0;
+                    UPDATE entities AS e
+                    SET evidence_count = counts.total
+                    FROM (
+                        SELECT entity_id, COUNT(DISTINCT memory_id)::INTEGER AS total
+                        FROM memory_entities
+                        WHERE source <> 'inherited'
+                        GROUP BY entity_id
+                    ) AS counts
+                    WHERE e.id = counts.entity_id;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entities' AND column_name = 'status_override'
+                ) THEN
+                    ALTER TABLE entities ADD COLUMN status_override TEXT DEFAULT NULL
+                        CHECK (status_override IN ('active', 'candidate'));
                 END IF;
             END $$;
         """)
@@ -1091,6 +1118,26 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
         return row["id"] if row else None
 
 
+def _entity_name_matches_query(name: str, normalized_query: str, terms: list) -> tuple[bool, bool]:
+    """Return exact-term and full-phrase matches while rejecting short or partial Latin names."""
+    value = normalize_entity_name(name)
+    compact = value.replace(" ", "")
+    if not compact:
+        return False, False
+    has_non_ascii = any(ord(char) > 127 for char in value)
+    if len(compact) < (2 if has_non_ascii else 3):
+        return False, False
+    exact = value in terms
+    if has_non_ascii:
+        phrase = value in normalized_query
+    else:
+        phrase = bool(re.search(
+            rf"(?<![a-z0-9_]){re.escape(value)}(?![a-z0-9_])",
+            normalized_query,
+        ))
+    return exact, phrase
+
+
 async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limit: int):
     """Return memories reached through an entity name or alias match."""
     normalized_query = normalize_entity_name(query)
@@ -1100,37 +1147,92 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
     if not terms:
         return {}
     rows = await conn.fetch("""
-        SELECT m.id, m.content, m.importance, m.created_at, m.layer, m.title,
-               e.id AS entity_id, e.name AS entity_name, e.normalized_name,
-               e.entity_type, e.description, e.profile_json,
-               COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
-               COALESCE(array_agg(DISTINCT ea.normalized_alias) FILTER (WHERE ea.normalized_alias IS NOT NULL), ARRAY[]::text[]) AS normalized_aliases
-        FROM entities e
-        LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
-        JOIN memory_entities me ON me.entity_id = e.id
-        JOIN memories m ON m.id = me.memory_id
-        WHERE m.is_active = TRUE AND EXISTS (
-            SELECT 1 FROM unnest($1::text[]) AS term
-            WHERE e.normalized_name LIKE '%' || term || '%'
-               OR term LIKE '%' || e.normalized_name || '%'
-               OR ea.normalized_alias LIKE '%' || term || '%'
-               OR term LIKE '%' || ea.normalized_alias || '%'
+        WITH matched AS (
+            SELECT m.id, m.content, m.importance, m.created_at, m.layer, m.title,
+                   e.id AS entity_id, e.name AS entity_name, e.normalized_name,
+                   e.entity_type, e.description, e.profile_json,
+                   e.evidence_count, e.status_override, me.confidence,
+                   COALESCE(array_agg(DISTINCT ea.alias)
+                       FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
+                   COALESCE(array_agg(DISTINCT ea.normalized_alias)
+                       FILTER (WHERE ea.normalized_alias IS NOT NULL), ARRAY[]::text[]) AS normalized_aliases,
+                   CASE
+                       WHEN e.normalized_name = ANY($1::text[])
+                         OR BOOL_OR(ea.normalized_alias = ANY($1::text[])) THEN 1.0
+                       ELSE 0.9
+                   END AS match_quality
+            FROM entities e
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            JOIN memory_entities me ON me.entity_id = e.id
+            JOIN memories m ON m.id = me.memory_id
+            WHERE m.is_active = TRUE
+              AND (
+                  e.status_override = 'active'
+                  OR (
+                      e.status_override IS NULL
+                      AND (e.profile_json IS NOT NULL OR e.evidence_count >= $3)
+                  )
+              )
+              AND (
+                  (
+                      (
+                          (octet_length(e.normalized_name) > char_length(e.normalized_name)
+                              AND char_length(replace(e.normalized_name, ' ', '')) >= 2)
+                          OR
+                          (octet_length(e.normalized_name) = char_length(e.normalized_name)
+                              AND char_length(replace(e.normalized_name, ' ', '')) >= 3)
+                      )
+                      AND (
+                          e.normalized_name = ANY($1::text[])
+                          OR position(e.normalized_name IN $2) > 0
+                      )
+                  )
+                  OR (
+                      (
+                          (octet_length(ea.normalized_alias) > char_length(ea.normalized_alias)
+                              AND char_length(replace(ea.normalized_alias, ' ', '')) >= 2)
+                          OR
+                          (octet_length(ea.normalized_alias) = char_length(ea.normalized_alias)
+                              AND char_length(replace(ea.normalized_alias, ' ', '')) >= 3)
+                      )
+                      AND (
+                          ea.normalized_alias = ANY($1::text[])
+                          OR position(ea.normalized_alias IN $2) > 0
+                      )
+                  )
+              )
+            GROUP BY m.id, e.id, me.confidence
+        ),
+        ranked AS (
+            SELECT matched.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY entity_id
+                       ORDER BY layer DESC, importance DESC, created_at DESC
+                   ) AS entity_rank
+            FROM matched
         )
-        GROUP BY m.id, e.id
-        ORDER BY m.importance DESC, m.created_at DESC
-        LIMIT $2
-    """, terms, max(limit * 10, 30))
+        SELECT * FROM ranked
+        WHERE entity_rank <= 3
+        ORDER BY importance DESC, created_at DESC
+        LIMIT $4
+    """, terms, normalized_query, ENTITY_ACTIVE_EVIDENCE_THRESHOLD, max(limit * 10, 30))
     candidates = {}
     for row in rows:
         names = [row["normalized_name"], *(row["normalized_aliases"] or [])]
-        exact = any(name in terms for name in names)
-        phrase = any(name and name in normalized_query for name in names)
-        entity_score = 1.0 if exact else 0.9 if phrase else 0.7
-        entity = {
+        matches = [_entity_name_matches_query(name, normalized_query, terms) for name in names]
+        exact = any(match[0] for match in matches)
+        phrase = any(match[1] for match in matches)
+        if not exact and not phrase:
+            continue
+        match_quality = float(row.get("match_quality") or (1.0 if exact else 0.9 if phrase else 0.0))
+        entity_score = match_quality * max(0.0, min(1.0, float(row.get("confidence", 1.0) or 0.0)))
+        entity = attach_entity_lifecycle({
             "id": row["entity_id"], "name": row["entity_name"], "type": row["entity_type"],
             "description": row["description"] or "", "aliases": list(row["aliases"] or []),
-            "profile": row["profile_json"],
-        }
+            "profile": row["profile_json"], "profile_json": row["profile_json"],
+            "evidence_count": row.get("evidence_count", 0),
+            "status_override": row.get("status_override"),
+        })
         item = candidates.setdefault(row["id"], {
             "content": row["content"], "importance": row["importance"],
             "created_at": row["created_at"], "layer": row["layer"] or 1, "title": row["title"],
@@ -1149,6 +1251,7 @@ async def _attach_entity_context(conn, results: list):
     ids = [int(result["id"]) for result in results]
     rows = await conn.fetch("""
         SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description, e.profile_json,
+               e.evidence_count, e.status_override,
                COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
         FROM memory_entities me
         JOIN entities e ON e.id = me.entity_id
@@ -1159,12 +1262,15 @@ async def _attach_entity_context(conn, results: list):
     """, ids)
     by_memory = {}
     for row in rows:
-        by_memory.setdefault(row["memory_id"], []).append({
+        by_memory.setdefault(row["memory_id"], []).append(attach_entity_lifecycle({
             "id": row["id"], "name": row["name"], "type": row["entity_type"],
             "description": row["description"] or "", "aliases": list(row["aliases"] or []),
             "profile": row["profile_json"],
+            "profile_json": row["profile_json"],
+            "evidence_count": row["evidence_count"],
+            "status_override": row["status_override"],
             "confidence": row["confidence"],
-        })
+        }))
     for result in results:
         result["entities"] = by_memory.get(result["id"], [])
         result.setdefault("matched_entities", [])
@@ -1274,9 +1380,11 @@ async def search_memories(query: str, limit: int = 10):
         await _attach_entity_context(conn, results)
         
         if results:
-            print(f"🔍 搜索 '{query}' → 关键词 {keywords[:8]}{'...' if len(keywords)>8 else ''} → 命中 {len(results)} 条" + (f"（过滤 {filtered} 条低分）" if filtered else ""))
+            entity_hits = sum(1 for row in results if row.get("entity_score", 0) > 0)
+            print(f"🔍 记忆搜索命中 {len(results)} 条（实体召回 {entity_hits} 条）"
+                  + (f"（过滤 {filtered} 条低分）" if filtered else ""))
             for r in results[:3]:
-                print(f"   📌 [score={r['score']:.3f}] (hits={r['hit_count']}, imp={r['importance']}) {r['content'][:60]}...")
+                print(f"   📌 [score={r['score']:.3f}] (hits={r['hit_count']}, imp={r['importance']})")
             
             ids = [r["id"] for r in results]
             await conn.execute(
@@ -1284,7 +1392,7 @@ async def search_memories(query: str, limit: int = 10):
                 ids,
             )
         else:
-            print(f"🔍 搜索 '{query}' → 关键词 {keywords[:8]} → 无结果" + (f"（{filtered} 条被分数阈值过滤）" if filtered else ""))
+            print("🔍 记忆搜索无结果" + (f"（{filtered} 条被分数阈值过滤）" if filtered else ""))
         
         return results
 
@@ -1476,10 +1584,11 @@ async def search_memories_hybrid(query: str, limit: int = 10):
         
         if results:
             mode_tag = "混合" if query_embedding else "关键词"
-            kw_tag = f"关键词 {keywords[:6]}" if keywords else "无关键词"
-            print(f"🔍 {mode_tag}搜索 '{query}' → {kw_tag} → 命中 {len(results)} 条" + (f"（过滤 {filtered} 条低分）" if filtered else ""))
+            entity_hits = sum(1 for row in results if row.get("entity_score", 0) > 0)
+            print(f"🔍 {mode_tag}搜索命中 {len(results)} 条（实体召回 {entity_hits} 条）"
+                  + (f"（过滤 {filtered} 条低分）" if filtered else ""))
             for r in results[:3]:
-                print(f"   📌 [score={r['score']:.3f}] (kw={r['hit_count']}, sim={r['similarity']:.2f}, entity={r['entity_score']:.2f}, imp={r['importance']}) {r['content'][:60]}...")
+                print(f"   📌 [score={r['score']:.3f}] (kw={r['hit_count']}, sim={r['similarity']:.2f}, entity={r['entity_score']:.2f}, imp={r['importance']})")
             
             ids = [r["id"] for r in results]
             await conn.execute(
@@ -1487,7 +1596,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 ids,
             )
         else:
-            print(f"🔍 混合搜索 '{query}' → 无结果" + (f"（{filtered} 条被过滤）" if filtered else ""))
+            print("🔍 混合搜索无结果" + (f"（{filtered} 条被过滤）" if filtered else ""))
         
         return [dict(r) for r in results]
 
@@ -1649,19 +1758,47 @@ async def update_memory(memory_id: int, content: str = None, importance: int = N
 
 
 async def delete_memory(memory_id: int):
-    """删除单条记忆"""
+    """删除单条记忆，并撤销仍可追踪的原始实体证据。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
+        async with conn.transaction():
+            rows = await conn.fetch("""
+                SELECT entity_id, COUNT(*)::INTEGER AS removed
+                FROM memory_entities
+                WHERE memory_id = $1 AND source <> 'inherited'
+                GROUP BY entity_id
+            """, memory_id)
+            for row in rows:
+                await conn.execute("""
+                    UPDATE entities
+                    SET evidence_count = GREATEST(0, evidence_count - $2), updated_at = NOW()
+                    WHERE id = $1
+                """, row["entity_id"], row["removed"])
+            await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
 
 
 async def delete_memories_batch(memory_ids: list):
-    """批量删除记忆"""
+    """批量删除记忆，并撤销仍可追踪的原始实体证据。"""
+    if not memory_ids:
+        return
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM memories WHERE id = ANY($1::int[])", memory_ids
-        )
+        async with conn.transaction():
+            rows = await conn.fetch("""
+                SELECT entity_id, COUNT(DISTINCT memory_id)::INTEGER AS removed
+                FROM memory_entities
+                WHERE memory_id = ANY($1::int[]) AND source <> 'inherited'
+                GROUP BY entity_id
+            """, memory_ids)
+            for row in rows:
+                await conn.execute("""
+                    UPDATE entities
+                    SET evidence_count = GREATEST(0, evidence_count - $2), updated_at = NOW()
+                    WHERE id = $1
+                """, row["entity_id"], row["removed"])
+            await conn.execute(
+                "DELETE FROM memories WHERE id = ANY($1::int[])", memory_ids
+            )
 
 
 # ============================================================
@@ -2580,6 +2717,25 @@ def normalize_entity_name(name: str) -> str:
 ENTITY_TYPES = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}
 
 
+def attach_entity_lifecycle(entity: dict) -> dict:
+    """Attach the effective retrieval status to one entity row."""
+    value = dict(entity)
+    evidence_count = max(0, int(value.get("evidence_count") or 0))
+    override = value.get("status_override")
+    if override in {"active", "candidate"}:
+        status, source = override, "manual"
+    elif value.get("profile_json"):
+        status, source = "active", "profile"
+    elif evidence_count >= ENTITY_ACTIVE_EVIDENCE_THRESHOLD:
+        status, source = "active", "evidence"
+    else:
+        status, source = "candidate", "candidate"
+    value["evidence_count"] = evidence_count
+    value["retrieval_status"] = status
+    value["status_source"] = source
+    return value
+
+
 def normalize_entity_update(data: dict) -> dict:
     """Validate editable entity fields and deduplicate aliases by lookup key."""
     name = str(data.get("name", "")).strip()
@@ -2655,13 +2811,27 @@ async def link_memory_entities(memory_id: int, entities: list, source: str = "ex
                         updated_at = NOW()
                     RETURNING id
                 """, name, normalized, entity_type)
+                existing_source = await conn.fetchval("""
+                    SELECT source FROM memory_entities
+                    WHERE memory_id = $1 AND entity_id = $2
+                """, memory_id, row["id"])
                 await conn.execute("""
                     INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (memory_id, entity_id) DO UPDATE SET
                         confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence),
-                        source = EXCLUDED.source
+                        source = CASE
+                            WHEN memory_entities.source = 'inherited' THEN EXCLUDED.source
+                            WHEN EXCLUDED.source = 'inherited' THEN memory_entities.source
+                            ELSE EXCLUDED.source
+                        END
                 """, memory_id, row["id"], confidence, source)
+                if source != "inherited" and existing_source in {None, "inherited"}:
+                    await conn.execute("""
+                        UPDATE entities
+                        SET evidence_count = evidence_count + 1, updated_at = NOW()
+                        WHERE id = $1
+                    """, row["id"])
                 linked += 1
     return linked
 
@@ -2672,7 +2842,8 @@ async def get_entities_for_memory_ids(memory_ids: list) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT me.memory_id, e.id, e.name, e.entity_type, me.confidence
+            SELECT me.memory_id, e.id, e.name, e.entity_type, e.profile_json,
+                   e.evidence_count, e.status_override, me.confidence
             FROM memory_entities me
             JOIN entities e ON e.id = me.entity_id
             WHERE me.memory_id = ANY($1::int[])
@@ -2680,10 +2851,13 @@ async def get_entities_for_memory_ids(memory_ids: list) -> dict:
         """, [int(memory_id) for memory_id in memory_ids])
     result = {}
     for row in rows:
-        result.setdefault(row["memory_id"], []).append({
+        result.setdefault(row["memory_id"], []).append(attach_entity_lifecycle({
             "id": row["id"], "name": row["name"], "type": row["entity_type"],
+            "profile_json": row["profile_json"],
+            "evidence_count": row["evidence_count"],
+            "status_override": row["status_override"],
             "confidence": row["confidence"],
-        })
+        }))
     return result
 
 
@@ -2693,7 +2867,7 @@ async def list_entities():
         rows = await conn.fetch("""
             SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
-                   e.created_at, e.updated_at,
+                   e.evidence_count, e.status_override, e.created_at, e.updated_at,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e
@@ -2702,7 +2876,14 @@ async def list_entities():
             GROUP BY e.id
             ORDER BY memory_count DESC, e.name
         """)
-        return [dict(row) for row in rows]
+        entities = [attach_entity_lifecycle(row) for row in rows]
+        entities.sort(key=lambda item: (
+            item["retrieval_status"] != "active",
+            -int(item.get("evidence_count") or 0),
+            -int(item.get("memory_count") or 0),
+            item["name"].casefold(),
+        ))
+        return entities
 
 
 async def get_entity_detail(entity_id: int):
@@ -2711,13 +2892,31 @@ async def get_entity_detail(entity_id: int):
         row = await conn.fetchrow("""
             SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
+                   e.evidence_count, e.status_override,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e
             LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
             WHERE e.id = $1
             GROUP BY e.id
         """, entity_id)
-        return dict(row) if row else None
+        return attach_entity_lifecycle(row) if row else None
+
+
+async def set_entity_status(entity_id: int, status: str):
+    """Set or clear the manual retrieval-status override."""
+    normalized = str(status or "").strip().lower()
+    if normalized not in {"active", "candidate", "auto"}:
+        return {"error": "status 必须是 active、candidate 或 auto"}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE entities
+            SET status_override = $2, updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, None if normalized == "auto" else normalized)
+    if result == "UPDATE 0":
+        return {"error": "实体不存在"}
+    return {"status": "ok", "entity": await get_entity_detail(entity_id)}
 
 
 async def update_entity(entity_id: int, data: dict):
@@ -2860,16 +3059,47 @@ async def merge_entities(source_id: int, target_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            source = await conn.fetchrow("SELECT id, name, normalized_name FROM entities WHERE id = $1", source_id)
-            target = await conn.fetchrow("SELECT id FROM entities WHERE id = $1", target_id)
+            source = await conn.fetchrow(
+                "SELECT id, name, normalized_name, evidence_count FROM entities WHERE id = $1",
+                source_id,
+            )
+            target = await conn.fetchrow(
+                "SELECT id, evidence_count FROM entities WHERE id = $1",
+                target_id,
+            )
             if not source or not target:
                 return {"error": "实体不存在"}
+            overlap = await conn.fetchval("""
+                SELECT COUNT(DISTINCT source_link.memory_id)
+                FROM memory_entities AS source_link
+                JOIN memory_entities AS target_link
+                  ON target_link.memory_id = source_link.memory_id
+                 AND target_link.entity_id = $2
+                 AND target_link.source <> 'inherited'
+                WHERE source_link.entity_id = $1
+                  AND source_link.source <> 'inherited'
+            """, source_id, target_id)
+            merged_evidence_count = max(
+                0,
+                int(source["evidence_count"] or 0)
+                + int(target["evidence_count"] or 0)
+                - int(overlap or 0),
+            )
             await conn.execute("""
                 INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
                 SELECT memory_id, $2, confidence, source FROM memory_entities WHERE entity_id = $1
                 ON CONFLICT (memory_id, entity_id) DO UPDATE SET
-                    confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence)
+                    confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence),
+                    source = CASE
+                        WHEN memory_entities.source = 'inherited' THEN EXCLUDED.source
+                        ELSE memory_entities.source
+                    END
             """, source_id, target_id)
+            await conn.execute("""
+                UPDATE entities
+                SET evidence_count = $2, updated_at = NOW()
+                WHERE id = $1
+            """, target_id, merged_evidence_count)
             await conn.execute("""
                 INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
                 SELECT $2, alias, normalized_alias FROM entity_aliases WHERE entity_id = $1

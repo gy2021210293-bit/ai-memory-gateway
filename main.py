@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity
+from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -385,7 +385,8 @@ def _format_matched_entity_overview(memories: list) -> str:
     entities = {}
     for memory in memories:
         for entity in memory.get("matched_entities", []):
-            entities[entity["id"]] = entity
+            if entity.get("retrieval_status") == "active":
+                entities[entity["id"]] = entity
     lines = []
     for entity in entities.values():
         aliases = f"，别名：{'、'.join(entity.get('aliases', []))}" if entity.get("aliases") else ""
@@ -426,7 +427,13 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
             return base_system_prompt
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
-        entity_map = {mem["id"]: mem.get("entities", []) for mem in memories}
+        entity_map = {
+            mem["id"]: [
+                entity for entity in mem.get("entities", [])
+                if entity.get("retrieval_status") == "active"
+            ]
+            for mem in memories
+        }
         memory_lines = []
         for mem in memories:
             date_str = ""
@@ -1068,7 +1075,13 @@ async def build_memory_text(user_message: str) -> str:
         if not memories:
             return ""
         
-        entity_map = {mem["id"]: mem.get("entities", []) for mem in memories}
+        entity_map = {
+            mem["id"]: [
+                entity for entity in mem.get("entities", [])
+                if entity.get("retrieval_status") == "active"
+            ]
+            for mem in memories
+        }
         memory_lines = []
         for mem in memories:
             date_str = ""
@@ -2130,6 +2143,17 @@ async def api_update_entity(entity_id: int, request: Request):
     result = await update_entity(entity_id, await request.json())
     if result.get("error"):
         status_code = 404 if result["error"] == "实体不存在" else 409 if "冲突" in result["error"] or "已存在" in result["error"] or "已是实体" in result["error"] or "已属于实体" in result["error"] else 400
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.put("/api/entities/{entity_id}/status")
+async def api_set_entity_status(entity_id: int, request: Request):
+    """Set or clear the manual entity retrieval-status override."""
+    data = await request.json()
+    result = await set_entity_status(entity_id, data.get("status"))
+    if result.get("error"):
+        status_code = 404 if result["error"] == "实体不存在" else 400
         return JSONResponse(status_code=status_code, content=result)
     return result
 

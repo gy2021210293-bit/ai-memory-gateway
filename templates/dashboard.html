@@ -460,7 +460,7 @@
             <section id="section-entities" class="section">
                 <div class="section-header">
                     <h1>实体管理</h1>
-                    <p class="section-desc">查看记忆中的人物、地点、项目与事件，并合并重复实体。</p>
+                    <p class="section-desc">查看记忆中的人物、地点、项目与事件。累计原始证据达到 3 条后自动参与实体召回；归档碎片清理不会抹去累计证据。</p>
                 </div>
                 <div class="card toolbar-card">
                     <div class="toolbar">
@@ -501,6 +501,15 @@
                     <div class="form-group">
                         <label for="entity-aliases-edit">别名（每行一个）</label>
                         <textarea id="entity-aliases-edit" class="textarea" rows="3" placeholder="每行输入一个别名"></textarea>
+                    </div>
+                    <div class="card" style="margin:12px 0;padding:12px">
+                        <div id="entity-lifecycle-summary" class="section-desc"></div>
+                        <div class="toolbar" style="margin-top:10px">
+                            <button class="btn btn-primary" data-entity-status onclick="setEntityRetrievalStatus('active')">人工设为活跃</button>
+                            <button class="btn btn-secondary" data-entity-status onclick="setEntityRetrievalStatus('candidate')">人工设为候选</button>
+                            <button class="btn btn-secondary" data-entity-status onclick="setEntityRetrievalStatus('auto')">恢复自动判定</button>
+                        </div>
+                        <p class="section-desc" style="margin:8px 0 0">累计原始证据可能高于当前关联记忆数，因为30天归档清理会删除旧碎片，但不会否定历史出现。</p>
                     </div>
                     <div class="toolbar">
                         <button class="btn btn-primary" id="entity-save" onclick="saveEntityEdits()">保存名称/类型/别名</button>
@@ -791,6 +800,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.7"></script>
+    <script src="/static/js/dashboard.js?v=4.8"></script>
 </body>
 </html>

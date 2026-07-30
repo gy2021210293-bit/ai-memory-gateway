@@ -172,6 +172,11 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["matched_entities"][0]["name"] == "Alice" for item in candidates.values()))
         terms = conn.calls[0][1][0]
         self.assertIn("小艾", terms)
+        sql = conn.calls[0][0]
+        self.assertIn("e.status_override = 'active'", sql)
+        self.assertIn("e.evidence_count >= $3", sql)
+        self.assertNotIn("term LIKE", sql)
+        self.assertIn("entity_rank <= 3", sql)
 
     def test_profile_normalization_rejects_unknown_evidence(self):
         profile = memory_extractor.normalize_entity_profile({
