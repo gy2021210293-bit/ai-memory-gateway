@@ -542,6 +542,34 @@ def _message_text(message: dict) -> str:
     return ""
 
 
+def _build_partition_system_prompt(base_prompt: str, messages: list) -> tuple[str, int, int]:
+    """Append client system text to the gateway-owned partition prompt."""
+    client_prompts = []
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            if content:
+                client_prompts.append(content)
+        elif isinstance(content, list):
+            text = "\n".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and block.get("text")
+            )
+            if text:
+                client_prompts.append(text)
+
+    client_text = "\n\n".join(client_prompts)
+    combined = "\n\n".join(
+        part for part in (base_prompt or "", client_text) if part
+    )
+    return combined, len(client_prompts), len(client_text)
+
+
 def _extract_dynamic_environment(messages: list) -> tuple[list, str]:
     """Remove client-marked dynamic environment messages and return the last valid snapshot."""
     filtered = []
@@ -1510,6 +1538,15 @@ async def _chat_completions_inner(request: Request):
         partition_prompt = effective_system_prompt
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
             partition_prompt = (effective_system_prompt or "") + MEMORY_USAGE_GUIDE
+        partition_prompt, client_system_count, client_system_chars = (
+            _build_partition_system_prompt(partition_prompt, messages)
+        )
+        if client_system_count:
+            print(
+                "[client-system] 分区模式已保留"
+                f"{client_system_count}条客户端 system（共{client_system_chars}字）",
+                flush=True,
+            )
         messages = await build_partitioned_messages(
             session_id, all_msgs, partition_prompt, user_message
         )
