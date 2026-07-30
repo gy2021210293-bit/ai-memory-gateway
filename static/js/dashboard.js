@@ -93,26 +93,69 @@ function renderEntities() {
     }
     const renderGroup = (title, entities, collapsed = false) => {
         const container = collapsed ? document.createElement('details') : document.createElement('section');
+        container.className = `entity-group${collapsed ? ' entity-group-candidate' : ''}`;
         if (collapsed) {
             const summary = document.createElement('summary');
             summary.textContent = `${title}（${entities.length}）`;
-            summary.style.cursor = 'pointer';
+            summary.className = 'entity-group-title';
             container.appendChild(summary);
         } else {
             const heading = document.createElement('h4');
             heading.textContent = `${title}（${entities.length}）`;
+            heading.className = 'entity-group-title';
             container.appendChild(heading);
         }
+        const grid = document.createElement('div');
+        grid.className = 'entity-grid';
         entities.forEach(entity => {
             const row = document.createElement('button');
             row.type = 'button';
-            row.className = 'memory-item';
-            row.style.cssText = 'width:100%;text-align:left;margin-bottom:8px;cursor:pointer';
-            const aliases = entity.aliases?.length ? ` · 别名：${entity.aliases.join('、')}` : '';
-            row.textContent = `${entity.name} · ${entity.entity_type} · 累计证据 ${entity.evidence_count || 0} · 当前记忆 ${entity.memory_count}${aliases}`;
-            row.onclick = () => loadEntityMemories(entity);
-            container.appendChild(row);
+            row.className = `entity-item${selectedEntity?.id === entity.id ? ' is-selected' : ''}`;
+
+            const identity = document.createElement('span');
+            identity.className = 'entity-item-identity';
+            const name = document.createElement('strong');
+            name.className = 'entity-item-name';
+            name.textContent = entity.name;
+            const type = document.createElement('span');
+            type.className = `entity-type entity-type-${entity.entity_type || 'other'}`;
+            type.textContent = entity.entity_type || 'other';
+            identity.append(name, type);
+
+            const metrics = document.createElement('span');
+            metrics.className = 'entity-item-metrics';
+            [
+                ['累计证据', entity.evidence_count || 0],
+                ['当前记忆', entity.memory_count || 0],
+            ].forEach(([label, value]) => {
+                const metric = document.createElement('span');
+                metric.className = 'entity-metric';
+                const metricLabel = document.createElement('small');
+                metricLabel.textContent = label;
+                const metricValue = document.createElement('b');
+                metricValue.textContent = value;
+                metric.append(metricLabel, metricValue);
+                metrics.appendChild(metric);
+            });
+
+            const aliases = document.createElement('span');
+            aliases.className = `entity-item-aliases${entity.aliases?.length ? '' : ' is-empty'}`;
+            aliases.textContent = entity.aliases?.length ? `别名：${entity.aliases.join('、')}` : '暂无别名';
+
+            const arrow = document.createElement('span');
+            arrow.className = 'entity-item-arrow';
+            arrow.setAttribute('aria-hidden', 'true');
+            arrow.textContent = '›';
+
+            row.append(identity, metrics, aliases, arrow);
+            row.onclick = () => {
+                list.querySelectorAll('.entity-item.is-selected').forEach(item => item.classList.remove('is-selected'));
+                row.classList.add('is-selected');
+                loadEntityMemories(entity);
+            };
+            grid.appendChild(row);
         });
+        container.appendChild(grid);
         list.appendChild(container);
     };
     renderGroup('活跃实体', allEntities.filter(entity => entity.retrieval_status === 'active'));

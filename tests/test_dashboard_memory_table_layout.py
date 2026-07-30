@@ -25,7 +25,7 @@ class DashboardMemoryTableLayoutTests(unittest.TestCase):
         self.assertNotIn("min-width: 430px;", self.css)
 
     def test_dashboard_css_cache_version_is_bumped(self):
-        self.assertIn("/static/css/dashboard.css?v=5.9", self.html)
+        self.assertIn("/static/css/dashboard.css?v=6.0", self.html)
 
 
 if __name__ == "__main__":
