@@ -34,8 +34,13 @@ class DashboardEntityProfileEditorTests(unittest.TestCase):
         self.assertIn("selectedEntityMemoryIds.has(id)", self.javascript)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=4.9", self.html)
+        self.assertIn("/static/js/dashboard.js?v=5.0", self.html)
         self.assertIn("/static/css/dashboard.css?v=6.0", self.html)
+
+    def test_conversation_detail_uses_query_parameter_session_id(self):
+        self.assertIn("/api/conversation-messages?", self.javascript)
+        self.assertIn("session_id: sessionId", self.javascript)
+        self.assertIn("if (!resp.ok)", self.javascript)
 
     def test_editor_collapses_to_one_column_on_narrow_screens(self):
         self.assertIn('class="entity-profile-editor-grid"', self.html)

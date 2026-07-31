@@ -23,6 +23,20 @@ def _load_batch_functions():
     return namespace
 
 
+def _load_history_function():
+    source = Path("database.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "get_conversation_messages"
+    ]
+    namespace = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), "database.py", "exec"), namespace)
+    return namespace
+
+
 class _AsyncContext:
     def __init__(self, value=None):
         self.value = value
@@ -38,11 +52,13 @@ class _Connection:
     def __init__(self, rows):
         self.rows = rows
         self.executions = []
+        self.fetch_queries = []
 
     def transaction(self):
         return _AsyncContext()
 
-    async def fetch(self, query, session_id):
+    async def fetch(self, query, *args):
+        self.fetch_queries.append(query)
         return self.rows
 
     async def execute(self, query, *args):
@@ -58,6 +74,23 @@ class _Pool:
 
 
 class ConversationBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_uses_id_as_the_stable_message_order(self):
+        namespace = _load_history_function()
+        connection = _Connection([
+            {"role": "assistant", "content": "", "metadata": None, "created_at": "same"},
+            {"role": "tool", "content": "result", "metadata": None, "created_at": "same"},
+        ])
+
+        async def get_pool():
+            return _Pool(connection)
+
+        namespace["get_pool"] = get_pool
+        rows = await namespace["get_conversation_messages"]("thread-a", 100)
+
+        self.assertEqual(len(rows), 2)
+        query = connection.fetch_queries[0]
+        self.assertIn("ORDER BY id ASC", query)
+
     async def test_closed_tool_chain_only_inserts_missing_suffix(self):
         namespace = _load_batch_functions()
         rows = [

@@ -5,6 +5,7 @@ from message_pipeline import (
     combine_system_prompt,
     make_persistence_plan,
     reconcile_partition_block,
+    validate_tool_sequence,
 )
 
 
@@ -276,6 +277,107 @@ class MessagePipelineTests(unittest.TestCase):
 
         self.assertEqual(result.provider_messages, ())
         self.assertEqual(result.reason, "ambiguous_history_alignment")
+
+    def test_parallel_tool_results_may_arrive_in_any_order(self):
+        result = validate_tool_sequence([
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call-1"},
+                    {"id": "call-2"},
+                    {"id": "call-3"},
+                    {"id": "call-4"},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-3", "content": "three"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "one"},
+            {"role": "tool", "tool_call_id": "call-4", "content": "four"},
+            {"role": "tool", "tool_call_id": "call-2", "content": "two"},
+            {"role": "assistant", "content": "done"},
+        ])
+
+        self.assertTrue(result.valid)
+
+    def test_multiple_parallel_tool_steps_are_valid(self):
+        result = validate_tool_sequence([
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1"}, {"id": "call-2"}],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "two"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "one"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-3"}],
+            },
+            {"role": "tool", "tool_call_id": "call-3", "content": "three"},
+        ])
+
+        self.assertTrue(result.valid)
+
+    def test_consecutive_tool_call_assistants_are_rejected(self):
+        result = validate_tool_sequence([
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2"}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "one"},
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "unclosed_tool_calls")
+        self.assertEqual(result.index, 1)
+
+    def test_invalid_tool_ids_are_rejected(self):
+        cases = [
+            (
+                [{"role": "tool", "tool_call_id": "call-1", "content": "one"}],
+                "orphan_tool_result",
+            ),
+            (
+                [
+                    {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "content": "one"},
+                ],
+                "missing_tool_call_id",
+            ),
+            (
+                [
+                    {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "tool_call_id": "call-x", "content": "bad"},
+                ],
+                "unexpected_tool_call_id",
+            ),
+            (
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "call-1"}, {"id": "call-1"}],
+                    },
+                ],
+                "duplicate_tool_call_id",
+            ),
+            (
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "call-1"}, {"id": "call-2"}],
+                    },
+                    {"role": "tool", "tool_call_id": "call-1", "content": "one"},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "again"},
+                ],
+                "duplicate_tool_result",
+            ),
+        ]
+
+        for messages, reason in cases:
+            with self.subTest(reason=reason):
+                result = validate_tool_sequence(messages)
+                self.assertFalse(result.valid)
+                self.assertEqual(result.reason, reason)
 
 
 if __name__ == "__main__":

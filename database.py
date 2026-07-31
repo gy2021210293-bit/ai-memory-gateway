@@ -857,7 +857,7 @@ async def get_last_user_content(session_id: str) -> str:
         row = await conn.fetchrow("""
             SELECT content FROM conversations
             WHERE session_id = $1 AND role = 'user'
-            ORDER BY created_at DESC
+            ORDER BY id DESC
             LIMIT 1
         """, session_id)
         return row['content'] if row else ""
@@ -870,7 +870,7 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
         row = await conn.fetchrow("""
             SELECT id FROM conversations
             WHERE session_id = $1 AND role = 'assistant'
-            ORDER BY created_at DESC
+            ORDER BY id DESC
             LIMIT 1
         """, session_id)
         if row:
@@ -886,7 +886,7 @@ async def get_recent_messages(session_id: str, limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT role, content, metadata, created_at FROM conversations WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2",
+            "SELECT role, content, metadata, created_at FROM conversations WHERE session_id = $1 ORDER BY id DESC LIMIT $2",
             session_id, limit,
         )
         return list(reversed(rows))
@@ -1841,7 +1841,7 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
             SELECT role, content, metadata, created_at
             FROM conversations
             WHERE session_id = $1
-            ORDER BY created_at ASC
+            ORDER BY id ASC
             LIMIT $2
         """, session_id, limit)
         return [dict(r) for r in rows]
@@ -2181,7 +2181,7 @@ async def export_all_conversations():
         rows = await conn.fetch("""
             SELECT session_id, role, content, model, created_at
             FROM conversations
-            ORDER BY session_id, created_at
+            ORDER BY session_id, id
         """)
         return [
             {

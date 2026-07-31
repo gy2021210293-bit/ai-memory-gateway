@@ -46,6 +46,16 @@ class ReconciledBlock:
     reason: str
 
 
+@dataclass(frozen=True)
+class ToolSequenceValidation:
+    valid: bool
+    index: int = -1
+    role: str = ""
+    reason: str = ""
+    pending_ids: tuple[str, ...] = ()
+    tool_call_id: str = ""
+
+
 def _empty_reconciled(reason: str, aligned_count: int = 0, alignment_end: int = -1):
     return ReconciledBlock(
         provider_messages=(),
@@ -56,6 +66,99 @@ def _empty_reconciled(reason: str, aligned_count: int = 0, alignment_end: int = 
         alignment_end=alignment_end,
         reason=reason,
     )
+
+
+def validate_tool_sequence(messages: list[Message]) -> ToolSequenceValidation:
+    """Validate OpenAI assistant(tool_calls) -> tool* message ordering."""
+    pending_ids: set[str] = set()
+    completed_ids: set[str] = set()
+
+    for index, message in enumerate(messages):
+        role = message.get("role", "")
+
+        if pending_ids:
+            if role != "tool":
+                return ToolSequenceValidation(
+                    valid=False,
+                    index=index,
+                    role=role,
+                    reason="unclosed_tool_calls",
+                    pending_ids=tuple(sorted(pending_ids)),
+                )
+
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                return ToolSequenceValidation(
+                    valid=False,
+                    index=index,
+                    role=role,
+                    reason="missing_tool_call_id",
+                    pending_ids=tuple(sorted(pending_ids)),
+                )
+            if tool_call_id not in pending_ids:
+                return ToolSequenceValidation(
+                    valid=False,
+                    index=index,
+                    role=role,
+                    reason=(
+                        "duplicate_tool_result"
+                        if tool_call_id in completed_ids
+                        else "unexpected_tool_call_id"
+                    ),
+                    pending_ids=tuple(sorted(pending_ids)),
+                    tool_call_id=tool_call_id,
+                )
+
+            pending_ids.remove(tool_call_id)
+            completed_ids.add(tool_call_id)
+            continue
+
+        if role == "tool":
+            return ToolSequenceValidation(
+                valid=False,
+                index=index,
+                role=role,
+                reason="orphan_tool_result",
+                tool_call_id=message.get("tool_call_id", ""),
+            )
+
+        tool_calls = message.get("tool_calls")
+        if role != "assistant" or not tool_calls:
+            continue
+
+        call_ids = []
+        for call in tool_calls:
+            call_id = call.get("id") if isinstance(call, dict) else None
+            if not isinstance(call_id, str) or not call_id:
+                return ToolSequenceValidation(
+                    valid=False,
+                    index=index,
+                    role=role,
+                    reason="missing_tool_call_id",
+                )
+            if call_id in call_ids:
+                return ToolSequenceValidation(
+                    valid=False,
+                    index=index,
+                    role=role,
+                    reason="duplicate_tool_call_id",
+                    tool_call_id=call_id,
+                )
+            call_ids.append(call_id)
+
+        pending_ids = set(call_ids)
+        completed_ids = set()
+
+    if pending_ids:
+        return ToolSequenceValidation(
+            valid=False,
+            index=len(messages),
+            role="end",
+            reason="unclosed_tool_calls",
+            pending_ids=tuple(sorted(pending_ids)),
+        )
+
+    return ToolSequenceValidation(valid=True)
 
 
 def message_text(message: Message) -> str:

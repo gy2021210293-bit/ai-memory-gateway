@@ -40,6 +40,7 @@ from message_pipeline import (
     combine_system_prompt,
     make_persistence_plan,
     reconcile_partition_block,
+    validate_tool_sequence,
 )
 
 # ============================================================
@@ -1656,6 +1657,27 @@ async def _chat_completions_inner(request: Request):
             flush=True,
         )
 
+    tool_sequence = validate_tool_sequence(body.get("messages", []))
+    if not tool_sequence.valid:
+        print(
+            "[message-sequence] invalid "
+            f"index={tool_sequence.index} "
+            f"role={tool_sequence.role or '?'} "
+            f"reason={tool_sequence.reason} "
+            f"pending_ids={list(tool_sequence.pending_ids)} "
+            f"tool_call_id={tool_sequence.tool_call_id or '-'}",
+            flush=True,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "工具调用消息顺序无效，请新建会话或清理损坏的会话尾部",
+                    "type": "invalid_message_sequence",
+                }
+            },
+        )
+
     # ---------- 转发请求 ----------
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -2885,6 +2907,7 @@ async def api_conversations(page: int = 1, per_page: int = 20):
         return {"error": str(e)}
 
 
+@app.get("/api/conversation-messages")
 @app.get("/api/conversations/{session_id}/messages")
 async def api_conversation_messages(session_id: str, limit: int = 50, offset: int = 0):
     if not MEMORY_ENABLED:
@@ -2898,7 +2921,7 @@ async def api_conversation_messages(session_id: str, limit: int = 50, offset: in
             rows = await conn.fetch("""
                 SELECT id, role, content, created_at
                 FROM conversations WHERE session_id = $1
-                ORDER BY created_at DESC
+                ORDER BY id DESC
                 LIMIT $2 OFFSET $3
             """, session_id, limit, offset)
         msgs = [{"id": r["id"], "role": r["role"], "content": r["content"], 

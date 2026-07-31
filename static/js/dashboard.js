@@ -1951,8 +1951,23 @@ async function loadConvMessages(sessionId, append = false) {
     const offset = append ? convDetailLoadedCount : 0;
     
     try {
-        const resp = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}/messages?limit=50&offset=${offset}`);
-        const data = await resp.json();
+        const params = new URLSearchParams({
+            session_id: sessionId,
+            limit: '50',
+            offset: String(offset),
+        });
+        const resp = await fetch(`/api/conversation-messages?${params.toString()}`);
+        const raw = await resp.text();
+        let data = {};
+        try {
+            data = raw ? JSON.parse(raw) : {};
+        } catch (_) {
+            throw new Error(`HTTP ${resp.status}：服务器返回了非 JSON 响应`);
+        }
+
+        if (!resp.ok) {
+            throw new Error(data.error || data.detail || `HTTP ${resp.status}`);
+        }
         
         if (data.error) {
             messagesEl.innerHTML = '<div style="color: var(--error);">' + data.error + '</div>';
