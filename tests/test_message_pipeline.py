@@ -106,6 +106,20 @@ class MessagePipelineTests(unittest.TestCase):
         self.assertFalse(plan.completed_round)
         self.assertEqual(plan.messages[-1]["tool_calls"][0]["id"], "call-1")
 
+    def test_upstream_rejection_plan_keeps_user_without_completing_round(self):
+        plan = make_persistence_plan(
+            "thread-a",
+            ({"role": "user", "content": [{"type": "text", "text": "request"}]},),
+            "",
+            None,
+            None,
+            False,
+        )
+
+        self.assertEqual(len(plan.messages), 1)
+        self.assertEqual(plan.messages[0]["role"], "user")
+        self.assertFalse(plan.completed_round)
+
     def test_empty_current_block_never_falls_back_to_old_user(self):
         result = classify_request([
             {"role": "user", "content": "嗯嗯，可能是网关那边做了清洗"},
@@ -205,7 +219,7 @@ class MessagePipelineTests(unittest.TestCase):
         self.assertNotIn("battery=80", str(result.provider_messages))
         self.assertEqual(classified.client_system_prompts, ("client rules",))
 
-    def test_invalid_environment_marker_does_not_drop_workflow_user(self):
+    def test_text_list_environment_is_valid_and_isolated(self):
         database = [
             {"role": "user", "content": "old"},
             {"role": "assistant", "content": "old answer"},
@@ -214,14 +228,19 @@ class MessagePipelineTests(unittest.TestCase):
             *database,
             {
                 "role": "user",
-                "content": [{"type": "text", "text": "run workflow"}],
+                "content": [
+                    {"type": "text", "text": "battery=80"},
+                    "charging",
+                ],
                 "metadata": {"dynamic_environment": True},
             },
+            {"role": "user", "content": "run workflow"},
         ])
 
-        self.assertEqual(classified.invalid_dynamic_count, 1)
+        self.assertEqual(classified.invalid_dynamic_count, 0)
+        self.assertEqual(classified.dynamic_environment, "battery=80\ncharging")
         self.assertEqual(classified.latest_user_text, "run workflow")
-        self.assertNotIn("metadata", classified.ordinary_messages[-1])
+        self.assertNotIn("battery=80", str(classified.ordinary_messages))
 
         result = reconcile_partition_block(
             database,
@@ -234,6 +253,23 @@ class MessagePipelineTests(unittest.TestCase):
             [message["role"] for message in result.provider_messages],
             ["user"],
         )
+
+    def test_mixed_environment_marker_does_not_drop_original_message(self):
+        classified = classify_request([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "redacted"}},
+                ],
+                "metadata": {"dynamic_environment": True},
+            },
+        ])
+
+        self.assertEqual(classified.invalid_dynamic_count, 1)
+        self.assertEqual(classified.dynamic_environment, "")
+        self.assertEqual(classified.latest_user_text, "look")
+        self.assertNotIn("metadata", classified.ordinary_messages[0])
 
     def test_no_new_message_after_alignment_is_rejected(self):
         history = [

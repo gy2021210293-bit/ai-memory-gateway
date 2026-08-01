@@ -2,10 +2,51 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
+import json
 from typing import Any
 
 
 Message = dict[str, Any]
+
+
+def normalize_content_text(content: Any) -> str:
+    """Convert OpenAI-compatible message content to database-safe text."""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        return "\n".join(text_parts) if text_parts else "[图片]"
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _pure_text_content(content: Any) -> str | None:
+    """Return text only when content is a non-empty string or text-only list."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or not content:
+        return None
+    for block in content:
+        if isinstance(block, str):
+            continue
+        if not (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text", ""), str)
+        ):
+            return None
+    return normalize_content_text(content)
 
 
 @dataclass(frozen=True)
@@ -269,8 +310,9 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
     for message in raw:
         metadata = message.get("metadata")
         if isinstance(metadata, dict) and metadata.get("dynamic_environment") is True:
-            if message.get("role") == "user" and isinstance(message.get("content"), str):
-                dynamic = message["content"]
+            dynamic_text = _pure_text_content(message.get("content"))
+            if message.get("role") == "user" and dynamic_text is not None:
+                dynamic = dynamic_text
                 continue
             else:
                 invalid_dynamic += 1

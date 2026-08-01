@@ -75,7 +75,10 @@ class DynamicEnvironmentTests(unittest.TestCase):
         messages = [
             {
                 "role": "user",
-                "content": [{"type": "text", "text": "invalid"}],
+                "content": [
+                    {"type": "text", "text": "invalid"},
+                    {"type": "image_url", "image_url": {"url": "redacted"}},
+                ],
                 "metadata": {"dynamic_environment": True},
             },
             {"role": "user", "content": "real request"},
@@ -86,7 +89,10 @@ class DynamicEnvironmentTests(unittest.TestCase):
         self.assertEqual(filtered, [
             {
                 "role": "user",
-                "content": [{"type": "text", "text": "invalid"}],
+                "content": [
+                    {"type": "text", "text": "invalid"},
+                    {"type": "image_url", "image_url": {"url": "redacted"}},
+                ],
             },
             {"role": "user", "content": "real request"},
         ])

@@ -2,6 +2,7 @@ import ast
 import json
 from pathlib import Path
 import unittest
+from message_pipeline import normalize_content_text
 
 
 def _load_batch_functions():
@@ -18,7 +19,10 @@ def _load_batch_functions():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name in names
     ]
-    namespace = {"json": json}
+    namespace = {
+        "json": json,
+        "normalize_content_text": normalize_content_text,
+    }
     exec(compile(ast.Module(body=selected, type_ignores=[]), "database.py", "exec"), namespace)
     return namespace
 
@@ -74,6 +78,38 @@ class _Pool:
 
 
 class ConversationBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_list_content_is_normalized_before_database_write(self):
+        namespace = _load_batch_functions()
+        connection = _Connection([])
+        incoming = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"},
+                ],
+            },
+            {
+                "role": "tool",
+                "content": [{"type": "image_url", "image_url": {"url": "redacted"}}],
+                "tool_call_id": "call-1",
+            },
+        ]
+
+        async def get_pool():
+            return _Pool(connection)
+
+        namespace["get_pool"] = get_pool
+        await namespace["persist_conversation_batch"]("thread-a", incoming, "model-a")
+
+        inserts = [
+            args
+            for query, args in connection.executions
+            if "INSERT INTO conversations" in query
+        ]
+        self.assertEqual([args[2] for args in inserts], ["first\nsecond", "[图片]"])
+        self.assertTrue(all(isinstance(args[2], str) for args in inserts))
+
     async def test_history_uses_id_as_the_stable_message_order(self):
         namespace = _load_history_function()
         connection = _Connection([

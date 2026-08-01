@@ -14,6 +14,7 @@ from typing import Optional, List
 from datetime import date, datetime, timedelta, timezone as dt_timezone
 
 import asyncpg
+from message_pipeline import normalize_content_text
 
 # 时区偏移（和 main.py 保持一致）
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -747,6 +748,7 @@ def _min_max_normalize(scores: dict) -> dict:
 # ============================================================
 
 async def save_message(session_id: str, role: str, content: str, model: str = "", metadata: str = None):
+    content = normalize_content_text(content)
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -757,7 +759,7 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
 
 def _conversation_message_parts(message: dict):
     role = message.get("role", "")
-    content = message.get("content")
+    content = normalize_content_text(message.get("content"))
     metadata = {}
     for key in ("tool_calls", "reasoning_content", "tool_call_id", "name"):
         if message.get(key) is not None:
@@ -876,7 +878,7 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
         if row:
             await conn.execute(
                 "UPDATE conversations SET content = $1, model = $2 WHERE id = $3",
-                new_content, model, row['id']
+                normalize_content_text(new_content), model, row['id']
             )
             return True
         return False
@@ -1079,7 +1081,7 @@ async def update_message_content(message_id: int, new_content: str):
     async with pool.acquire() as conn:
         result = await conn.execute(
             "UPDATE conversations SET content = $1 WHERE id = $2",
-            new_content, message_id,
+            normalize_content_text(new_content), message_id,
         )
         return int(result.split()[-1]) if result else 0
 
@@ -2213,7 +2215,7 @@ async def import_conversations(records: list):
         for r in records:
             session_id = r.get('session_id')
             role = r.get('role')
-            content = r.get('content')
+            content = normalize_content_text(r.get('content'))
             
             if not all([session_id, role, content]):
                 continue
