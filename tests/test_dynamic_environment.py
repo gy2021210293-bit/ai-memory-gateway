@@ -60,6 +60,24 @@ class DynamicEnvironmentTests(unittest.TestCase):
             ],
         )
 
+    def test_extracts_text_list_snapshot_with_dynamic_context_envelope(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "<dynamic_context generated_at=\"t1\">battery=51</dynamic_context>",
+                }],
+                "metadata": {"dynamic_environment": True, "generated_at": "t1"},
+            },
+            {"role": "user", "content": "real request"},
+        ]
+
+        filtered, snapshot = self.helpers["_extract_dynamic_environment"](messages)
+
+        self.assertIn("battery=51", snapshot)
+        self.assertEqual(filtered, [{"role": "user", "content": "real request"}])
+
     def test_unmarked_adjacent_users_are_not_treated_as_snapshots(self):
         messages = [
             {"role": "user", "content": "first"},

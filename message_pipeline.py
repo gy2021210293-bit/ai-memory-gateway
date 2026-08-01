@@ -31,8 +31,8 @@ def normalize_content_text(content: Any) -> str:
         return str(content)
 
 
-def _pure_text_content(content: Any) -> str | None:
-    """Return text only when content is a non-empty string or text-only list."""
+def _dynamic_environment_content(content: Any) -> str | None:
+    """Accept strings, or text-only lists that retain the dynamic-context envelope."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list) or not content:
@@ -46,7 +46,14 @@ def _pure_text_content(content: Any) -> str | None:
             and isinstance(block.get("text", ""), str)
         ):
             return None
-    return normalize_content_text(content)
+    text = normalize_content_text(content)
+    stripped = text.strip()
+    if not (
+        stripped.startswith("<dynamic_context")
+        and stripped.endswith("</dynamic_context>")
+    ):
+        return None
+    return text
 
 
 @dataclass(frozen=True)
@@ -310,7 +317,7 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
     for message in raw:
         metadata = message.get("metadata")
         if isinstance(metadata, dict) and metadata.get("dynamic_environment") is True:
-            dynamic_text = _pure_text_content(message.get("content"))
+            dynamic_text = _dynamic_environment_content(message.get("content"))
             if message.get("role") == "user" and dynamic_text is not None:
                 dynamic = dynamic_text
                 continue

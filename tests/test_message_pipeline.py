@@ -229,8 +229,10 @@ class MessagePipelineTests(unittest.TestCase):
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "battery=80"},
-                    "charging",
+                    {
+                        "type": "text",
+                        "text": "<dynamic_context generated_at=\"t1\">battery=80\ncharging</dynamic_context>",
+                    },
                 ],
                 "metadata": {"dynamic_environment": True},
             },
@@ -238,7 +240,7 @@ class MessagePipelineTests(unittest.TestCase):
         ])
 
         self.assertEqual(classified.invalid_dynamic_count, 0)
-        self.assertEqual(classified.dynamic_environment, "battery=80\ncharging")
+        self.assertIn("battery=80", classified.dynamic_environment)
         self.assertEqual(classified.latest_user_text, "run workflow")
         self.assertNotIn("battery=80", str(classified.ordinary_messages))
 
@@ -253,6 +255,21 @@ class MessagePipelineTests(unittest.TestCase):
             [message["role"] for message in result.provider_messages],
             ["user"],
         )
+
+    def test_mislabeled_text_list_workflow_is_preserved(self):
+        classified = classify_request([
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "run workflow"}],
+                "metadata": {"dynamic_environment": True, "generated_at": "t1"},
+            },
+        ])
+
+        self.assertEqual(classified.invalid_dynamic_count, 1)
+        self.assertEqual(classified.dynamic_environment, "")
+        self.assertEqual(classified.latest_user_text, "run workflow")
+        self.assertEqual(len(classified.current_block), 1)
+        self.assertNotIn("metadata", classified.current_block[0])
 
     def test_mixed_environment_marker_does_not_drop_original_message(self):
         classified = classify_request([
