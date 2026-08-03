@@ -433,5 +433,126 @@ class MessagePipelineTests(unittest.TestCase):
                 self.assertEqual(result.reason, reason)
 
 
+def _call(*call_ids):
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": call_id, "type": "function"} for call_id in call_ids],
+    }
+
+
+def _result(call_id):
+    return {"role": "tool", "tool_call_id": call_id, "content": f"{call_id}-result"}
+
+
+class DbAssistantSuppliedTests(unittest.TestCase):
+    """客户端回传工具结果时丢掉 assistant(tool_calls) 消息 → 由 DB 补全调用方。"""
+
+    def test_db_assistant_supplied_when_client_drops_assistant(self):
+        database = [
+            {"role": "user", "content": "run workflow"},
+            _call("call-1"),
+        ]
+        client = [
+            {"role": "user", "content": "run workflow"},
+            _result("call-1"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "db_assistant_supplied")
+        self.assertTrue(result.is_tool_chain)
+        self.assertEqual(
+            [message["role"] for message in result.provider_messages],
+            ["tool"],
+        )
+        self.assertEqual(result.latest_user_text, "run workflow")
+        self.assertTrue(validate_tool_sequence(database + list(result.provider_messages)).valid)
+
+    def test_db_assistant_supplied_with_parallel_results_any_order(self):
+        database = [
+            {"role": "user", "content": "run"},
+            _call("call-a", "call-b"),
+        ]
+        client = [
+            {"role": "user", "content": "run"},
+            _result("call-b"),
+            _result("call-a"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "db_assistant_supplied")
+        self.assertEqual(len(result.provider_messages), 2)
+        self.assertTrue(result.is_tool_chain)
+
+    def test_db_assistant_supplied_without_any_client_history(self):
+        database = [
+            {"role": "user", "content": "run"},
+            _call("call-1"),
+        ]
+        client = [_result("call-1")]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "db_assistant_supplied")
+        self.assertEqual(result.latest_user_text, "run")
+        self.assertEqual(
+            [message["role"] for message in result.provider_messages],
+            ["tool"],
+        )
+
+    def test_no_supply_when_tool_ids_mismatch_db(self):
+        database = [
+            {"role": "user", "content": "run"},
+            _call("call-1"),
+        ]
+        client = [
+            {"role": "user", "content": "run"},
+            _result("call-2"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        # 无法归属任何调用方 → 维持原有拒绝
+        self.assertEqual(result.reason, "no_valid_current_block")
+        self.assertEqual(result.provider_messages, ())
+
+    def test_no_supply_when_db_tail_is_not_the_caller(self):
+        database = [
+            {"role": "user", "content": "run"},
+            _call("call-1"),
+            _result("call-1"),
+        ]
+        client = [
+            {"role": "user", "content": "run"},
+            _result("call-1"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        # DB 尾部不是 assistant（链已闭合在 DB 内）→ 不合成，维持原有行为
+        self.assertNotEqual(result.reason, "db_assistant_supplied")
+
+    def test_normal_flow_prefers_alignment(self):
+        database = [
+            {"role": "user", "content": "run"},
+            _call("call-1"),
+        ]
+        client = [
+            {"role": "user", "content": "run"},
+            _call("call-1"),
+            _result("call-1"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.reason, "aligned")
+        self.assertEqual(
+            [message["role"] for message in result.provider_messages],
+            ["tool"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1498,6 +1498,7 @@ async def _chat_completions_inner(request: Request):
                     "error": {
                         "message": "无法识别本次客户端请求块，请检查消息角色和工具调用顺序",
                         "type": "invalid_message_sequence",
+                        "reason": reconciled.reason,
                     }
                 },
             )

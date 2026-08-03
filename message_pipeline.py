@@ -516,6 +516,58 @@ def reconcile_partition_block(
                 reason="aligned",
             )
 
+    # 客户端尾部是无主 tool 结果、但其重发历史里没有对应的 assistant(tool_calls)：
+    # 部分插件式客户端（或格式桥）会丢掉工具调用消息。若 DB 尾部 assistant 的调用
+    # id 与客户端 tool 结果完全匹配，则视为同一链的延续（DB 提供调用方、客户端
+    # 提供结果），跨请求闭合，不再以 no_valid_current_block 拒绝。
+    if client and client[-1].get("role") == "tool":
+        tail = len(client) - 1
+        while tail >= 0 and client[tail].get("role") == "tool":
+            tail -= 1
+        tools = client[tail + 1:]
+        tool_ids = {
+            tool.get("tool_call_id", "")
+            for tool in tools
+            if tool.get("tool_call_id")
+        }
+        prev = client[tail] if tail >= 0 else None
+        prev_matches = bool(
+            prev
+            and prev.get("role") == "assistant"
+            and prev.get("tool_calls")
+            and {
+                call.get("id", "")
+                for call in prev["tool_calls"]
+                if isinstance(call, dict) and call.get("id")
+            }
+            == tool_ids
+        )
+        db_last = database[-1] if database else None
+        db_matches = bool(
+            tool_ids
+            and db_last
+            and db_last.get("role") == "assistant"
+            and db_last.get("tool_calls")
+            and {
+                call.get("id", "")
+                for call in db_last["tool_calls"]
+                if isinstance(call, dict) and call.get("id")
+            }
+            == tool_ids
+        )
+        if db_matches and not prev_matches:
+            logical_block, is_tool_chain = extract_current_block(database + tools)
+            if logical_block and is_tool_chain:
+                return ReconciledBlock(
+                    provider_messages=tuple(tools),
+                    persistence_messages=tuple(tools),
+                    latest_user_text=_latest_user_text(logical_block),
+                    is_tool_chain=True,
+                    aligned_count=0,
+                    alignment_end=0,
+                    reason="db_assistant_supplied",
+                )
+
     fallback, is_tool_chain = extract_current_block(client)
     if fallback:
         return ReconciledBlock(
