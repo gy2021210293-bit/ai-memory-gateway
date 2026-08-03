@@ -1564,10 +1564,11 @@ async def _chat_completions_inner(request: Request):
         all_msgs = db_msgs + client_new_msgs
 
         # ---------- 陈旧工具链自愈（请求侧，零DB写回） ----------
-        # 仅当当前块是"以普通 user 结尾"的合法块时，中和其前方历史中零结果的
-        # 工具链（assistant 请求了工具、结果从未回传、已被后续 user 覆盖）。
-        # 活跃块（工具结果正在回传等）一律不碰，继续由 validate_tool_sequence 严格把关。
-        if reconciled.provider_messages and not reconciled.is_tool_chain:
+        # 当前块被识别即可修复（普通 user 结尾或工具结果回传均可）：正在闭合的
+        # 链（DB 的 assistant + 本次 delta 的结果）在组装列表中必然闭合，zone 逻辑
+        # 自动保护；只有零结果的陈旧链（DB 里积累的悬挂链）会被中和。
+        # 部分闭合/错配/重复仍留给 validate_tool_sequence 严格把关。
+        if reconciled.provider_messages:
             all_msgs, repair = repair_stale_tool_chains(all_msgs, len(client_new_msgs))
             if repair.changed:
                 print(
@@ -1632,8 +1633,8 @@ async def _chat_completions_inner(request: Request):
                 })
 
         # ---------- 陈旧工具链自愈（请求侧，零DB写回） ----------
-        # 门控与分区模式一致：仅当前块合法且以普通 user 结尾时才修复前方历史。
-        if classified.current_block and not classified.is_tool_chain:
+        # 门控与分区模式一致：当前块被识别即可修复（zone 逻辑保护活跃链）。
+        if classified.current_block:
             messages, repair = repair_stale_tool_chains(
                 messages, len(classified.current_block)
             )

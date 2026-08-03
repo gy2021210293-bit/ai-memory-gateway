@@ -283,7 +283,7 @@ class RepairStaleToolChainsTests(unittest.TestCase):
         client = database + [user_msg("别管了")]
         reconciled = reconcile_partition_block(database, client)
 
-        gate = bool(reconciled.provider_messages) and not reconciled.is_tool_chain
+        gate = bool(reconciled.provider_messages)
         self.assertTrue(gate)
         self.assertEqual(
             [m["role"] for m in reconciled.provider_messages], ["user"]
@@ -298,14 +298,15 @@ class RepairStaleToolChainsTests(unittest.TestCase):
         self.assertTrue(result.changed)
         self.assertTrue(validate_tool_sequence(out).valid)
 
-    def test_tool_result_flow_gate_blocks_repair(self):
-        # 工具结果回传请求（跨界闭合）：is_tool_chain=True → 门控不通过 → 零修复
+    def test_tool_result_flow_closed_zone_untouched(self):
+        # 工具结果回传请求（跨界闭合）：门控通过，但正在闭合的链在组装列表中
+        # 闭合 → zone 逻辑分毫不动 → 校验通过
         database = [user_msg("run"), assistant_call("t1")]
         client = database + [tool_result("t1")]
         reconciled = reconcile_partition_block(database, client)
 
-        gate = bool(reconciled.provider_messages) and not reconciled.is_tool_chain
-        self.assertFalse(gate)
+        gate = bool(reconciled.provider_messages)
+        self.assertTrue(gate)
         self.assertTrue(reconciled.is_tool_chain)
 
         all_msgs = database + list(reconciled.provider_messages)
@@ -316,12 +317,62 @@ class RepairStaleToolChainsTests(unittest.TestCase):
         self.assertFalse(result.changed)
         self.assertTrue(validate_tool_sequence(out).valid)
 
+    def test_tool_result_flow_repairs_accumulated_stale_history(self):
+        # 回归：DB 里积累的旧悬挂链 t0 + 本次回传 t1 结果 —— 修复必须中和 t0，
+        # 否则组装列表校验失败（此前的"一用工具就报错"1675）
+        database = [
+            user_msg("run"),
+            assistant_call("t0"),      # 旧悬挂链（之前失败的工具调用遗留）
+            user_msg("再试一次"),
+            assistant_call("t1"),      # 当前链
+        ]
+        client = [
+            user_msg("run"),
+            user_msg("再试一次"),
+            tool_result("t1"),         # 客户端丢弃 assistant 消息
+        ]
+        reconciled = reconcile_partition_block(database, client)
+
+        self.assertEqual(reconciled.reason, "db_assistant_supplied")
+        self.assertTrue(bool(reconciled.provider_messages))
+
+        all_msgs = database + list(reconciled.provider_messages)
+        self.assertFalse(validate_tool_sequence(all_msgs).valid)  # 修复前 1675
+
+        out, result = repair_stale_tool_chains(
+            all_msgs, len(reconciled.provider_messages)
+        )
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.dropped_assistants, 1)
+        self.assertTrue(validate_tool_sequence(out).valid)
+        # 正在闭合的 t1 链必须原样保留，旧悬挂链 t0 被中和
+        self.assertEqual(
+            [m["role"] for m in out],
+            ["user", "user", "assistant", "tool"],
+        )
+
+    def test_partial_parallel_closure_still_rejected(self):
+        # 并行 [t1a,t1b] 只回 t1a：部分闭合 → 对齐拒绝（1498 路径），
+        # 门控不通过、修复不运行，红线不变
+        database = [user_msg("run"), assistant_call("t1a", "t1b")]
+        client = [
+            user_msg("run"),
+            assistant_call("t1a", "t1b"),
+            tool_result("t1a"),
+        ]
+        reconciled = reconcile_partition_block(database, client)
+
+        self.assertNotEqual(reconciled.reason, "aligned")
+        self.assertFalse(reconciled.provider_messages)
+        self.assertFalse(bool(reconciled.provider_messages))
+
     def test_empty_current_block_gate_blocks_repair(self):
         # 当前块无法识别（无主 tool 尾）：门控不通过 → 修复不会被调用
         # → 原消息原样进入校验器，维持 400（回归：行为与修复前逐字节一致）
         classified = classify_request([user_msg("old"), tool_result("x")])
 
-        gate = bool(classified.current_block) and not classified.is_tool_chain
+        gate = bool(classified.current_block)
         self.assertFalse(gate)
         self.assertEqual(classified.current_block, ())
 
