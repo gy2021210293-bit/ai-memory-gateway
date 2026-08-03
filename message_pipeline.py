@@ -209,6 +209,123 @@ def validate_tool_sequence(messages: list[Message]) -> ToolSequenceValidation:
     return ToolSequenceValidation(valid=True)
 
 
+@dataclass
+class RepairResult:
+    stripped_assistants: int = 0
+    dropped_assistants: int = 0
+    dropped_orphan_tools: int = 0
+    left_for_validator: int = 0
+    changed: bool = False
+
+
+def _message_has_text(message: Message) -> bool:
+    return bool(message_text(message).strip())
+
+
+def repair_stale_tool_chains(
+    messages: list[Message],
+    active_tail_len: int = 0,
+) -> tuple[list[Message], RepairResult]:
+    """
+    中和历史中"零结果"的陈旧工具链，活跃块继续由校验器严格把关。
+
+    messages: 组装后的完整消息列表（DB历史 + 客户端增量）。
+    active_tail_len: 客户端当前活跃块的条数（列表尾部）。活跃块内任何未闭合、
+        错配、重复链一律不碰，继续由 validate_tool_sequence 返回 400。
+
+    只处理两种确定"已放弃"的形状（区起点在活跃块边界之前）：
+    - assistant(tool_calls) 后没有任何匹配 tool 结果 → 剥 tool_calls
+      （内容为空则删整条），跟随的错误 id tool 一并删
+    - 无主 tool 结果（前面没有打开的 assistant 区）→ 删
+    部分闭合（有匹配但未覆盖全部 id）、闭合区内的重复 id、活跃块内的任何
+    残缺 → 一律不碰，保留现有 400 行为。
+
+    纯函数：不读写 DB、不修改输入消息对象、同输入两次结果一致（幂等）。
+    """
+    out: list[Message] = []
+    result = RepairResult()
+    boundary = len(messages) - active_tail_len
+
+    pending_ids: set[str] | None = None
+    pending_msg: Message | None = None
+    zone_start = 0
+    zone_results: list[Message] = []
+
+    def close_zone() -> None:
+        nonlocal pending_ids, pending_msg, zone_results
+        if pending_ids is None or pending_msg is None:
+            return
+        matched = {
+            tool.get("tool_call_id", "")
+            for tool in zone_results
+            if tool.get("tool_call_id", "") in pending_ids
+        }
+        if matched == pending_ids and pending_ids:
+            # 完全闭合 → 原样保留（含跨界闭合：DB assistant + delta 结果）
+            out.append(pending_msg)
+            out.extend(zone_results)
+        elif matched:
+            # 部分闭合 → 不碰，留给校验器
+            out.append(pending_msg)
+            out.extend(zone_results)
+            result.left_for_validator += 1
+        elif zone_start < boundary:
+            # 零结果 + 陈旧 → 中和整条链（剥 tool_calls / 删空消息 + 删无主 tool）
+            result.dropped_orphan_tools += len(zone_results)
+            if _message_has_text(pending_msg):
+                pending_msg.pop("tool_calls", None)
+                out.append(pending_msg)
+                result.stripped_assistants += 1
+            else:
+                result.dropped_assistants += 1
+            result.changed = True
+        else:
+            # 零结果 + 活跃尾 → 不碰，留给校验器
+            out.append(pending_msg)
+            out.extend(zone_results)
+            result.left_for_validator += 1
+        pending_ids = None
+        pending_msg = None
+        zone_results = []
+
+    for index, message in enumerate(messages):
+        role = message.get("role", "")
+
+        if pending_ids is not None:
+            if role == "tool":
+                zone_results.append(message)
+                continue
+            close_zone()
+            # 当前消息重新走下面的普通分支（close_zone 已清空状态）
+
+        tool_calls = message.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            pending_ids = {
+                call.get("id", "")
+                for call in tool_calls
+                if isinstance(call, dict) and call.get("id")
+            }
+            pending_msg = deepcopy(message)
+            zone_start = index
+            zone_results = []
+            continue
+
+        if role == "tool":
+            # 无主 tool：前面没有打开的 assistant 区
+            if index < boundary:
+                result.dropped_orphan_tools += 1
+                result.changed = True
+                continue
+            out.append(message)
+            continue
+
+        out.append(message)
+
+    close_zone()
+
+    return out, result
+
+
 def message_text(message: Message) -> str:
     content = message.get("content", "")
     if isinstance(content, str):

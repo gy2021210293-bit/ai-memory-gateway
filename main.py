@@ -40,6 +40,7 @@ from message_pipeline import (
     combine_system_prompt,
     make_persistence_plan,
     reconcile_partition_block,
+    repair_stale_tool_chains,
     validate_tool_sequence,
 )
 
@@ -1560,6 +1561,21 @@ async def _chat_completions_inner(request: Request):
         if filtered_count:
             print(f"🔧 去重: 过滤{filtered_count}条客户端历史，保留当前块{len(client_new_msgs)}条")
         all_msgs = db_msgs + client_new_msgs
+
+        # ---------- 陈旧工具链自愈（请求侧，零DB写回） ----------
+        # 仅当当前块是"以普通 user 结尾"的合法块时，中和其前方历史中零结果的
+        # 工具链（assistant 请求了工具、结果从未回传、已被后续 user 覆盖）。
+        # 活跃块（工具结果正在回传等）一律不碰，继续由 validate_tool_sequence 严格把关。
+        if reconciled.provider_messages and not reconciled.is_tool_chain:
+            all_msgs, repair = repair_stale_tool_chains(all_msgs, len(client_new_msgs))
+            if repair.changed:
+                print(
+                    f"🧹 陈旧工具链自愈: 剥tool_calls×{repair.stripped_assistants} "
+                    f"删空assistant×{repair.dropped_assistants} "
+                    f"删无主tool×{repair.dropped_orphan_tools} "
+                    f"留校验×{repair.left_for_validator}",
+                    flush=True,
+                )
         
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
         tool_messages = [
@@ -1613,7 +1629,22 @@ async def _chat_completions_inner(request: Request):
                     "role": "system",
                     "content": final_system_prompt,
                 })
-        
+
+        # ---------- 陈旧工具链自愈（请求侧，零DB写回） ----------
+        # 门控与分区模式一致：仅当前块合法且以普通 user 结尾时才修复前方历史。
+        if classified.current_block and not classified.is_tool_chain:
+            messages, repair = repair_stale_tool_chains(
+                messages, len(classified.current_block)
+            )
+            if repair.changed:
+                print(
+                    f"🧹 陈旧工具链自愈: 剥tool_calls×{repair.stripped_assistants} "
+                    f"删空assistant×{repair.dropped_assistants} "
+                    f"删无主tool×{repair.dropped_orphan_tools} "
+                    f"留校验×{repair.left_for_validator}",
+                    flush=True,
+                )
+
         body["messages"] = messages
         if drives_task:
             prepared_drives_text = await drives_task
