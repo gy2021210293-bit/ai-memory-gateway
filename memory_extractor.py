@@ -11,13 +11,15 @@ v2.4.1: 提取失败时打印完整API响应体，方便排查空返回问题。
 v2.4.2: 放宽记忆去重标准，生活细节不再被误判为已知信息而跳过。
 v2.4.3: 恢复严格去重措辞，增加精细化约束：仅过滤机械重复，保留有新增价值的相似信息。
 v2.4.4: prompt 改为栖的第一人称视角，记忆带情感温度；保留去重精细化约束。
+v2.4.5: 实体概况与实体回填不再发送 max_tokens（推理模型的思考会吃光预算导致 content 为空），
+        解析改用 llm_json 扫描器，失败时与记忆提取一致重试一次并强制只返回 JSON。
 """
 
 import os
 import json
 import re
 import httpx
-from llm_json import parse_json_array
+from llm_json import parse_json_array, parse_json_object
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
@@ -393,21 +395,44 @@ durable personal significance. Use confidence below 0.65 when unsure.
 Never return the user herself (including 晏晏, 用户, user, or the user) as an entity.
 
 {items}"""
+    request_messages = [{"role": "user", "content": prompt}]
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 get_memory_api_base_url(),
                 headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
-                json={"model": MEMORY_MODEL, "temperature": 0, "max_tokens": 2000,
-                      "messages": [{"role": "user", "content": prompt}]},
+                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
             )
-        if response.status_code != 200:
-            print(f"⚠️ 实体回填请求失败: {response.status_code} {response.text[:200]}")
-            return None
-        text = _extract_response_content(response.json()).strip()
-        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.IGNORECASE)
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        parsed = json.loads(match.group() if match else text)
+            if response.status_code != 200:
+                print(f"⚠️ 实体回填请求失败: {response.status_code} {response.text[:200]}")
+                return None
+            text = _extract_response_content(response.json()).strip()
+            try:
+                parsed = parse_json_array(text)
+            except ValueError as first_error:
+                print(f"⚠️ 实体回填解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages + [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": "上一次输出没有给出可解析的最终结果。请重新检查记忆，只返回最终 JSON 数组，不要分析、解释或使用 Markdown。",
+                        },
+                    ]},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️ 实体回填重试失败: {retry_response.status_code} {retry_response.text[:200]}")
+                    return None
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                try:
+                    parsed = parse_json_array(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️ 实体回填重试结果仍无法解析: {retry_error}")
+                    print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
+                    return None
         allowed_ids = {int(item["id"]) for item in memories}
         result = {}
         for item in parsed if isinstance(parsed, list) else []:
@@ -480,21 +505,47 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 5. 只返回 JSON 对象：
 {{"summary":"简短摘要","relationship":"与用户或伙伴的关系","stable_facts":[],"recent_updates":[],"preferences":[],"uncertainties":[],"evidence_memory_ids":[]}}
 """
+    request_messages = [{"role": "user", "content": prompt}]
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             response = await client.post(
                 get_memory_api_base_url(),
                 headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
-                json={"model": MEMORY_MODEL, "temperature": 0, "max_tokens": 1800,
-                      "messages": [{"role": "user", "content": prompt}]},
+                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
             )
-        if response.status_code != 200:
-            print(f"⚠️ 实体概况生成失败: {response.status_code} {response.text[:200]}")
-            return None
-        text = _extract_response_content(response.json()).strip()
-        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.IGNORECASE)
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        raw_profile = json.loads(match.group() if match else text)
+            if response.status_code != 200:
+                print(f"⚠️ 实体概况生成失败: {response.status_code} {response.text[:200]}")
+                return None
+            text = _extract_response_content(response.json()).strip()
+            try:
+                raw_profile = parse_json_object(text)
+            except ValueError as first_error:
+                print(f"⚠️ 实体概况解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages + [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": "上一次输出没有给出可解析的最终结果。请重新检查证据，只返回最终 JSON 对象，不要分析、解释或使用 Markdown。",
+                        },
+                    ]},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️ 实体概况重试失败: {retry_response.status_code} {retry_response.text[:200]}")
+                    return None
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                if not retry_text:
+                    print("⚠️ 实体概况重试返回空内容")
+                    return None
+                try:
+                    raw_profile = parse_json_object(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️ 实体概况重试结果仍无法解析: {retry_error}")
+                    print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
+                    return None
         if not isinstance(raw_profile, dict):
             return None
         return normalize_entity_profile(raw_profile, {int(memory["id"]) for memory in memories})

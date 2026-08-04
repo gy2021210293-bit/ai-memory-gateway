@@ -98,6 +98,83 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("max_tokens", call.kwargs["json"])
         self.assertIn("只返回最终 JSON 数组", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
 
+    async def test_entity_profile_retries_when_reasoning_has_no_json_object(self):
+        entity = {"name": "测试", "entity_type": "person", "aliases": [], "profile_json": None}
+        memories = [{"id": 1, "content": "证据记忆", "layer": 1}]
+        first = Mock()
+        first.status_code = 200
+        first.json.return_value = {
+            "choices": [{"message": {"content": "", "reasoning_content": "这些证据值得整理，但最终 JSON 在思考中被截断"}}]
+        }
+        second = Mock()
+        second.status_code = 200
+        second.json.return_value = {
+            "choices": [{"message": {"content": '{"summary":"我对测试的稳定认识","relationship":"伙伴","stable_facts":["喜欢阅读"],"recent_updates":[],"preferences":[],"uncertainties":[],"evidence_memory_ids":[1]}'}}]
+        }
+        client = AsyncMock()
+        client.post.side_effect = [first, second]
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_entity_profile(entity, memories)
+
+        self.assertEqual(result["summary"], "我对测试的稳定认识")
+        self.assertEqual(result["stable_facts"], ["喜欢阅读"])
+        self.assertEqual(result["evidence_memory_ids"], [1])
+        self.assertEqual(client.post.await_count, 2)
+        for call in client.post.await_args_list:
+            self.assertNotIn("max_tokens", call.kwargs["json"])
+        self.assertIn("只返回最终 JSON 对象", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
+
+    async def test_entity_profile_retries_when_response_content_is_empty(self):
+        entity = {"name": "测试", "entity_type": "person", "aliases": [], "profile_json": None}
+        memories = [{"id": 1, "content": "证据记忆", "layer": 1}]
+        first = Mock()
+        first.status_code = 200
+        first.json.return_value = {"choices": [{"message": {"content": None}}]}
+        second = Mock()
+        second.status_code = 200
+        second.json.return_value = {
+            "choices": [{"message": {"content": '{"summary":"空返回后重试成功","relationship":"伙伴","stable_facts":[],"recent_updates":[],"preferences":[],"uncertainties":[],"evidence_memory_ids":[1]}'}}]
+        }
+        client = AsyncMock()
+        client.post.side_effect = [first, second]
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_entity_profile(entity, memories)
+
+        self.assertEqual(result["summary"], "空返回后重试成功")
+        self.assertEqual(client.post.await_count, 2)
+
+    async def test_entity_backfill_retries_when_reasoning_has_no_json_array(self):
+        memories = [{"id": 1, "content": "旧记忆"}]
+        first = Mock()
+        first.status_code = 200
+        first.json.return_value = {
+            "choices": [{"message": {"content": "", "reasoning_content": "先想想，输出在最终 JSON 前被截断"}}]
+        }
+        second = Mock()
+        second.status_code = 200
+        second.json.return_value = {
+            "choices": [{"message": {"content": '[{"memory_id": 1, "entities": [{"name": "明月", "type": "place", "confidence": 0.9}]}]'}}]
+        }
+        client = AsyncMock()
+        client.post.side_effect = [first, second]
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.extract_entities_from_memories(memories)
+
+        self.assertEqual(result[1][0]["name"], "明月")
+        self.assertEqual(client.post.await_count, 2)
+        for call in client.post.await_args_list:
+            self.assertNotIn("max_tokens", call.kwargs["json"])
+        self.assertIn("只返回最终 JSON 数组", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
+
     async def test_failed_request_is_distinct_from_successful_empty_result(self):
         failed = Mock()
         failed.status_code = 503
