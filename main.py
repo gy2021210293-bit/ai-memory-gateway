@@ -14,6 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+import hashlib
 from llm_json import parse_json_array, valid_merged_ids
 import uuid
 import asyncio
@@ -666,6 +667,105 @@ def build_time_injection() -> str:
         f"<gateway_context>当前时间：{time_str} {weekday}。"
         f"此块由网关自动注入，不是用户发送的内容，无需回应或提及；"
         f"回答涉及日期、年份、时间时以此为准。</gateway_context>"
+    )
+
+
+# ============================================================
+# 请求调试转储（排查缓存命中率 / 检查实际发给上游的内容）
+# ============================================================
+# DEBUG_DUMP_REQUEST=1 时打印最终请求的逐条消息摘要；
+# 前缀对比（与上次请求找分歧点）默认总是打印，直接指出缓存断点在哪条消息。
+DEBUG_DUMP_REQUEST = os.getenv("DEBUG_DUMP_REQUEST", "false").lower() == "true"
+_last_request_digest = None  # (model, [(role, content_md5), ...])
+
+
+def _message_content_digest(message: dict) -> str:
+    """对消息做确定性摘要（md5），用于对比两次请求的逐条内容"""
+    return hashlib.md5(
+        json.dumps(
+            message, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def dump_request_debug(model: str, messages: list) -> None:
+    """
+    打印最终发给上游的请求摘要，并与上次请求对比找出缓存前缀断点。
+    只读不修改。messages 为最终 body（含系统提示词）。
+    """
+    global _last_request_digest
+    digest = [
+        (m.get("role", ""), _message_content_digest(m))
+        for m in messages
+    ]
+
+    if DEBUG_DUMP_REQUEST:
+        print(f"🔍 [请求转储] model={model}, 共{len(messages)}条消息", flush=True)
+        for i, m in enumerate(messages):
+            content = m.get("content", "")
+            if isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+                fmt = f"list[{len(content)}块]"
+            else:
+                text = content or ""
+                fmt = "str"
+            head = text[:60].replace("\n", "⏎")
+            extra = []
+            if m.get("tool_calls"):
+                extra.append(f"tool_calls×{len(m['tool_calls'])}")
+            if m.get("tool_call_id"):
+                extra.append(f"tool_call_id={m['tool_call_id']}")
+            print(
+                f"   [{i:>3}] {m.get('role', '?'):<9} {fmt:<11} len={len(text):<6}"
+                + (f" {' '.join(extra)}" if extra else "")
+                + f" | {head!r}",
+                flush=True,
+            )
+
+    # 与上次请求逐条对比：共同前缀长度 = 上游自动缓存最多能命中的部分
+    if _last_request_digest and _last_request_digest[0] == model:
+        prev_digests = _last_request_digest[1]
+        common = 0
+        for a, b in zip(prev_digests, digest):
+            if a == b:
+                common += 1
+            else:
+                break
+        if common == len(digest) == len(prev_digests):
+            print("🔍 与上次请求逐条一致（无新增）", flush=True)
+        elif common == len(prev_digests):
+            print(
+                f"🔍 与上次请求比较: 前缀一致 {common}/{len(digest)} 条，"
+                f"仅尾部新增 {len(digest) - common} 条 —— 缓存应命中全部历史",
+                flush=True,
+            )
+        else:
+            changed = digest[common]
+            prev_changed = prev_digests[common] if common < len(prev_digests) else ("-", "-")
+            tail_note = "（注意：末条 user 消息总是不同，属正常）" if common == len(digest) - 1 else ""
+            print(
+                f"🔍 与上次请求比较: 前缀一致 {common}/{len(digest)} 条，"
+                f"第{common}条起不同 —— 此处之后缓存全部失效{tail_note}",
+                flush=True,
+            )
+            print(
+                f"🔍 分歧消息: role={changed[0]} 本次={changed[1]} vs 上次={prev_changed[1]}",
+                flush=True,
+            )
+    _last_request_digest = (model, digest)
+
+
+def _usage_cache_hit(usage: dict) -> int:
+    """从上游 usage 里读取缓存命中 token 数（DeepSeek / Anthropic 两种字段）"""
+    if not usage:
+        return 0
+    return (
+        usage.get("prompt_cache_hit_tokens", 0)
+        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        or 0
     )
 
 
@@ -1711,6 +1811,10 @@ async def _chat_completions_inner(request: Request):
             },
         )
 
+    # ---------- 请求调试转储（排查缓存命中率） ----------
+    # 打印最终发给上游的逐条消息摘要；前缀对比默认开启，直接指出缓存断点。
+    dump_request_debug(model, body.get("messages", []))
+
     # ---------- 转发请求 ----------
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -1760,6 +1864,16 @@ async def _chat_completions_inner(request: Request):
             
             if response.status_code == 200:
                 resp_data = response.json()
+                usage = resp_data.get("usage") or {}
+                if usage.get("total_tokens"):
+                    pt = usage.get("prompt_tokens", 0)
+                    hit = _usage_cache_hit(usage)
+                    print(
+                        f"📊 Token: {pt} + {usage.get('completion_tokens', 0)}"
+                        f" = {usage.get('total_tokens', 0)}"
+                        + (f"（缓存命中 {hit} / {pt} = {hit / pt * 100:.1f}%）" if pt and hit else ""),
+                        flush=True,
+                    )
                 assistant_msg = ""
                 assistant_tool_calls = None
                 assistant_reasoning = None
@@ -1984,9 +2098,14 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
         pt = stream_usage.get("prompt_tokens", 0)
         ct = stream_usage.get("completion_tokens", 0)
         tt = stream_usage.get("total_tokens", 0)
+        hit = _usage_cache_hit(stream_usage)
         if tt > 0 and not skip_conversation_log:
             asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
-            print(f"📊 Stream Token: {pt} + {ct} = {tt}")
+            print(
+                f"📊 Stream Token: {pt} + {ct} = {tt}"
+                + (f"（缓存命中 {hit} / {pt} = {hit / pt * 100:.1f}%）" if pt and hit else ""),
+                flush=True,
+            )
     
     tool_messages = [message for message in current_block if message.get("role") == "tool"]
     if MEMORY_ENABLED and (user_message or tool_messages):
