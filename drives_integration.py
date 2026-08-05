@@ -2,7 +2,8 @@
 Drivesoid 情感引擎集成
 =====================
 环境变量 DRIVESOID_URL 配置后自动启用。
-转发前读 /api/drives/context 注入 system prompt，
+转发前读 /api/drives/context 注入当前 user 消息（不注入 system：
+情绪每轮都变，注入 system 会让整段前缀缓存失效、历史全部不命中），
 回复后发 msg_user + msg_assistant 事件驱动 16 维变化。
 """
 
@@ -39,25 +40,27 @@ async def fetch_context() -> str | None:
 
 
 def inject(messages: list, drives_text: str) -> bool:
-    """注入到 system prompt 末尾，支持 str 和多模态 list 格式"""
+    """
+    注入到"最后一条且是 user"的消息末尾（与时间/记忆注入同位置）。
+    只动本轮真实输入消息：它本来就不进缓存前缀，情绪每轮变化也不影响历史命中。
+    绝不改历史消息或 system —— 那会让整段前缀失效。
+    工具链请求（末尾是 tool 结果）没有当前 user 消息，本次跳过注入。
+    """
     if not drives_text:
         return False
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                msg["content"] = content + f"\n\n{drives_text}"
-            elif isinstance(content, list):
-                for block in reversed(content):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        block["text"] = block.get("text", "") + f"\n\n{drives_text}"
-                        break
-            print("💓 [Drivesoid] 情感状态已注入 system prompt")
+    if messages and messages[-1].get("role") == "user":
+        content = messages[-1].get("content", "")
+        if isinstance(content, str):
+            messages[-1]["content"] = content + f"\n\n{drives_text}"
+            print("💓 [Drivesoid] 情感状态已注入当前 user 消息")
             return True
-    if messages:
-        messages.insert(0, {"role": "system", "content": drives_text})
-        print("💓 [Drivesoid] 情感状态已注入 system prompt")
-        return True
+        if isinstance(content, list):
+            for block in reversed(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    block["text"] = block.get("text", "") + f"\n\n{drives_text}"
+                    print("💓 [Drivesoid] 情感状态已注入当前 user 消息")
+                    return True
+    print("💓 [Drivesoid] 无当前 user 消息（工具链请求），本次跳过情感注入")
     return False
 
 
