@@ -2060,6 +2060,45 @@ async def merge_sessions_to_target(source_ids: list, target_id: str) -> dict:
             }
 
 
+async def copy_tail_messages(source_session_id: str, target_session_id: str, n: int) -> int:
+    """把源会话最后 n 条可用消息复制到目标会话（时间正序，保留 created_at）。
+
+    只复制 user/assistant 且内容非空的"可用"消息（过滤 tool/system 和空 assistant），
+    避免把工具链残留带进新会话。目标会话必须是空会话，否则提取基线已建立，
+    复制消息会被当成新历史重复提取。
+    """
+    if n <= 0:
+        return 0
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """
+                SELECT id FROM conversations
+                WHERE session_id = $1
+                  AND role IN ('user', 'assistant')
+                  AND NOT (role = 'assistant' AND (content IS NULL OR trim(content) = ''))
+                ORDER BY id DESC
+                LIMIT $2
+                """,
+                source_session_id, n,
+            )
+            ids = [r['id'] for r in reversed(rows)]  # 时间正序
+            if not ids:
+                return 0
+            await conn.execute(
+                """
+                INSERT INTO conversations (session_id, role, content, model, metadata, created_at)
+                SELECT $1, role, content, model, metadata, created_at
+                FROM conversations
+                WHERE id = ANY($2::int[])
+                ORDER BY id ASC
+                """,
+                target_session_id, ids,
+            )
+            return len(ids)
+
+
 async def list_all_session_cache_states() -> list:
     pool = await get_pool()
     async with pool.acquire() as conn:

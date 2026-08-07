@@ -2346,34 +2346,45 @@ function updateCopyFromSelect(threads) {
     // 保留第一个option
     sel.innerHTML = '<option value="">不继承，从零开始</option>';
     for (const t of threads) {
-        if (t.summary_length > 0) {
-            sel.innerHTML += `<option value="${t.session_id}">${t.session_id} (${t.summary_length}字)</option>`;
-        }
+        const hasSummary = (t.summary_length || 0) > 0;
+        const hasMessages = (t.message_count || 0) > 0;
+        if (!hasSummary && !hasMessages) continue;
+        const meta = [];
+        if (hasMessages) meta.push(`${t.message_count}条消息`);
+        if (hasSummary) meta.push(`${t.summary_length}字摘要`);
+        sel.innerHTML += `<option value="${t.session_id}">${t.session_id} (${meta.join(' / ')})</option>`;
     }
 }
 
 async function createThread() {
     const newId = document.getElementById('new-thread-id').value.trim();
     const copyFrom = document.getElementById('new-thread-copy-from').value;
+    const tailCountEl = document.getElementById('new-thread-tail-count');
+    const tailCount = tailCountEl ? parseInt(tailCountEl.value || '0', 10) || 0 : 0;
     const msgEl = document.getElementById('thread-create-msg');
-    
+
     if (!newId) {
         msgEl.innerHTML = '<div style="color: var(--danger);">请输入对话线ID</div>';
         return;
     }
-    
+
     try {
         const resp = await fetch('/api/partition/thread', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: newId, copy_summary_from: copyFrom })
+            body: JSON.stringify({
+                session_id: newId,
+                copy_summary_from: copyFrom,
+                copy_tail_from: copyFrom,
+                tail_count: tailCount
+            })
         });
         const data = await resp.json();
         if (data.error) {
             msgEl.innerHTML = `<div style="color: var(--danger);">${data.error}</div>`;
             return;
         }
-        
+
         const switchResp = await fetch('/api/partition/switch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2386,7 +2397,10 @@ async function createThread() {
             return;
         }
 
-        msgEl.innerHTML = `<div style="color: var(--success);">✅ 创建并切换成功${data.summary_length > 0 ? '（继承了' + data.summary_length + '字摘要）' : ''}</div>`;
+        const inherits = [];
+        if (data.summary_length > 0) inherits.push(`继承了 ${data.summary_length} 字摘要`);
+        if (data.tail_copied > 0) inherits.push(`继承了 ${data.tail_copied} 条消息`);
+        msgEl.innerHTML = `<div style="color: var(--success);">✅ 创建并切换成功${inherits.length ? '（' + inherits.join('、') + '）' : ''}</div>`;
         document.getElementById('new-thread-id').value = '';
         loadThreads();
     } catch(e) {

@@ -27,7 +27,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
@@ -2537,7 +2537,7 @@ CONSOLIDATION_PROMPT = """
 3. 用我的第一人称自然讲述：“我”是栖，“她”是晏晏；不能写“用户表示”“系统记录”“经讨论决定”。保留不可替代的重要原话，并注明是谁说的。
 4. 事件和互动中的情绪必须来自碎片证据，在content里自然体现，不编造感受、动机、结果或关系变化。
 5. title不超过13个汉字，content不超过200个汉字。写不下时，只能拆成证据互不重复且各自完整的子事件；不能完整拆分就保留碎片，不截断故事。
-6. 不是所有碎片都要整理。孤立碎片只有自身已构成完整且值得长期记住的事件时才单独生成；信息不足或琐碎无意义的碎片保留原状，不放入merged_ids。
+6. 不是所有碎片都要整理。须本身完整、是里程碑式的时刻且足以长期存在；普通孤立碎片保留原状，不放入merged_ids。
 7. content必须自然写出完整日期，如“2026年7月25日”。跨天事件写清日期范围。event_date填写事件发生或计划发生的主日期（YYYY-MM-DD）；正文有明确日期时以正文为准，否则使用碎片生成日期。保留上午、晚上、计划、可能、取消等原有精度和状态。
 8. importance使用1～10：8～10为影响关系、重要决定或重要第一次；4～7为有意义的日常；1～3为仍有回看价值的小事。merged_ids只包含该事件真正使用的碎片ID，不得重复用于其他事件。
 
@@ -2677,35 +2677,6 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 except ValueError:
                     return {"status": "error", "error": "JSON解析失败（AI修复也失败）", "raw": content[:500]}
 
-            empty_retry_used = False
-            if not events:
-                empty_retry_used = True
-                retry_resp = await client.post(
-                    get_memory_api_base_url(),
-                    headers={
-                        "Authorization": f"Bearer {get_memory_api_key()}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": consolidation_model,
-                        "messages": [{
-                            "role": "user",
-                            "content": prompt + "\n\n上一次返回了空数组。请重新审视是否存在能组成完整经历、变化过程或重要互动的碎片组；若存在，就生成少量完整而有温度的事件。孤立碎片只有自身构成完整且值得长期记住的事件时才单独生成，不要为了覆盖率制造琐碎事件。"
-                        }],
-                        "temperature": 0.2,
-                    }
-                )
-                if retry_resp.status_code == 200:
-                    retry_message = retry_resp.json().get("choices", [{}])[0].get("message", {})
-                    retry_content = retry_message.get("content") or retry_message.get("reasoning_content") or ""
-                    try:
-                        retry_events = parse_json_array(retry_content)
-                        if retry_events:
-                            events = retry_events
-                            content = retry_content
-                    except ValueError:
-                        pass
-            
             # 创建事件记忆并停用碎片
             created_count = 0
             skipped_invalid_ids = 0
@@ -2763,7 +2734,6 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 "events_returned": len(events),
                 "events_skipped_invalid_ids": skipped_invalid_ids,
                 "events_skipped_empty_content": skipped_empty_content,
-                "empty_retry_used": empty_retry_used,
                 "events_created": created_count
             }
             
@@ -3277,6 +3247,12 @@ async def api_create_thread(request: Request):
         body = await request.json()
         new_id = body.get("session_id", "").strip()
         copy_from = body.get("copy_summary_from", "")
+        copy_tail_from = body.get("copy_tail_from", "").strip() or copy_from
+        try:
+            tail_count = int(body.get("tail_count", 0) or 0)
+        except (TypeError, ValueError):
+            tail_count = 0
+        tail_count = max(0, min(tail_count, 200))
         if not new_id:
             return {"error": "session_id 不能为空"}
         existing = await get_session_cache_state(new_id)
@@ -3286,9 +3262,21 @@ async def api_create_thread(request: Request):
         if copy_from:
             source = await get_session_cache_state(copy_from)
             summary_parts = source.get('summary_parts', [])
+        tail_copied = 0
+        if tail_count > 0:
+            if not copy_tail_from:
+                return {"error": "继承消息需要指定来源对话线"}
+            if copy_tail_from == new_id:
+                return {"error": "不能从自身继承消息"}
+            # 目标必须是空会话：提取基线在首条真实消息写入前建立，
+            # 若已有消息，复制尾部会被当成新历史重复提取。
+            existing_msgs = await get_conversation_messages(new_id, limit=1)
+            if existing_msgs:
+                return {"error": "目标对话线已有消息，不能继承尾部消息"}
+            tail_copied = await copy_tail_messages(copy_tail_from, new_id, tail_count)
         await save_session_cache_state(new_id, summary_parts, 0)
         total_len = sum(len(p) for p in summary_parts)
-        return {"status": "ok", "session_id": new_id, "summary_length": total_len}
+        return {"status": "ok", "session_id": new_id, "summary_length": total_len, "tail_copied": tail_copied}
     except Exception as e:
         return {"error": str(e)}
 
