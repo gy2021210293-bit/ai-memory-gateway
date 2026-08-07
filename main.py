@@ -3274,6 +3274,10 @@ async def api_create_thread(request: Request):
             if existing_msgs:
                 return {"error": "目标对话线已有消息，不能继承尾部消息"}
             tail_copied = await copy_tail_messages(copy_tail_from, new_id, tail_count)
+            print(
+                f"[thread] 继承尾部: source={copy_tail_from!r} target={new_id!r} "
+                f"request={tail_count} copied={tail_copied}"
+            )
         await save_session_cache_state(new_id, summary_parts, 0)
         total_len = sum(len(p) for p in summary_parts)
         return {"status": "ok", "session_id": new_id, "summary_length": total_len, "tail_copied": tail_copied}

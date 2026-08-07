@@ -2103,13 +2103,25 @@ async def list_all_session_cache_states() -> list:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT scs.session_id, scs.summary, scs.a_start_round, scs.updated_at,
+            SELECT base.session_id,
+                   scs.summary, scs.a_start_round, scs.updated_at,
                    COALESCE(c.message_count, 0) as message_count,
                    COALESCE(tu.chat_tokens, 0) as chat_tokens
-            FROM session_cache_state scs
-            LEFT JOIN (SELECT session_id, COUNT(*) as message_count FROM conversations GROUP BY session_id) c ON scs.session_id = c.session_id
-            LEFT JOIN (SELECT session_id, SUM(total_tokens) as chat_tokens FROM token_usage WHERE usage_type = 'chat' GROUP BY session_id) tu ON scs.session_id = tu.session_id
-            ORDER BY scs.updated_at DESC
+            FROM (
+                SELECT session_id FROM session_cache_state
+                UNION
+                SELECT session_id FROM conversations
+            ) base
+            LEFT JOIN session_cache_state scs ON scs.session_id = base.session_id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) as message_count
+                FROM conversations GROUP BY session_id
+            ) c ON c.session_id = base.session_id
+            LEFT JOIN (
+                SELECT session_id, SUM(total_tokens) as chat_tokens
+                FROM token_usage WHERE usage_type = 'chat' GROUP BY session_id
+            ) tu ON tu.session_id = base.session_id
+            ORDER BY scs.updated_at DESC NULLS LAST, base.session_id
         """)
         results = []
         for r in rows:
