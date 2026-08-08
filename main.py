@@ -1540,6 +1540,12 @@ async def _chat_completions_inner(request: Request):
     if not session_id:
         session_id = str(uuid.uuid4())[:8]
 
+    drives_user_message_id = ""
+    drives_run_id = ""
+    if drives.is_enabled() and user_message and not skip_conversation_log:
+        drives_user_message_id = f"gateway-{uuid.uuid4()}"
+        drives_run_id = f"{drives_user_message_id}:assistant"
+
     system_task = asyncio.create_task(get_system_prompt())
     drives_task = (
         asyncio.create_task(drives.fetch_context())
@@ -1854,6 +1860,7 @@ async def _chat_completions_inner(request: Request):
             safe_stream_and_capture(
                 headers, body, session_id, user_message, model,
                 skip_conversation_log, persistence_block,
+                drives_user_message_id, drives_run_id,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -1906,7 +1913,12 @@ async def _chat_completions_inner(request: Request):
 
                 # ---------- Drivesoid 情感引擎：回复后上报事件 ----------
                 if drives.is_enabled() and user_message and not skip_conversation_log:
-                    asyncio.create_task(drives.report_events(user_message, assistant_msg))
+                    asyncio.create_task(drives.report_events(
+                        user_message,
+                        assistant_msg,
+                        user_message_id=drives_user_message_id,
+                        run_id=drives_run_id,
+                    ))
 
                 return JSONResponse(status_code=200, content=resp_data)
             else:
@@ -1983,7 +1995,7 @@ async def safe_stream_and_capture(*args, **kwargs):
         yield _upstream_stream_error_event(exc)
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = ()):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = (), drives_user_message_id: str = "", drives_run_id: str = ""):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
     full_reasoning = []
@@ -2125,7 +2137,12 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
 
     # ---------- Drivesoid 情感引擎：流式回复后上报事件 ----------
     if drives.is_enabled() and user_message and not skip_conversation_log:
-        asyncio.create_task(drives.report_events(user_message, assistant_msg))
+        asyncio.create_task(drives.report_events(
+            user_message,
+            assistant_msg,
+            user_message_id=drives_user_message_id,
+            run_id=drives_run_id,
+        ))
 
 
 # ============================================================

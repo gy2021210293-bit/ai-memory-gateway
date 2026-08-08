@@ -64,34 +64,62 @@ def inject(messages: list, drives_text: str) -> bool:
     return False
 
 
-async def report_events(user_msg: str, assistant_msg: str):
-    """上报 msg_user（触发 LLM 分类）+ msg_assistant（启动等待计时器）"""
+async def report_events(
+    user_msg: str,
+    assistant_msg: str,
+    *,
+    user_message_id: str,
+    run_id: str,
+):
+    """上报一轮已完成的用户/助手事件，并保留二者的稳定关联。"""
     if not DRIVESOID_URL:
+        return
+    if not user_msg or not user_message_id or not run_id:
+        print("[Drivesoid] 跳过事件上报：缺少用户文本或稳定事件 ID")
         return
     h = {"Content-Type": "application/json", **_headers()}
     async with httpx.AsyncClient(timeout=10) as c:
-        if user_msg:
-            try:
-                r = await c.post(
-                    f"{DRIVESOID_URL}/internal/drives/event",
-                    json={"type": "msg_user", "payload": {"text": user_msg[:1000]}},
-                    headers=h,
-                )
-                if r.status_code == 200:
-                    print("💓 [Drivesoid] msg_user 已上报")
-                else:
-                    print(f"⚠️  [Drivesoid] msg_user HTTP {r.status_code}: {r.text[:200]}")
-            except Exception as e:
-                print(f"⚠️  [Drivesoid] msg_user 上报失败: {e}")
         try:
             r = await c.post(
                 f"{DRIVESOID_URL}/internal/drives/event",
-                json={"type": "msg_assistant", "payload": {}},
+                json={
+                    "type": "msg_user",
+                    "payload": {
+                        "message_id": user_message_id,
+                        "text": user_msg[:1000],
+                    },
+                },
                 headers=h,
             )
             if r.status_code == 200:
-                print("💓 [Drivesoid] msg_assistant 已上报")
+                print("[Drivesoid] msg_user 已上报（带稳定 ID）")
             else:
-                print(f"⚠️  [Drivesoid] msg_assistant HTTP {r.status_code}: {r.text[:200]}")
+                print(f"[Drivesoid] msg_user HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
-            print(f"⚠️  [Drivesoid] msg_assistant 上报失败: {e}")
+            print(f"[Drivesoid] msg_user 上报失败: {e}")
+
+        if not assistant_msg:
+            print("[Drivesoid] 本轮没有助手最终文本，跳过 msg_assistant")
+            return
+
+        try:
+            r = await c.post(
+                f"{DRIVESOID_URL}/internal/drives/event",
+                json={
+                    "type": "msg_assistant",
+                    "payload": {
+                        "message_id": run_id,
+                        "run_id": run_id,
+                        "source_user_message_id": user_message_id,
+                        "complete": True,
+                        "text": assistant_msg,
+                    },
+                },
+                headers=h,
+            )
+            if r.status_code == 200:
+                print("[Drivesoid] msg_assistant 已上报（带最终文本和关联 ID）")
+            else:
+                print(f"[Drivesoid] msg_assistant HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"[Drivesoid] msg_assistant 上报失败: {e}")
