@@ -124,7 +124,13 @@ FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
 
 # 下游 SSE 心跳间隔（秒）。Zeabur 等边缘代理会对"首字节前静默"和"无数据空闲"超时并回 502，
 # 心跳间隔必须短于边缘 idle 超时。环境变量 STREAM_HEARTBEAT_INTERVAL 可覆盖（默认 5 秒）。
-STREAM_HEARTBEAT_INTERVAL = float(os.getenv("STREAM_HEARTBEAT_INTERVAL", "5"))
+try:
+    # 环境变量必须是非空正数；非法或非正数值回退到 5 秒，避免启动时崩溃。
+    STREAM_HEARTBEAT_INTERVAL = float(os.getenv("STREAM_HEARTBEAT_INTERVAL", "5"))
+    if STREAM_HEARTBEAT_INTERVAL <= 0:
+        STREAM_HEARTBEAT_INTERVAL = 5.0
+except (TypeError, ValueError):
+    STREAM_HEARTBEAT_INTERVAL = 5.0
 
 # 推理/思维链参数（部分客户端走网关时不会自动添加reasoning参数，导致上游不返回thinking数据）
 # 设为 low/medium/high 会在转发请求时注入 reasoning_effort 参数
