@@ -122,6 +122,10 @@ TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 # 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
 
+# 下游 SSE 心跳间隔（秒）。Zeabur 等边缘代理会对"首字节前静默"和"无数据空闲"超时并回 502，
+# 心跳间隔必须短于边缘 idle 超时。环境变量 STREAM_HEARTBEAT_INTERVAL 可覆盖（默认 5 秒）。
+STREAM_HEARTBEAT_INTERVAL = float(os.getenv("STREAM_HEARTBEAT_INTERVAL", "5"))
+
 # 推理/思维链参数（部分客户端走网关时不会自动添加reasoning参数，导致上游不返回thinking数据）
 # 设为 low/medium/high 会在转发请求时注入 reasoning_effort 参数
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
@@ -1929,7 +1933,7 @@ async def _chat_completions_inner(request: Request):
                 return JSONResponse(status_code=response.status_code, content=error_content)
 
 
-async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = 15.0):
+async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = STREAM_HEARTBEAT_INTERVAL):
     """Yield upstream bytes and SSE comments while the upstream is silent."""
     iterator = response.aiter_bytes().__aiter__()
     pending_chunk = None
@@ -1965,6 +1969,32 @@ def _upstream_stream_error_event(exc: Exception) -> bytes:
         "error": {
             "message": f"Upstream stream interrupted: {type(exc).__name__}",
             "type": "upstream_stream_error",
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+def _upstream_http_error_event(status_code: int, raw_body: str) -> bytes:
+    """将上游非200响应（如纯文本 "Bad Gateway"）转换为 OpenAI 兼容的 SSE 错误事件。
+
+    直接透传原文会导致客户端把 "Bad Gateway" 当 JSON 解析而崩溃。
+    若上游返回的是合法 OpenAI 风格 JSON 错误，则复用其 message/type。
+    """
+    message = raw_body or f"Upstream returned HTTP {status_code}"
+    error_type = "upstream_http_error"
+    if raw_body:
+        try:
+            parsed = json.loads(raw_body)
+            err = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+            if isinstance(err, dict):
+                message = err.get("message") or message
+                error_type = err.get("type") or error_type
+        except (ValueError, TypeError):
+            pass
+    error_payload = {
+        "error": {
+            "message": f"HTTP {status_code}: {message}",
+            "type": error_type,
         }
     }
     return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
@@ -2006,7 +2036,42 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
+        # 立即发一个初始心跳，让边缘代理在 SSE 建立瞬间就看到活动字节；
+        # 随后在建立上游连接（可能耗时数秒到数十秒，如 opencode 冷启动）期间
+        # 持续发心跳，避免"首字节前静默"被 Zeabur 等边缘代理判定为超时而回 502。
+        yield b": keep-alive\n\n"
+        request = client.build_request("POST", API_BASE_URL, headers=headers, json=body)
+        connect_task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            while not connect_task.done():
+                try:
+                    done, _ = await asyncio.wait(
+                        {connect_task}, timeout=STREAM_HEARTBEAT_INTERVAL
+                    )
+                except asyncio.CancelledError:
+                    connect_task.cancel()
+                    raise
+                if not done:
+                    yield b": keep-alive\n\n"
+            response = connect_task.result()
+        except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+            print(
+                f"❌ 上游连接失败: session={session_id}, "
+                f"type={type(exc).__name__}, detail={exc}",
+                flush=True,
+            )
+            yield _upstream_stream_error_event(exc)
+            return
+        except httpx.HTTPError as exc:
+            print(
+                f"❌ 上游HTTP异常: session={session_id}, "
+                f"type={type(exc).__name__}, detail={exc}",
+                flush=True,
+            )
+            yield _upstream_stream_error_event(exc)
+            return
+
+        try:
             # 打印上游响应头（排查thinking问题用）
             upstream_ct = response.headers.get("content-type", "")
             print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
@@ -2018,8 +2083,24 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             
             error_body_parts = []
             is_error = response.status_code != 200
-            
+            upstream_status = response.status_code
+
             async for chunk, is_heartbeat, chunk_error in _iterate_upstream_with_heartbeat(response):
+                if is_error:
+                    # 上游非200：不把 "Bad Gateway" 等纯文本错误正文原样透传给客户端
+                    # （客户端按 JSON/SSE 解析会崩溃），先缓冲完整正文，流结束后统一转
+                    # 成 OpenAI 兼容的 SSE error 事件。
+                    if chunk_error is not None:
+                        stream_error = chunk_error
+                        print(
+                            f"❌ 上游错误流中断: session={session_id}, "
+                            f"type={type(chunk_error).__name__}, detail={chunk_error}",
+                            flush=True,
+                        )
+                    if not is_heartbeat:
+                        error_body_parts.append(chunk)
+                    continue
+
                 # 原始字节直接透传给客户端
                 yield chunk
 
@@ -2033,10 +2114,6 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         f"type={type(chunk_error).__name__}, detail={chunk_error}",
                         flush=True,
                     )
-                    continue
-                
-                if is_error:
-                    error_body_parts.append(chunk)
                     continue
                 
                 # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
@@ -2083,7 +2160,16 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                             accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
                         except (json.JSONDecodeError, KeyError, IndexError):
                             pass
-    
+        finally:
+            await response.aclose()
+
+    # ---------- 上游非200：以结构化 SSE error 事件返回，绝不透传纯文本 ----------
+    if is_error:
+        raw = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
+        print(f"❌ 上游HTTP错误: status={upstream_status}, body={raw!r}", flush=True)
+        yield _upstream_http_error_event(upstream_status, raw)
+        return
+
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
