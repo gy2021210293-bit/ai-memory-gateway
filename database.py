@@ -10,6 +10,8 @@
 import os
 import re
 import json
+import unicodedata
+import difflib
 from typing import Optional, List
 from datetime import date, datetime, timedelta, timezone as dt_timezone
 
@@ -2763,8 +2765,74 @@ async def revert_merge(memory_id: int):
 # ============================================================
 
 def normalize_entity_name(name: str) -> str:
-    """Generate the canonical lookup key without changing the display name."""
-    return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
+    """Generate the canonical lookup key without changing the display name.
+
+    NFKC folds full-width forms to half-width (Ａｌｉｃｅ -> Alice), then lowercases
+    and collapses whitespace. Changing this affects the entities.normalized_name
+    UNIQUE key, so keep it conservative.
+    """
+    value = unicodedata.normalize("NFKC", str(name or "").strip())
+    return re.sub(r"\s+", " ", value).casefold()
+
+
+# 称呼后缀：仅在余下部分长度 >=2 时才剥离（避免「王老师」->「王」这种单字误并）
+HONORIFIC_SUFFIXES = ("同学", "先生", "女士", "老师", "师傅", "教授")
+
+# 括号注释：`(...)` / `（...）` 视为对实体名的补充说明，匹配时剥离
+_BRACKET_ANNOTATION_RE = re.compile(r"[\(（][^\)）]*[\)）]")
+
+
+def canonicalize_entity_surface(name: str) -> str:
+    """Aggressive matching form of an entity surface, used only for identity
+    matching (never stored as the UNIQUE lookup key).
+
+    Strips bracketed annotations like "Alice (朋友)" and CJK honorific
+    suffixes like "小明同学" -> "小明", but only when the remainder is still
+    >= 2 characters to avoid collapsing single-character names.
+    """
+    value = normalize_entity_name(name)
+    value = _BRACKET_ANNOTATION_RE.sub("", value)
+    for suffix in HONORIFIC_SUFFIXES:
+        if value.endswith(suffix) and len(value) - len(suffix) >= 2:
+            value = value[: -len(suffix)]
+            break
+    return re.sub(r"\s+", " ", value).strip()
+
+
+_HAS_CJK_RE = re.compile(r"[　-鿿]")
+
+
+def _entity_bigrams(text: str) -> set:
+    chars = list(text)
+    if not chars:
+        return set()
+    if len(chars) == 1:
+        return {chars[0]}
+    return {chars[i] + chars[i + 1] for i in range(len(chars) - 1)}
+
+
+def _entity_similarity(a: str, b: str) -> float:
+    """0..1 similarity between two already-normalized surfaces.
+
+    CJK surfaces are compared by character-bigram Jaccard; latin surfaces by
+    difflib ratio (approximates Levenshtein ratio).
+    """
+    if not a or not b:
+        return 0.0
+    if _HAS_CJK_RE.search(a) or _HAS_CJK_RE.search(b):
+        left, right = _entity_bigrams(a), _entity_bigrams(b)
+        union = left | right
+        return len(left & right) / len(union) if union else 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _entity_similar_enough(a: str, b: str) -> bool:
+    """High-confidence threshold used for auto-aliasing (CJK vs latin differ)."""
+    if not a or not b:
+        return False
+    if _HAS_CJK_RE.search(a) or _HAS_CJK_RE.search(b):
+        return _entity_similarity(a, b) >= 0.8
+    return _entity_similarity(a, b) >= 0.92
 
 
 ENTITY_TYPES = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}
@@ -2833,14 +2901,106 @@ def is_excluded_entity_name(name: str) -> bool:
     return normalize_entity_name(name) in EXCLUDED_ENTITY_NAMES
 
 
+async def _load_entity_guard(conn):
+    """Load the full entity identity map for fuzzy matching and the alias guard.
+
+    entity_aliases.normalized_alias has no cross-table constraint against
+    entities.normalized_name, so the guard that an alias must not equal another
+    entity's name or alias is enforced here in memory.
+    """
+    roster = await conn.fetch(
+        "SELECT id, name, normalized_name, entity_type FROM entities"
+    )
+    alias_rows = await conn.fetch(
+        "SELECT entity_id, normalized_alias FROM entity_aliases"
+    )
+    alias_map = {}
+    for alias_row in alias_rows:
+        alias_map.setdefault(alias_row["normalized_alias"], alias_row["entity_id"])
+    return roster, alias_map
+
+
+def _fuzzy_match_entity(canonical: str, entity_type: str, roster: list):
+    """Find an existing entity that is the same identity as a new surface form.
+
+    Returns the matched row or None. Canonical-surface equality may bridge the
+    'other' type; high-similarity requires the same entity_type. Short canonical
+    forms (< 2 chars) never match, to avoid collapsing single-character names.
+    """
+    if len(canonical) < 2:
+        return None
+    best = None
+    best_sim = 0.0
+    for ent in roster:
+        ent_canonical = canonicalize_entity_surface(ent["normalized_name"])
+        if len(ent_canonical) < 2:
+            continue
+        same_type = ent["entity_type"] == entity_type
+        if canonical == ent_canonical:
+            if same_type or ent["entity_type"] == "other" or entity_type == "other":
+                return ent
+            continue
+        if not same_type:
+            continue
+        if _entity_similar_enough(canonical, ent_canonical):
+            sim = _entity_similarity(canonical, ent_canonical)
+            if sim > best_sim:
+                best_sim = sim
+                best = ent
+    return best
+
+
+def _clean_alias_entries(raw_aliases, own_normalized, own_entity_id, roster, alias_map):
+    """Dedupe/sanitize alias candidates and apply the cross-entity guard.
+
+    Skips aliases whose normalized form equals another entity's normalized_name
+    or another entity's alias, excluded participant names, the entity's own name,
+    and over-long values. Caps the persisted set at ALIAS_MAX_COUNT.
+    """
+    other_names = {r["normalized_name"] for r in roster if r["id"] != own_entity_id}
+    other_aliases = set(alias_map)
+    results = []
+    seen = set()
+    for raw in raw_aliases:
+        alias = str(raw).strip()
+        alias_norm = normalize_entity_name(alias)
+        if not alias_norm or alias_norm in seen:
+            continue
+        if alias_norm == own_normalized or is_excluded_entity_name(alias):
+            continue
+        if len(alias) > ALIAS_MAX_CHARS:
+            continue
+        if alias_norm in other_names or alias_norm in other_aliases:
+            continue
+        results.append((alias, alias_norm))
+        seen.add(alias_norm)
+        if len(results) >= ALIAS_MAX_COUNT:
+            break
+    return results
+
+
+ALIAS_MAX_COUNT = 8
+ALIAS_MAX_CHARS = 40
+
+
 async def link_memory_entities(memory_id: int, entities: list, source: str = "extractor"):
-    """Upsert extracted entities and link them to one memory."""
+    """Upsert extracted entities and link them to one memory.
+
+    For each entity the canonical identity is resolved in order:
+      1. exact normalized_name match
+      2. existing alias match
+      3. canonical-surface / high-similarity fuzzy match -> the new surface form
+         is auto-added as a non-destructive alias of the matched entity
+      4. otherwise a new entity row is inserted (ON CONFLICT closes the race)
+    Evidence counting and source handling are unchanged.
+    """
     if not memory_id or not entities:
         return 0
     pool = await get_pool()
     linked = 0
     async with pool.acquire() as conn:
         async with conn.transaction():
+            guard = None  # lazily loaded: (roster_rows, alias_map)
             for item in entities:
                 if isinstance(item, str):
                     item = {"name": item, "type": "other"}
@@ -2849,25 +3009,80 @@ async def link_memory_entities(memory_id: int, entities: list, source: str = "ex
                 if not normalized or is_excluded_entity_name(name):
                     continue
                 entity_type = str(item.get("type", "other") or "other").strip().lower()
-                allowed_types = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}
-                if entity_type not in allowed_types:
+                if entity_type not in ENTITY_TYPES:
                     entity_type = "other"
                 try:
                     confidence = max(0.0, min(1.0, float(item.get("confidence", 1.0))))
                 except (TypeError, ValueError):
                     confidence = 1.0
-                row = await conn.fetchrow("""
-                    INSERT INTO entities (name, normalized_name, entity_type)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (normalized_name) DO UPDATE SET
-                        entity_type = CASE WHEN entities.entity_type = 'other' THEN EXCLUDED.entity_type ELSE entities.entity_type END,
-                        updated_at = NOW()
-                    RETURNING id
-                """, name, normalized, entity_type)
+
+                # ---- identity resolution ----
+                row = await conn.fetchrow(
+                    "SELECT id FROM entities WHERE normalized_name = $1", normalized
+                )
+                auto_alias = False
+                if row:
+                    entity_id = row["id"]
+                    entity_normalized = normalized
+                else:
+                    alias_row = await conn.fetchrow("""
+                        SELECT ea.entity_id, e.normalized_name
+                        FROM entity_aliases ea
+                        JOIN entities e ON e.id = ea.entity_id
+                        WHERE ea.normalized_alias = $1
+                    """, normalized)
+                    if alias_row:
+                        entity_id = alias_row["entity_id"]
+                        entity_normalized = alias_row["normalized_name"]
+                    else:
+                        if guard is None:
+                            guard = await _load_entity_guard(conn)
+                        roster, alias_map = guard
+                        matched = _fuzzy_match_entity(
+                            canonicalize_entity_surface(normalized), entity_type, roster
+                        )
+                        if matched is not None:
+                            entity_id = matched["id"]
+                            entity_normalized = matched["normalized_name"]
+                            auto_alias = True
+                        else:
+                            row = await conn.fetchrow("""
+                                INSERT INTO entities (name, normalized_name, entity_type)
+                                VALUES ($1, $2, $3)
+                                ON CONFLICT (normalized_name) DO UPDATE SET
+                                    entity_type = CASE WHEN entities.entity_type = 'other' THEN EXCLUDED.entity_type ELSE entities.entity_type END,
+                                    updated_at = NOW()
+                                RETURNING id
+                            """, name, normalized, entity_type)
+                            entity_id = row["id"]
+                            entity_normalized = normalized
+
+                # ---- persist aliases (LLM-supplied + auto-alias on fuzzy match) ----
+                raw_aliases = item.get("aliases", []) if isinstance(item, dict) else []
+                if isinstance(raw_aliases, str):
+                    raw_aliases = [raw_aliases]
+                else:
+                    raw_aliases = list(raw_aliases or [])
+                if auto_alias:
+                    raw_aliases.append(name)
+                if raw_aliases:
+                    if guard is None:
+                        guard = await _load_entity_guard(conn)
+                    roster, alias_map = guard
+                    alias_entries = _clean_alias_entries(
+                        raw_aliases, entity_normalized, entity_id, roster, alias_map
+                    )
+                    for alias, alias_norm in alias_entries:
+                        await conn.execute("""
+                            INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (normalized_alias) DO NOTHING
+                        """, entity_id, alias, alias_norm)
+
                 existing_source = await conn.fetchval("""
                     SELECT source FROM memory_entities
                     WHERE memory_id = $1 AND entity_id = $2
-                """, memory_id, row["id"])
+                """, memory_id, entity_id)
                 await conn.execute("""
                     INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
                     VALUES ($1, $2, $3, $4)
@@ -2878,13 +3093,13 @@ async def link_memory_entities(memory_id: int, entities: list, source: str = "ex
                             WHEN EXCLUDED.source = 'inherited' THEN memory_entities.source
                             ELSE EXCLUDED.source
                         END
-                """, memory_id, row["id"], confidence, source)
+                """, memory_id, entity_id, confidence, source)
                 if source != "inherited" and existing_source in {None, "inherited"}:
                     await conn.execute("""
                         UPDATE entities
                         SET evidence_count = evidence_count + 1, updated_at = NOW()
                         WHERE id = $1
-                    """, row["id"])
+                    """, entity_id)
                 linked += 1
     return linked
 
@@ -2937,6 +3152,136 @@ async def list_entities():
             item["name"].casefold(),
         ))
         return entities
+
+
+async def list_entity_roster(limit: int = 150):
+    """Lightweight entity roster for the extraction prompt (no profile payloads).
+
+    Active entities first, then by evidence_count desc.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.name, e.entity_type, e.evidence_count,
+                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+            FROM entities e
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            GROUP BY e.id
+            ORDER BY e.evidence_count DESC, e.name
+            LIMIT $1
+        """, max(1, int(limit)))
+    roster = [attach_entity_lifecycle(row) for row in rows]
+    roster.sort(key=lambda item: (
+        item["retrieval_status"] != "active",
+        -int(item.get("evidence_count") or 0),
+        item["name"].casefold(),
+    ))
+    return roster[:max(1, int(limit))]
+
+
+def _length_ratio_ok(a: str, b: str) -> bool:
+    short, long = sorted((len(a), len(b)))
+    return long >= 2 and short * 2 >= long
+
+
+def _pick_duplicate_group(members, reason):
+    """Pick the merge target (highest evidence) and shape one suggestion group."""
+    members = sorted(
+        members,
+        key=lambda m: (int(m.get("evidence_count") or 0), int(m.get("memory_count") or 0)),
+        reverse=True,
+    )
+    target_id = members[0]["id"]
+    return {
+        "reason": reason,
+        "entities": [
+            {
+                "id": m["id"],
+                "name": m["name"],
+                "entity_type": m["entity_type"],
+                "evidence_count": int(m.get("evidence_count") or 0),
+                "memory_count": int(m.get("memory_count") or 0),
+                "is_target": m["id"] == target_id,
+            }
+            for m in members
+        ],
+    }
+
+
+async def find_duplicate_entities():
+    """Read-only scan for likely-duplicate entities. Never writes.
+
+    Pass 1 groups entities whose canonical surface collapses to the same key
+    (e.g. "小明同学" / "小明（朋友）" / "小明"). Pass 2 pairs same-type entities
+    whose canonical surfaces share character bigrams and pass a high similarity
+    threshold. Each group carries a recommended merge target (highest evidence).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.name, e.normalized_name, e.entity_type, e.evidence_count,
+                   COUNT(DISTINCT me.memory_id)::int AS memory_count
+            FROM entities e
+            LEFT JOIN memory_entities me ON me.entity_id = e.id
+            GROUP BY e.id
+        """)
+
+    groups = []
+    seen_ids = set()
+
+    # ---- pass 1: canonical-surface equality groups ----
+    by_canonical = {}
+    for r in rows:
+        canonical = canonicalize_entity_surface(r["normalized_name"])
+        if len(canonical) < 2:
+            continue
+        by_canonical.setdefault((r["entity_type"], canonical), []).append(r)
+    for members in by_canonical.values():
+        if len(members) >= 2:
+            group = _pick_duplicate_group(members, "canonical")
+            groups.append(group)
+            seen_ids.update(m["id"] for m in group["entities"])
+
+    # ---- pass 2: high-similarity pairs within the same type ----
+    by_type = {}
+    for r in rows:
+        if r["id"] in seen_ids:
+            continue
+        canonical = canonicalize_entity_surface(r["normalized_name"])
+        if len(canonical) < 2:
+            continue
+        by_type.setdefault(r["entity_type"], []).append((r, canonical))
+
+    for items in by_type.values():
+        # bigram index so we only compare pairs that share at least one bigram
+        bigram_index = {}
+        for r, canonical in items:
+            for bigram in _entity_bigrams(canonical):
+                bigram_index.setdefault(bigram, []).append((r, canonical))
+        matched = set()
+        for r, canonical in items:
+            if r["id"] in matched:
+                continue
+            best = None
+            best_sim = 0.0
+            seen_partners = set()
+            for bigram in _entity_bigrams(canonical):
+                for other, other_canonical in bigram_index.get(bigram, []):
+                    if other["id"] == r["id"] or other["id"] in matched or other["id"] in seen_partners:
+                        continue
+                    seen_partners.add(other["id"])
+                    if not _length_ratio_ok(canonical, other_canonical):
+                        continue
+                    if _entity_similar_enough(canonical, other_canonical):
+                        sim = _entity_similarity(canonical, other_canonical)
+                        if sim > best_sim:
+                            best_sim = sim
+                            best = other
+            if best is not None:
+                group = _pick_duplicate_group([r, best], "similarity")
+                groups.append(group)
+                matched.update(m["id"] for m in group["entities"])
+    return groups
 
 
 async def get_entity_detail(entity_id: int):

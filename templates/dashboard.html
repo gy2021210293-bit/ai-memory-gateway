@@ -218,6 +218,18 @@
                 </div>
             </div>
 
+            <!-- 疑似重复实体弹窗 -->
+            <div id="duplicatesModal" class="modal" style="display:none;">
+                <div class="modal-content modal-wide">
+                    <h3>疑似重复实体</h3>
+                    <p class="hint">以下实体可能指向同一事物，请人工确认后合并。合并后源实体成为目标的别名，记忆与证据自动迁移。</p>
+                    <div id="duplicatesContent" style="margin-top:12px"></div>
+                    <div class="modal-actions">
+                        <button class="btn btn-secondary" onclick="closeDuplicatesModal()">关闭</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- 底部浮动操作栏 -->
             <div id="floatingBar" class="floating-bar" style="display:none;">
                 <span class="floating-count">已选 <b id="selectedCount">0</b> 条</span>
@@ -469,14 +481,21 @@
                 <div class="card toolbar-card">
                     <div class="toolbar">
                         <button class="btn btn-primary" onclick="backfillEntities()">回填旧记忆（最多30条）</button>
+                        <button class="btn btn-secondary" onclick="detectDuplicateEntities()">检测重复实体</button>
                         <span id="entity-status" class="section-desc"></span>
                     </div>
                 </div>
                 <div class="card">
                     <div class="toolbar">
-                        <select id="entity-source" class="input"><option value="">选择要合并的实体</option></select>
+                        <div class="combo-box" id="combo-entity-source" style="min-width:200px;flex:1">
+                            <input type="text" id="entity-source-input" class="combo-input" placeholder="搜索要合并的实体（名称/别名/类型）…" autocomplete="off">
+                            <div class="combo-dropdown" id="entity-source-dropdown"></div>
+                        </div>
                         <span>合并到</span>
-                        <select id="entity-target" class="input"><option value="">选择保留的实体</option></select>
+                        <div class="combo-box" id="combo-entity-target" style="min-width:200px;flex:1">
+                            <input type="text" id="entity-target-input" class="combo-input" placeholder="搜索要保留的实体（名称/别名/类型）…" autocomplete="off">
+                            <div class="combo-dropdown" id="entity-target-dropdown"></div>
+                        </div>
                         <button class="btn btn-secondary" onclick="mergeSelectedEntities()">合并实体</button>
                     </div>
                     <div id="entity-list" style="margin-top:16px"></div>

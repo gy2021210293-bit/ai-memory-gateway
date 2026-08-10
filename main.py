@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, get_entities_for_memory_ids, list_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
+from database import link_memory_entities, get_entities_for_memory_ids, list_entities, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -1379,7 +1379,19 @@ async def process_memories_background(
             f"-{extraction_claim['through_message_id']}）"
         )
 
-        new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
+        # 已有实体清单：让提取模型复用规范名，避免为同一事物新建重复实体。
+        # 拉取失败不阻塞提取，回退为 None（不带 roster 照常提取）。
+        try:
+            entity_roster = await list_entity_roster()
+        except Exception:
+            entity_roster = None
+            print("⚠️ 已有实体清单拉取失败，本次提取不带 roster")
+
+        new_memories = await extract_memories(
+            messages_for_extraction,
+            existing_memories=existing_contents,
+            existing_entities=entity_roster,
+        )
         if new_memories is None:
             await release_memory_extraction_claim(
                 session_id,
@@ -2341,6 +2353,12 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
 async def api_get_entities():
     """List entities with aliases and linked-memory counts."""
     return {"entities": await list_entities()}
+
+
+@app.get("/api/entities/duplicates")
+async def api_find_duplicate_entities():
+    """Suggest-only scan for likely-duplicate entities (never merges automatically)."""
+    return {"groups": await find_duplicate_entities()}
 
 
 @app.get("/api/cognitive-items")

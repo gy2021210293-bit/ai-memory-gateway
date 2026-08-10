@@ -75,17 +75,129 @@ async function loadEntities() {
     }
 }
 
+// ============================================
+// 实体合并下拉框（可搜索 combobox）
+// ============================================
+const ENTITY_COMBOS = ['source', 'target'];
+const entityComboState = { sourceId: null, targetId: null };
+
+function _entityComboEl(field, kind) {
+    return document.getElementById(`entity-${field}-${kind}`);
+}
+
+function _entityComboRenderOptions(field) {
+    const dropdown = _entityComboEl(field, 'dropdown');
+    const input = _entityComboEl(field, 'input');
+    if (!dropdown || !input) return;
+    const q = input.value.trim().toLowerCase();
+    const matches = allEntities.filter(entity => {
+        if (!q) return true;
+        const haystack = [entity.name, entity.entity_type, ...(entity.aliases || [])].join(' ').toLowerCase();
+        return haystack.includes(q);
+    }).slice(0, 100);
+    dropdown.innerHTML = '';
+    if (!matches.length) {
+        const empty = document.createElement('div');
+        empty.className = 'combo-option combo-empty';
+        empty.textContent = q ? '无匹配实体' : '还没有实体';
+        dropdown.appendChild(empty);
+        return;
+    }
+    matches.forEach(entity => {
+        const option = document.createElement('div');
+        option.className = 'combo-option';
+        option.dataset.id = entity.id;
+        const meta = `${entity.entity_type || 'other'} · ${entity.memory_count || 0}记忆`;
+        const aliasText = (entity.aliases && entity.aliases.length)
+            ? `别名：${entity.aliases.slice(0, 3).join('、')}`
+            : '';
+        option.innerHTML = `<strong>${escapeHtml(entity.name)}</strong>` +
+            ` <span class="combo-option-meta">${escapeHtml(meta)}</span>` +
+            (aliasText ? ` <span class="combo-option-alias">${escapeHtml(aliasText)}</span>` : '');
+        option.addEventListener('click', () => _entityComboSelectOption(field, option));
+        dropdown.appendChild(option);
+    });
+}
+
+function _entityComboSelectOption(field, option) {
+    const id = Number(option.dataset.id);
+    const entity = allEntities.find(item => item.id === id);
+    if (!entity) return;
+    _entityComboEl(field, 'input').value = entity.name;
+    _entityComboEl(field, 'dropdown').classList.remove('open');
+    entityComboState[field + 'Id'] = entity.id;
+}
+
+function _entityComboFilter(field) {
+    const input = _entityComboEl(field, 'input');
+    const dropdown = _entityComboEl(field, 'dropdown');
+    if (!input || !dropdown) return;
+    entityComboState[field + 'Id'] = null;  // 编辑输入即取消已选实体
+    _entityComboRenderOptions(field);
+    dropdown.classList.add('open');
+}
+
+function _entityComboKeydown(field, event) {
+    const dropdown = _entityComboEl(field, 'dropdown');
+    const options = [...(dropdown?.querySelectorAll('.combo-option:not(.combo-empty)') || [])];
+    if (!options.length) return;
+    const current = options.findIndex(option => option.classList.contains('is-active'));
+    let next = current;
+    if (event.key === 'ArrowDown') {
+        next = (current + 1) % options.length;
+        event.preventDefault();
+    } else if (event.key === 'ArrowUp') {
+        next = (current - 1 + options.length) % options.length;
+        event.preventDefault();
+    } else if (event.key === 'Enter') {
+        if (current >= 0) {
+            _entityComboSelectOption(field, options[current]);
+            event.preventDefault();
+        }
+        return;
+    } else if (event.key === 'Escape') {
+        dropdown.classList.remove('open');
+        return;
+    } else {
+        return;
+    }
+    options.forEach(option => option.classList.remove('is-active'));
+    options[next].classList.add('is-active');
+    options[next].scrollIntoView({ block: 'nearest' });
+}
+
+function initEntityCombos() {
+    ENTITY_COMBOS.forEach(field => {
+        const input = _entityComboEl(field, 'input');
+        const dropdown = _entityComboEl(field, 'dropdown');
+        if (!input || !dropdown) return;
+        input.addEventListener('focus', () => { _entityComboRenderOptions(field); dropdown.classList.add('open'); });
+        input.addEventListener('input', () => _entityComboFilter(field));
+        input.addEventListener('keydown', (event) => _entityComboKeydown(field, event));
+    });
+    // 点击外部收起
+    document.addEventListener('click', (event) => {
+        ENTITY_COMBOS.forEach(field => {
+            const box = document.getElementById('combo-entity-' + field);
+            const dropdown = _entityComboEl(field, 'dropdown');
+            if (box && dropdown && !box.contains(event.target)) dropdown.classList.remove('open');
+        });
+    });
+}
+document.addEventListener('DOMContentLoaded', initEntityCombos);
+
 function renderEntities() {
     const list = document.getElementById('entity-list');
-    const source = document.getElementById('entity-source');
-    const target = document.getElementById('entity-target');
     list.replaceChildren();
-    [source, target].forEach(select => {
-        const firstLabel = select === source ? '选择要合并的实体' : '选择保留的实体';
-        select.replaceChildren(Object.assign(document.createElement('option'), { value: '', textContent: firstLabel }));
-        allEntities.forEach(entity => select.appendChild(Object.assign(document.createElement('option'), {
-            value: String(entity.id), textContent: `${entity.name} (${entity.memory_count})`,
-        })));
+    // 刷新合并下拉：已选实体若已不存在（被合并/删除）则清空选择
+    ['source', 'target'].forEach(field => {
+        const selectedId = entityComboState[field + 'Id'];
+        if (selectedId && !allEntities.some(entity => entity.id === selectedId)) {
+            entityComboState[field + 'Id'] = null;
+            const input = _entityComboEl(field, 'input');
+            if (input) input.value = '';
+        }
+        _entityComboRenderOptions(field);
     });
     if (!allEntities.length) {
         list.textContent = '还没有实体。新对话会自动提取，也可以回填已有记忆。';
@@ -450,11 +562,11 @@ function cancelEntityProfileDraft() {
 }
 
 async function mergeSelectedEntities() {
-    const sourceId = Number(document.getElementById('entity-source').value);
-    const targetId = Number(document.getElementById('entity-target').value);
+    const sourceId = entityComboState.sourceId;
+    const targetId = entityComboState.targetId;
     const status = document.getElementById('entity-status');
     if (!sourceId || !targetId || sourceId === targetId) {
-        status.textContent = '请选择两个不同的实体。';
+        status.textContent = '请从下拉框选择两个不同的实体（输入框可搜索过滤）。';
         return;
     }
     if (!confirm('合并后，源实体会成为目标实体的别名。确定继续吗？')) return;
@@ -465,6 +577,80 @@ async function mergeSelectedEntities() {
     const data = await response.json();
     status.textContent = data.error || '实体已合并。';
     if (response.ok) loadEntities();
+}
+
+// ============================================
+// 疑似重复实体检测（只建议，人工确认后走 /api/entities/merge）
+// ============================================
+let _duplicateGroups = [];
+
+async function detectDuplicateEntities() {
+    const status = document.getElementById('entity-status');
+    if (status) status.textContent = '检测疑似重复实体中…';
+    let groups = [];
+    try {
+        const response = await fetch('/api/entities/duplicates');
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        groups = data.groups || [];
+    } catch (error) {
+        if (status) status.textContent = `重复检测失败：${error.message}`;
+        return;
+    }
+    _duplicateGroups = groups;
+    const content = document.getElementById('duplicatesContent');
+    if (!content) return;
+    if (!groups.length) {
+        content.innerHTML = '<p class="hint">未发现疑似重复实体。</p>';
+    } else {
+        content.innerHTML = groups.map((group, index) => renderDuplicateGroup(group, index)).join('');
+    }
+    document.getElementById('duplicatesModal').style.display = 'flex';
+}
+
+function renderDuplicateGroup(group, index) {
+    const target = group.entities.find(entity => entity.is_target) || group.entities[0];
+    const others = group.entities.filter(entity => entity.id !== target.id);
+    const reasonLabel = group.reason === 'canonical' ? '规范名相同' : '名称高度相似';
+    const listHtml = group.entities.map(entity => {
+        const mark = entity.is_target ? ' <span class="combo-option-meta">（保留目标）</span>' : '';
+        return `<div class="dup-entity">${escapeHtml(entity.name)}` +
+            ` <span class="combo-option-meta">${entity.entity_type || 'other'} · 证据${entity.evidence_count || 0} · ${entity.memory_count || 0}记忆</span>${mark}</div>`;
+    }).join('');
+    return `<div class="dup-group">
+        <div class="dup-group-head"><strong>组 ${index + 1}</strong>` +
+        ` <span class="combo-option-meta">${reasonLabel} · 合并到「${escapeHtml(target.name)}」</span></div>
+        ${listHtml}
+        <button class="btn btn-sm btn-primary" onclick="mergeDuplicateGroup(${index})">合并 ${others.length} 个到「${escapeHtml(target.name)}」</button>
+    </div>`;
+}
+
+async function mergeDuplicateGroup(index) {
+    const group = _duplicateGroups[index];
+    const status = document.getElementById('entity-status');
+    if (!group) return;
+    const target = group.entities.find(entity => entity.is_target) || group.entities[0];
+    const others = group.entities.filter(entity => entity.id !== target.id);
+    if (!others.length) return;
+    if (!confirm(`合并组 ${index + 1}：将 ${others.map(entity => entity.name).join('、')} 合并到「${target.name}」？`)) return;
+    for (const other of others) {
+        const response = await fetch('/api/entities/merge', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_id: other.id, target_id: target.id }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) {
+            status.textContent = `合并失败：${data.error || `HTTP ${response.status}`}`;
+            return;
+        }
+    }
+    status.textContent = `已合并 ${others.length} 个实体到「${target.name}」。`;
+    // 源实体已删除、目标多了别名，旧结果会过期：刷新实体列表并重新检测
+    await Promise.all([loadEntities(), detectDuplicateEntities()]);
+}
+
+function closeDuplicatesModal() {
+    document.getElementById('duplicatesModal').style.display = 'none';
 }
 
 async function backfillEntities() {

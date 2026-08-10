@@ -18,6 +18,7 @@ v2.4.5: 实体概况与实体回填不再发送 max_tokens（推理模型的思�
 import os
 import json
 import re
+import unicodedata
 import httpx
 from llm_json import parse_json_array, parse_json_object
 from datetime import datetime, timedelta, timezone
@@ -177,7 +178,9 @@ stable named entities that are useful as recurring long-term memory anchors.
 Allowed types:
 person|place|organization|project|object|pet|activity|event|other
 Return each entity as:
-{"name":"display name","type":"...","confidence":0.0-1.0}
+{"name":"display name","type":"...","confidence":0.0-1.0,"aliases":["...","..."]}
+`aliases` is optional: list the surface spellings actually used in this
+conversation that refer to the same entity (max 8, each under 40 chars).
 Exclude:
 - either conversation participant, pronouns, generic nouns, and invented names;
 - code or implementation artifacts such as functions, classes, variables,
@@ -187,6 +190,36 @@ A technical product or tool may be kept only when the memory clearly establishes
 durable personal significance or recurring use. Omit candidates below 0.65
 confidence. If none qualify, return an empty array.
 """
+
+# 提取 prompt 里最多列出多少条已知实体（活跃在前，避免 prompt 膨胀）
+ENTITY_ROSTER_LIMIT = 120
+
+
+def _render_entity_roster(existing_entities) -> str:
+    """Render the known-entity roster and reuse rules, or '' when empty.
+
+    Appended verbatim to the extraction prompt so the model reuses canonical
+    names instead of minting a new surface form for an entity it already knows.
+    """
+    if not existing_entities:
+        return ""
+    lines = ["", "## Known entities - reuse, do not duplicate"]
+    for ent in existing_entities[:ENTITY_ROSTER_LIMIT]:
+        name = str(ent.get("name") or "").strip()
+        if not name:
+            continue
+        etype = str(ent.get("entity_type") or "other")
+        aliases = ent.get("aliases") or []
+        suffix = f" (aliases: {', '.join(str(a) for a in aliases[:4])})" if aliases else ""
+        lines.append(f"- {name} [{etype}]{suffix}")
+    lines += [
+        "",
+        "If the conversation mentions any of the entities above (including via an alias),",
+        "return its exact `name` above and put the surface form used in this conversation",
+        "into an optional `aliases` array. Never create a new entity for an entity already",
+        "listed above.",
+    ]
+    return "\n".join(lines)
 
 ENTITY_MIN_CONFIDENCE = 0.65
 ENTITY_FILE_EXTENSIONS = (
@@ -214,11 +247,16 @@ def _is_code_like_entity_name(name: str) -> bool:
 
 
 def _exclude_user_entities(entities) -> List:
-    """Drop participants, code-like names, and weak candidates before persistence."""
+    """Drop participants, code-like names, and weak candidates before persistence.
+
+    NFKC-normalizes names so a full-width excluded name (e.g. ＵＳＥＲ) is caught,
+    matching database.normalize_entity_name's folding. Dict entities also get a
+    sanitized `aliases` list attached for the canonical-entity reuse feature.
+    """
     result = []
     for entity in entities if isinstance(entities, list) else []:
         name = entity if isinstance(entity, str) else entity.get("name", "") if isinstance(entity, dict) else ""
-        normalized = re.sub(r"\s+", " ", str(name).strip()).casefold()
+        normalized = _normalize_entity_surface(name)
         try:
             confidence = float(entity.get("confidence", 1.0)) if isinstance(entity, dict) else 1.0
         except (TypeError, ValueError):
@@ -226,7 +264,38 @@ def _exclude_user_entities(entities) -> List:
         if (normalized and normalized not in EXCLUDED_ENTITY_NAMES
                 and confidence >= ENTITY_MIN_CONFIDENCE
                 and not _is_code_like_entity_name(name)):
+            if isinstance(entity, dict):
+                entity = dict(entity)
+                aliases = _clean_entity_aliases(entity.get("aliases"))
+                if aliases:
+                    entity["aliases"] = aliases
             result.append(entity)
+    return result
+
+
+def _normalize_entity_surface(name) -> str:
+    """NFKC + whitespace-collapse + casefold, mirroring database.normalize_entity_name."""
+    value = unicodedata.normalize("NFKC", str(name or "").strip())
+    return re.sub(r"\s+", " ", value).casefold()
+
+
+def _clean_entity_aliases(aliases) -> List[str]:
+    """Sanitize LLM-supplied alias surface forms (dedupe, drop excluded, cap)."""
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    result = []
+    seen = set()
+    for raw in (aliases or []):
+        alias = str(raw).strip()
+        normalized = _normalize_entity_surface(alias)
+        if not normalized or normalized in seen or normalized in EXCLUDED_ENTITY_NAMES:
+            continue
+        if len(alias) > 40:
+            continue
+        result.append(alias)
+        seen.add(normalized)
+        if len(result) >= 8:
+            break
     return result
 
 
@@ -249,6 +318,7 @@ def _format_message_time(value, fallback: datetime) -> str:
 async def extract_memories(
     messages: List[Dict[str, str]],
     existing_memories: List[str] = None,
+    existing_entities: Optional[List[Dict]] = None,
 ) -> Optional[List[Dict]]:
     """
     从对话消息中提取记忆
@@ -256,6 +326,7 @@ async def extract_memories(
     参数：
         messages: 对话消息列表，格式 [{"role": "user", "content": "..."}, ...]
         existing_memories: 已有记忆内容列表，用于去重对比
+        existing_entities: 已有实体清单（含别名），用于让模型复用规范名而非新建重复实体
 
     返回：
         成功时返回记忆列表（可以为空）；请求或解析失败时返回 None
@@ -290,7 +361,11 @@ async def extract_memories(
         memories_text = "（暂无已知信息）"
 
     # 把已有记忆填入prompt
-    prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text) + ENTITY_OUTPUT_GUIDANCE
+    prompt = (
+        EXTRACTION_PROMPT.format(existing_memories=memories_text)
+        + ENTITY_OUTPUT_GUIDANCE
+        + _render_entity_roster(existing_entities)
+    )
 
     # 调用 LLM 提取记忆
     try:

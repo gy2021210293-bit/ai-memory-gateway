@@ -1242,6 +1242,63 @@ body {
     border-radius: 0 0 var(--radius-sm) var(--radius-sm);
 }
 
+.combo-option.is-active {
+    background: var(--bg);
+}
+
+.combo-option-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.combo-option-alias {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.combo-empty {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 12px 14px;
+    font-size: 13px;
+    cursor: default;
+}
+
+/* 疑似重复实体弹窗 */
+.dup-group {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 12px;
+}
+
+.dup-group-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+}
+
+.dup-group-head .combo-option-meta {
+    margin-left: 4px;
+}
+
+.dup-entity {
+    padding: 4px 0;
+    font-size: 14px;
+}
+
+.dup-entity .combo-option-meta {
+    margin-left: 6px;
+}
+
 .form-hint {
     display: block;
     font-size: 12px;
