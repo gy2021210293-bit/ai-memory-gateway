@@ -2,6 +2,7 @@ import logging
 import sys
 import types
 import unittest
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 
@@ -193,6 +194,8 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         insert_calls = [call for call in conn.execute_calls if "INSERT INTO entity_card_proposals" in call[0]]
         self.assertEqual(len(insert_calls), 1)
         self.assertEqual(insert_calls[0][1][1], "住在上海")
+        # fact_date 必须是 date 对象：asyncpg 不接受字符串绑 DATE 列（DataError）
+        self.assertIsInstance(insert_calls[0][1][2], date)
 
     async def test_create_proposal_missing_entity(self):
         conn = ProposalConnection(entity_row=None)

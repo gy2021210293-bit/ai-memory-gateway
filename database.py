@@ -3732,6 +3732,22 @@ async def update_entity_card_description(entity_id: int, description: str) -> di
     return {"status": "ok", "description": description}
 
 
+def _parse_fact_date(value):
+    """Coerce a YYYY-MM-DD string (or date) into datetime.date for DATE params.
+
+    asyncpg requires a real date object for DATE columns — a bare str fails with
+    DataError ('str' object has no attribute 'toordinal'). Invalid/empty → None.
+    """
+    if isinstance(value, date):
+        return value
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
+
 async def create_entity_card_proposal(
     entity_id: int,
     state: str,
@@ -3745,7 +3761,7 @@ async def create_entity_card_proposal(
     state = re.sub(r"\s+", " ", str(state or "")).strip()
     if not state:
         return {"error": "提案快照不能为空"}
-    fact_date = str(fact_date or "").strip() or None
+    fact_date = _parse_fact_date(fact_date)
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id FROM entities WHERE id = $1", entity_id)
