@@ -3285,7 +3285,7 @@ async def list_entities():
                 entity.get("entity_card_json")
             )
             entity["card_has_description"] = _card_has_description(
-                entity.get("entity_card_json"), entity.get("description")
+                entity.get("entity_card_json")
             )
         entities.sort(key=lambda item: (
             item["retrieval_status"] != "active",
@@ -3484,7 +3484,7 @@ async def get_entity_detail(entity_id: int):
                 entity.get("entity_card_json")
             )
             entity["card_has_description"] = _card_has_description(
-                entity.get("entity_card_json"), entity.get("description")
+                entity.get("entity_card_json")
             )
         return entity
 
@@ -3699,17 +3699,15 @@ def _entity_card_summary(card_json) -> tuple:
     return True, snapshots[-1].get("fact_date") or None
 
 
-def _card_has_description(card_json, legacy_description) -> bool:
-    """True when the entity has a non-empty 说明.
+def _card_has_description(card_json) -> bool:
+    """True when the entity card's own 说明 is non-empty.
 
-    Mirrors the chat-time display which shows the card description, falling
-    back to the legacy entities.description when the card has none.
+    Only the card's description counts — the legacy entities.description (from the
+    abandoned profile system) is not what the card face displays, so it must not
+    suppress the 无说明 badge. Mirrors the Dashboard card's 说明 field.
     """
     card = _parse_entity_card(card_json)
-    return bool(
-        (card.get("description") or "").strip()
-        or str(legacy_description or "").strip()
-    )
+    return bool((card.get("description") or "").strip())
 
 
 def _sort_snapshots(snapshots: list) -> list:

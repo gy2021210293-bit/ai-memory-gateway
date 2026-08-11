@@ -164,15 +164,13 @@ class EntityCardTests(unittest.TestCase):
         # jsonb 列以字符串返回时同样解析
         self.assertEqual(database._entity_card_summary(json.dumps(card, ensure_ascii=False)), (True, "2026-07-20"))
 
-    def test_card_has_description_mirrors_display_fallback(self):
+    def test_card_has_description_is_card_only(self):
         # 卡内说明存在 → True
-        self.assertTrue(database._card_has_description({"description": "  朋友  ", "snapshots": []}, ""))
-        # 卡内无说明但遗留说明存在 → True（聊天注入的兜底）
-        self.assertTrue(database._card_has_description({"description": "", "snapshots": []}, "旧说明"))
-        # 两者皆空 → False
-        self.assertFalse(database._card_has_description({"description": "", "snapshots": []}, ""))
-        self.assertFalse(database._card_has_description(None, ""))
-        self.assertFalse(database._card_has_description(None, "   "))
+        self.assertTrue(database._card_has_description({"description": "  朋友  ", "snapshots": []}))
+        # 卡内无说明 → False（遗留 entities.description 不计入：卡面 说明 为空就显示 无说明）
+        self.assertFalse(database._card_has_description({"description": "", "snapshots": []}))
+        self.assertFalse(database._card_has_description(None))
+        self.assertFalse(database._card_has_description("not json"))
 
     def test_parse_entity_card_parses_stable_traits(self):
         payload = {
