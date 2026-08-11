@@ -14,6 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+import traceback
 import hashlib
 from llm_json import parse_json_array, valid_merged_ids
 import uuid
@@ -2777,9 +2778,17 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 return {"status": "error", "error": f"API调用失败: {last_error}"}
 
             data = response.json()
-            response_message = data.get("choices", [{}])[0].get("message", {})
-            content = response_message.get("content") or response_message.get("reasoning_content") or ""
-            
+            # 上游响应防御式解析：不同中转/推理模型可能返回空choices、非对象message或非JSON，
+            # 逐层校验并给出可读错误，避免内部异常变成UI上的"未知错误"。
+            if not isinstance(data, dict):
+                return {"status": "error", "error": f"模型返回了非对象响应（{type(data).__name__}）：{str(data)[:300]}", "raw": str(data)[:500]}
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return {"status": "error", "error": f"模型返回空choices（上游限流或请求失败），原始响应：{str(data)[:300]}", "raw": str(data)[:500]}
+            response_message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            content = (response_message.get("content") or response_message.get("reasoning_content") or "").strip()
+            if not content:
+                return {"status": "error", "error": "模型返回了空内容（未输出任何文字，可能是上游限流或模型故障）", "raw": str(data)[:500]}
             try:
                 events = parse_json_array(content)
             except ValueError as e:
@@ -2797,7 +2806,13 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                 )
                 if fix_resp.status_code != 200:
                     return {"status": "error", "error": f"JSON解析失败，AI修复请求失败: HTTP {fix_resp.status_code}", "raw": content[:500]}
-                fix_content = fix_resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                try:
+                    fix_data = fix_resp.json()
+                    fix_choices = fix_data.get("choices") if isinstance(fix_data, dict) else None
+                    fix_message = (fix_choices[0].get("message", {}) if isinstance(fix_choices, list) and fix_choices and isinstance(fix_choices[0], dict) else {})
+                    fix_content = (fix_message.get("content") or fix_message.get("reasoning_content") or "").strip()
+                except Exception as fe:
+                    return {"status": "error", "error": f"JSON解析失败，AI修复响应也无法解析（{type(fe).__name__}: {fe}）", "raw": content[:500]}
                 try:
                     events = parse_json_array(fix_content)
                     print("✅ AI修复JSON成功")
@@ -2865,7 +2880,10 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             }
             
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        traceback.print_exc()
+        detail = str(e).strip()
+        message = f"{type(e).__name__}: {detail}" if detail else f"{type(e).__name__}（无错误详情，已打印堆栈到服务日志）"
+        return {"status": "error", "error": message}
 
 
 @app.post("/api/memories/consolidate")
@@ -2912,7 +2930,9 @@ async def api_manual_consolidate(request: Request):
             _consolidate_status["result"] = result
             print(f"[manual/consolidate] 整理 {start_date}~{end_date}: {result}")
         except Exception as e:
-            _consolidate_status["error"] = str(e)
+            traceback.print_exc()
+            detail = str(e).strip()
+            _consolidate_status["error"] = detail or f"{type(e).__name__}（无错误详情，已打印堆栈到服务日志）"
             print(f"[manual/consolidate] 整理 {start_date}~{end_date} 失败: {e}")
         finally:
             _consolidate_status["running"] = False
