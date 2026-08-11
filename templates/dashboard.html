@@ -551,6 +551,24 @@
                         <div class="toolbar">
                             <button class="btn btn-primary" onclick="saveEntityCardDescription()">保存说明</button>
                         </div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin:16px 0 8px">
+                            <h5 style="margin:0">长期稳定特征（反复证据支持的长期特质）</h5>
+                            <button class="btn btn-secondary" onclick="generateTraitCandidates()">生成稳定特征候选</button>
+                        </div>
+                        <div id="entity-card-traits" class="entity-card-traits"></div>
+                        <div id="entity-trait-feedback" class="section-desc" style="margin-top:8px"></div>
+                        <h5 style="margin:16px 0 8px">手动新增稳定特征</h5>
+                        <div style="display:grid;grid-template-columns:1fr 130px 130px;gap:8px">
+                            <input id="entity-trait-text" class="input" placeholder="特征文本（≤120字）">
+                            <input id="entity-trait-first-seen" class="input" type="date" title="首次发现日期">
+                            <input id="entity-trait-last-confirmed" class="input" type="date" title="最后确认日期">
+                        </div>
+                        <div class="form-group" style="margin-top:8px">
+                            <input id="entity-trait-evidence" class="input" placeholder="证据记忆 ID（逗号分隔，至少1条且须属于该实体）" inputmode="numeric">
+                        </div>
+                        <div class="toolbar" style="margin-top:8px">
+                            <button class="btn btn-primary" onclick="addEntityCardTrait()">新增稳定特征</button>
+                        </div>
                         <h5 style="margin:16px 0 8px">状态快照（按事实日期排序，末节点即最后已知状态）</h5>
                         <div id="entity-card-snapshots" class="entity-card-snapshots"></div>
                         <h5 style="margin:16px 0 8px">手动新增 / 修正快照</h5>

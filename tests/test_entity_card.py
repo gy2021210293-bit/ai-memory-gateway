@@ -51,9 +51,10 @@ class FakePool:
 class CardConnection:
     """Fake conn returning a card payload and recording UPDATE writes."""
 
-    def __init__(self, card_json, entity_exists=True):
+    def __init__(self, card_json, entity_exists=True, owned_memory_ids=None):
         self.card_json = card_json
         self.entity_exists = entity_exists
+        self.owned_memory_ids = owned_memory_ids or []
         self.execute_calls = []
 
     def transaction(self):
@@ -63,6 +64,9 @@ class CardConnection:
         if not self.entity_exists:
             return None
         return {"entity_card_json": self.card_json}
+
+    async def fetch(self, _sql, *_args):
+        return [{"memory_id": mid} for mid in self.owned_memory_ids]
 
     async def execute(self, sql, *args):
         self.execute_calls.append((sql, args))
@@ -78,10 +82,12 @@ class EvidenceConnection:
 
 
 class EntityCardTests(unittest.TestCase):
+    EMPTY_CARD = {"description": "", "stable_traits": [], "snapshots": []}
+
     def test_parse_entity_card_empty_defaults(self):
-        self.assertEqual(database._parse_entity_card(None), {"description": "", "snapshots": []})
-        self.assertEqual(database._parse_entity_card("not json"), {"description": "", "snapshots": []})
-        self.assertEqual(database._parse_entity_card([]), {"description": "", "snapshots": []})
+        self.assertEqual(database._parse_entity_card(None), self.EMPTY_CARD)
+        self.assertEqual(database._parse_entity_card("not json"), self.EMPTY_CARD)
+        self.assertEqual(database._parse_entity_card([]), self.EMPTY_CARD)
 
     def test_parse_entity_card_accepts_str_and_dict(self):
         payload = {"description": "  朋友  ", "snapshots": [
@@ -167,6 +173,65 @@ class EntityCardTests(unittest.TestCase):
         self.assertFalse(database._card_has_description({"description": "", "snapshots": []}, ""))
         self.assertFalse(database._card_has_description(None, ""))
         self.assertFalse(database._card_has_description(None, "   "))
+
+    def test_parse_entity_card_parses_stable_traits(self):
+        payload = {
+            "description": "朋友",
+            "stable_traits": [
+                {"id": "t1", "text": "  长期目标是边缘设备部署  ", "status": "active",
+                 "first_seen": "2026-03-01", "last_confirmed": "2026-08-11",
+                 "evidence_memory_ids": [101, 101, 205], "evidence_message_ids": [3001],
+                 "origin": "confirmed"},
+                {"id": "", "text": "无ID被丢弃", "status": "active"},
+            ],
+            "snapshots": [],
+        }
+        card = database._parse_entity_card(json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(card["description"], "朋友")
+        self.assertEqual(len(card["stable_traits"]), 1)
+        trait = card["stable_traits"][0]
+        self.assertEqual(trait["id"], "t1")
+        self.assertEqual(trait["text"], "长期目标是边缘设备部署")
+        self.assertEqual(trait["evidence_memory_ids"], [101, 205])  # 重复ID去重
+        # 旧卡没有 stable_traits 字段 → 空数组（兼容）
+        self.assertEqual(database._parse_entity_card({"description": "x", "snapshots": []})["stable_traits"], [])
+
+    def test_clean_int_list_dedupes_and_filters(self):
+        self.assertEqual(database._clean_int_list([1, 1, 2, "3", None, 0]), [1, 2, 3])
+        self.assertEqual(database._clean_int_list("not-a-list"), [])
+        self.assertEqual(database._clean_int_list(None), [])
+
+    def test_merge_stable_traits_dedup_and_conflict(self):
+        target = [
+            {"id": "a", "text": "长期目标是边缘设备部署", "status": "active",
+             "first_seen": "2026-01-01", "last_confirmed": "2026-06-01",
+             "evidence_memory_ids": [1], "evidence_message_ids": [11], "origin": "confirmed"},
+            {"id": "b", "text": "习惯晨跑", "status": "retired",
+             "first_seen": "2026-02-01", "last_confirmed": "2026-03-01",
+             "evidence_memory_ids": [2], "evidence_message_ids": [], "origin": "confirmed"},
+        ]
+        source = [
+            {"id": "c", "text": "长期目标是边缘设备部署", "status": "active",
+             "first_seen": "2026-02-01", "last_confirmed": "2026-07-01",
+             "evidence_memory_ids": [3], "evidence_message_ids": [33], "origin": "candidate"},
+            {"id": "d", "text": "习惯晨跑", "status": "active",  # 同文本状态冲突
+             "first_seen": "2026-02-01", "last_confirmed": "2026-04-01",
+             "evidence_memory_ids": [4], "evidence_message_ids": [], "origin": "confirmed"},
+        ]
+        merged, conflicts = database._merge_stable_traits(target, source)
+        merged_by_text = {t["text"]: t for t in merged}
+        # 同文本同状态 → 合并证据 + 最早 first_seen + 最新 last_confirmed
+        trait = merged_by_text["长期目标是边缘设备部署"]
+        self.assertEqual(sorted(trait["evidence_memory_ids"]), [1, 3])
+        self.assertEqual(sorted(trait["evidence_message_ids"]), [11, 33])
+        self.assertEqual(trait["first_seen"], "2026-01-01")
+        self.assertEqual(trait["last_confirmed"], "2026-07-01")
+        # 同文本状态冲突 → 不自行决定，生成冲突描述
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["text"], "习惯晨跑")
+        self.assertEqual(conflicts[0]["status_existing"], "retired")
+        self.assertEqual(conflicts[0]["status_proposed"], "active")
+        self.assertEqual(conflicts[0]["existing_trait_id"], "b")
 
     def test_list_entities_includes_pending_count_and_card_summary(self):
         calls = []
@@ -285,6 +350,70 @@ class EntityCardAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn2))):
             self.assertEqual((await database.apply_entity_snapshot(1, "", "2026-07-01"))["status"], "error")
             self.assertEqual((await database.apply_entity_snapshot(1, "s", ""))["status"], "error")
+
+    async def test_add_entity_card_trait_appends(self):
+        conn = CardConnection({"description": "", "stable_traits": [], "snapshots": []}, owned_memory_ids=[1, 2])
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.add_entity_card_trait(
+                1, "长期目标是边缘设备部署", first_seen="2026-03-01", last_confirmed="2026-08-11",
+                evidence_memory_ids=[1, 2],
+            )
+        self.assertEqual(result["status"], "ok")
+        written = json.loads(conn.execute_calls[0][1][1])
+        trait = written["stable_traits"][0]
+        self.assertEqual(trait["text"], "长期目标是边缘设备部署")
+        self.assertEqual(trait["status"], "active")
+        self.assertEqual(trait["first_seen"], "2026-03-01")
+        self.assertEqual(sorted(trait["evidence_memory_ids"]), [1, 2])
+
+    async def test_add_entity_card_trait_rejects_foreign_evidence(self):
+        conn = CardConnection({"description": "", "stable_traits": [], "snapshots": []}, owned_memory_ids=[1])
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.add_entity_card_trait(
+                1, "特征", first_seen="2026-03-01", last_confirmed="2026-08-11",
+                evidence_memory_ids=[1, 999],
+            )
+        self.assertIn("证据记忆不属于该实体", result["error"])
+
+    async def test_add_entity_card_trait_rejects_invalid_date(self):
+        conn = CardConnection({"description": "", "stable_traits": [], "snapshots": []}, owned_memory_ids=[1])
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.add_entity_card_trait(
+                1, "特征", first_seen="2026-13-40", last_confirmed="2026-08-11",
+                evidence_memory_ids=[1],
+            )
+        self.assertIn("日期无效", result["error"])
+
+    async def test_add_entity_card_trait_has_no_cap(self):
+        card = {"description": "", "stable_traits": [
+            {"id": f"t{i}", "text": f"特征{i}", "status": "active",
+             "first_seen": "2026-01-01", "last_confirmed": "2026-08-01",
+             "evidence_memory_ids": [i], "evidence_message_ids": [], "origin": "confirmed"}
+            for i in range(1, 6)
+        ], "snapshots": []}
+        conn = CardConnection(card, owned_memory_ids=[1, 2, 3, 4, 5, 6])
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.add_entity_card_trait(
+                1, "第六条", first_seen="2026-03-01", last_confirmed="2026-08-11",
+                evidence_memory_ids=[6],
+            )
+        self.assertEqual(result["status"], "ok")
+        written = json.loads(conn.execute_calls[0][1][1])
+        self.assertEqual(len(written["stable_traits"]), 6)
+
+    async def test_retire_entity_card_trait_keeps_evidence(self):
+        card = {"description": "", "stable_traits": [
+            {"id": "t1", "text": "特征", "status": "active",
+             "first_seen": "2026-03-01", "last_confirmed": "2026-08-11",
+             "evidence_memory_ids": [1], "evidence_message_ids": [], "origin": "confirmed"},
+        ], "snapshots": []}
+        conn = CardConnection(card)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.retire_entity_card_trait(1, "t1")
+        self.assertEqual(result["status"], "ok")
+        written = json.loads(conn.execute_calls[0][1][1])
+        self.assertEqual(written["stable_traits"][0]["status"], "retired")
+        self.assertEqual(written["stable_traits"][0]["evidence_memory_ids"], [1])
 
     async def test_record_memory_evidence_skips_empty(self):
         conn = EvidenceConnection()

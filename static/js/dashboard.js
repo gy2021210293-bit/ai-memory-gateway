@@ -542,6 +542,144 @@ async function deleteEntityCardSnapshot(recordedAt) {
     }
 }
 
+function renderEntityCardTraits(traits) {
+    const container = document.getElementById('entity-card-traits');
+    container.replaceChildren();
+    if (!traits || !traits.length) {
+        container.textContent = '暂无稳定特征。';
+        return;
+    }
+    traits.forEach(trait => {
+        const item = document.createElement('div');
+        item.className = 'entity-card-trait';
+        const active = trait.status === 'active';
+        const statusLabel = active ? '活跃' : '已退休';
+        const statusClass = active ? 'trait-active' : 'trait-retired';
+        const evidenceMem = (trait.evidence_memory_ids || []).map(id => `#${id}`).join('、');
+        const evidenceMsg = (trait.evidence_message_ids || []).map(id => `#${id}`).join('、');
+        const header = document.createElement('div');
+        header.className = `entity-card-trait-header ${statusClass}`;
+        header.textContent = `【${statusLabel}】首见 ${trait.first_seen || '未知'} · 最后确认 ${trait.last_confirmed || '未知'}`
+            + `${evidenceMem ? ` · 证据记忆 ${evidenceMem}` : ''}${evidenceMsg ? ` · 证据消息 ${evidenceMsg}` : ''}`;
+        const body = document.createElement('div');
+        body.textContent = trait.text;
+        item.appendChild(header);
+        item.appendChild(body);
+        if (active) {
+            const actions = document.createElement('div');
+            actions.className = 'toolbar entity-card-snapshot-actions';
+            const editButton = document.createElement('button');
+            editButton.className = 'btn';
+            editButton.textContent = '编辑';
+            editButton.onclick = () => editEntityCardTrait(trait);
+            const retireButton = document.createElement('button');
+            retireButton.className = 'btn btn-danger';
+            retireButton.textContent = '退休';
+            retireButton.onclick = () => retireEntityCardTrait(trait.id);
+            actions.appendChild(editButton);
+            actions.appendChild(retireButton);
+            item.appendChild(actions);
+        }
+        container.appendChild(item);
+    });
+}
+
+function editEntityCardTrait(trait) {
+    const text = prompt('编辑稳定特征文本', trait.text || '');
+    if (text === null) return;
+    const lastConfirmed = prompt('最后确认日期（YYYY-MM-DD，留空不变）', trait.last_confirmed || '');
+    if (lastConfirmed === null) return;
+    updateEntityCardTrait(trait.id, text, lastConfirmed);
+}
+
+async function updateEntityCardTrait(traitId, text, lastConfirmed) {
+    const status = document.getElementById('entity-status');
+    if (!selectedEntity) return;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/traits/${encodeURIComponent(traitId)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, last_confirmed: lastConfirmed }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        status.textContent = '稳定特征已更新。';
+        await loadEntityCard(selectedEntity.id);
+    } catch (error) {
+        status.textContent = `稳定特征更新失败：${error.message}`;
+    }
+}
+
+async function retireEntityCardTrait(traitId) {
+    const status = document.getElementById('entity-status');
+    if (!selectedEntity || !confirm('退休这条稳定特征？会保留但不再注入聊天。')) return;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/traits/${encodeURIComponent(traitId)}/retire`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        status.textContent = '稳定特征已退休。';
+        await loadEntityCard(selectedEntity.id);
+    } catch (error) {
+        status.textContent = `稳定特征退休失败：${error.message}`;
+    }
+}
+
+async function addEntityCardTrait() {
+    const status = document.getElementById('entity-status');
+    const feedback = document.getElementById('entity-trait-feedback');
+    if (!selectedEntity) return;
+    const text = document.getElementById('entity-trait-text').value.trim();
+    const firstSeen = document.getElementById('entity-trait-first-seen').value;
+    const lastConfirmed = document.getElementById('entity-trait-last-confirmed').value;
+    const evidenceText = document.getElementById('entity-trait-evidence').value.trim();
+    if (!text) { feedback.textContent = '特征文本不能为空。'; return; }
+    const evidenceMemoryIds = evidenceText.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean).map(Number);
+    if (!evidenceMemoryIds.length || evidenceMemoryIds.some(n => !Number.isInteger(n))) {
+        feedback.textContent = '请至少填写一条整数证据记忆 ID。';
+        return;
+    }
+    feedback.textContent = '';
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/traits`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                text,
+                first_seen: firstSeen || undefined,
+                last_confirmed: lastConfirmed || undefined,
+                evidence_memory_ids: evidenceMemoryIds,
+            }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        document.getElementById('entity-trait-text').value = '';
+        document.getElementById('entity-trait-first-seen').value = '';
+        document.getElementById('entity-trait-last-confirmed').value = '';
+        document.getElementById('entity-trait-evidence').value = '';
+        renderEntityCardTraits(data.card ? data.card.stable_traits : []);
+        status.textContent = '已新增稳定特征。';
+    } catch (error) {
+        feedback.textContent = error.message;
+    }
+}
+
+async function generateTraitCandidates() {
+    const status = document.getElementById('entity-status');
+    const feedback = document.getElementById('entity-trait-feedback');
+    if (!selectedEntity) return;
+    feedback.textContent = '正在生成稳定特征候选…';
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/traits/generate`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        feedback.textContent = `已生成 ${data.proposed} 条新增候选、${data.retired_proposed || 0} 条矛盾退休提案（跳过 ${data.skipped}）`
+            + `${data.errors && data.errors.length ? `；失败：${data.errors.join('；')}` : ''}。请在下方提案区逐条确认。`;
+        await loadEntityCard(selectedEntity.id);
+    } catch (error) {
+        feedback.textContent = `候选生成失败：${error.message}`;
+    }
+}
+
 function renderEntityCardProposals(proposals) {
     const container = document.getElementById('entity-card-proposals');
     container.replaceChildren();
@@ -554,14 +692,17 @@ function renderEntityCardProposals(proposals) {
         item.className = 'entity-card-proposal';
         const header = document.createElement('div');
         header.className = 'entity-card-proposal-header';
-        header.textContent = `#${proposal.id} · ${proposal.fact_date || '未知日期'} · ${proposal.status}`;
+        const typeLabel = { snapshot: '快照', trait_add: '稳定特征新增', trait_retire: '稳定特征撤销' }[proposal.proposal_type] || '快照';
+        header.textContent = `#${proposal.id} · ${typeLabel} · ${proposal.fact_date || '未知日期'} · ${proposal.status}`;
         const body = document.createElement('div');
         body.textContent = proposal.state;
         const meta = document.createElement('div');
         meta.className = 'section-desc';
         const parts = [];
         if (proposal.evidence_memory_id) parts.push(`证据记忆 #${proposal.evidence_memory_id}`);
+        if ((proposal.evidence_memory_ids || []).length) parts.push(`证据记忆 ${proposal.evidence_memory_ids.map(id => `#${id}`).join('、')}`);
         if (proposal.evidence_message_id) parts.push(`证据消息 #${proposal.evidence_message_id}`);
+        if ((proposal.evidence_message_ids || []).length) parts.push(`证据消息 ${proposal.evidence_message_ids.map(id => `#${id}`).join('、')}`);
         if (proposal.reason) parts.push(`原因：${proposal.reason}`);
         meta.textContent = parts.join(' · ');
         item.appendChild(header);
@@ -593,8 +734,9 @@ async function loadEntityCard(entityId) {
         const response = await fetch(`/api/entities/${entityId}/card`);
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
-        const card = data.card || { description: '', snapshots: [] };
+        const card = data.card || { description: '', stable_traits: [], snapshots: [] };
         document.getElementById('entity-card-description-edit').value = card.description || '';
+        renderEntityCardTraits(card.stable_traits || []);
         renderEntityCardSnapshots(card.snapshots || []);
         renderEntityCardProposals(data.proposals || []);
         document.getElementById('entity-profile-current').textContent = formatEntityProfile(

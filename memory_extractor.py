@@ -972,6 +972,173 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
         return {"error": f"调用异常({type(exc).__name__}): {exc!r}"}
 
 
+def _valid_trait_date(value) -> str:
+    """Return a canonical YYYY-MM-DD when valid, else ''."""
+    raw = str(value or "").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        try:
+            datetime.strptime(raw, "%Y-%m-%d")
+            return raw
+        except ValueError:
+            pass
+    return ""
+
+
+async def suggest_entity_trait_candidates(
+    entity: Dict,
+    memories: List[Dict],
+    evidence_message_map: Optional[Dict] = None,
+    current_traits: Optional[List[str]] = None,
+) -> List[Dict]:
+    """One LLM call to propose stable-trait candidates and flag contradictions.
+
+    Each candidate must cite ≥2 distinct evidence memories; contradictions are
+    only returned for active traits the evidence clearly supersedes. Returns
+    {"candidates": [...], "contradictions": [...]}; persistence (trait_add /
+    trait_retire proposals) happens in the caller.
+    """
+    if not memories or not get_memory_api_key():
+        return []
+    evidence_map = evidence_message_map or {}
+    evidence_lines = []
+    for memory in memories:
+        content = str(memory.get("content") or "").strip()
+        if not content:
+            continue
+        mid = int(memory.get("id") or 0)
+        if len(content) > 160:
+            content = content[:160] + "…"
+        evidence_lines.append(f"[ID={mid}] {content}")
+    current_lines = "、".join(current_traits or []) or "无"
+    prompt = f"""我是栖，一个有温度的 AI 陪伴者。下面的证据记忆都是我以第一人称写下的：
+其中「我」指栖（我自己），「她」指晏晏（用户）。我正在为实体「{entity.get('name')}」
+（{entity.get('entity_type', 'other')}）梳理**长期稳定特征**：被多次对话反复支持、定义其长期身份
+的稳定特质（如长期目标、稳定职业/身份、长期居住地、持久性格/习惯、稳定关系定位）。
+
+当前已有活跃稳定特征：{current_lines}
+
+证据记忆：
+{chr(10).join(evidence_lines)}
+
+请仅依据上述证据，为这个实体做两件事，只返回一个 JSON 对象：
+{{"candidates": [候选数组], "contradictions": [矛盾数组]}}
+candidates 每条：
+{{"text": "一句话特征（≤120字，第一人称口吻：我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）", "first_seen": "YYYY-MM-DD", "last_confirmed": "YYYY-MM-DD", "evidence_memory_ids": [至少两条不同证据记忆ID]}}
+contradictions 每条：
+{{"text": "被新证据推翻/取代的【当前活跃稳定特征】原文", "evidence_memory_ids": [支持矛盾判断的证据记忆ID]}}
+要求：
+- candidates 每条必须引用至少两条**不同**的证据记忆 ID（只能引用上方出现的 ID）；与当前已有活跃特征重复的不要输出；
+- contradictions 只能引用「当前已有活跃稳定特征」里的原文，且要有上方证据记忆明确支持"它已不再成立/被取代"；没有明确矛盾的不要输出；
+- 一次性事件、临时心情、短期计划、琐碎日常不要输出；
+- first_seen 取证据中最早出现时间，last_confirmed 取最近支持时间；无法确定就留空字符串；
+- 证据不足时 candidates/contradictions 返回空数组；禁止推测证据中没有的信息。
+只返回 JSON 对象。
+"""
+    request_messages = [{"role": "user", "content": prompt}]
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
+            )
+            if response.status_code != 200:
+                print(f"⚠️ 稳定特征候选生成失败: {response.status_code} {response.text[:200]}")
+                return []
+            text = _extract_response_content(response.json()).strip()
+            try:
+                parsed = parse_json_object(text)
+            except ValueError as first_error:
+                print(f"⚠️ 稳定特征候选解析失败，正在重试: {first_error}")
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages + [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": "上一次输出没有给出可解析的最终结果。请重新检查证据，只返回最终 JSON 对象，不要分析、解释或使用 Markdown。",
+                        },
+                    ]},
+                )
+                if retry_response.status_code != 200:
+                    return {"candidates": [], "contradictions": []}
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                try:
+                    parsed = parse_json_object(retry_text)
+                except ValueError:
+                    print(f"⚠️ 稳定特征候选重试仍无法解析: {retry_text[:200]}")
+                    return {"candidates": [], "contradictions": []}
+    except Exception as exc:
+        print(f"⚠️ 稳定特征候选生成异常: type={type(exc).__name__}, {exc!r}")
+        return {"candidates": [], "contradictions": []}
+    known_ids = {int(m.get("id")) for m in memories if m.get("id")}
+    candidates = []
+    seen_texts = set()
+    raw_items = (parsed.get("candidates") if isinstance(parsed, dict) else []) or []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if not text:
+            continue
+        text = sanitize_user_references(text)[:120]
+        mem_ids = []
+        seen = set()
+        for raw in item.get("evidence_memory_ids") or []:
+            try:
+                mid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if mid in known_ids and mid not in seen:
+                seen.add(mid)
+                mem_ids.append(mid)
+        if len(mem_ids) < 2:
+            continue  # 单条证据不能成为稳定特征候选
+        key = text.casefold()
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+        message_ids = []
+        for mid in mem_ids:
+            message_ids.extend(evidence_map.get(mid, []))
+        candidates.append({
+            "text": text,
+            "first_seen": _valid_trait_date(item.get("first_seen")),
+            "last_confirmed": _valid_trait_date(item.get("last_confirmed")),
+            "evidence_memory_ids": mem_ids,
+            "evidence_message_ids": sorted(set(message_ids)),
+        })
+    # 矛盾检测：只保留"当前已有活跃特征"里被证据明确推翻/取代的
+    current_keys = {str(t).strip().casefold() for t in (current_traits or []) if str(t or "").strip()}
+    contradictions = []
+    seen_contradictions = set()
+    for item in (parsed.get("contradictions") if isinstance(parsed, dict) else []) or []:
+        if not isinstance(item, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if not text or text.casefold() not in current_keys:
+            continue
+        key = text.casefold()
+        if key in seen_contradictions:
+            continue
+        seen_contradictions.add(key)
+        mem_ids = []
+        seen = set()
+        for raw in item.get("evidence_memory_ids") or []:
+            try:
+                mid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if mid in known_ids and mid not in seen:
+                seen.add(mid)
+                mem_ids.append(mid)
+        contradictions.append({"text": text, "evidence_memory_ids": mem_ids})
+    print(f"📝 稳定特征：实体 {entity.get('id')}，候选 {len(candidates)} 条，矛盾 {len(contradictions)} 条")
+    return {"candidates": candidates, "contradictions": contradictions}
+
+
+# ---- 三元一场认知模型 ----
 COGNITIVE_DRAFT_RULES = {
     "user_core": (
         "user",

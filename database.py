@@ -10,6 +10,7 @@
 import os
 import re
 import json
+import uuid
 import unicodedata
 import difflib
 from typing import Optional, List
@@ -522,8 +523,50 @@ async def init_tables():
                 status              TEXT NOT NULL DEFAULT 'pending'
                                     CHECK (status IN ('pending', 'accepted', 'rejected')),
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                decided_at          TIMESTAMPTZ DEFAULT NULL
+                decided_at          TIMESTAMPTZ DEFAULT NULL,
+                proposal_type       TEXT NOT NULL DEFAULT 'snapshot'
+                                    CHECK (proposal_type IN ('snapshot', 'trait_add', 'trait_retire')),
+                trait_id            TEXT DEFAULT NULL,
+                last_confirmed      DATE DEFAULT NULL,
+                evidence_memory_ids   INTEGER[] DEFAULT ARRAY[]::INTEGER[],
+                evidence_message_ids  INTEGER[] DEFAULT ARRAY[]::INTEGER[]
             );
+        """)
+        # 为存量库补充稳定特征相关列（新装已含，幂等）
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'proposal_type'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN proposal_type TEXT NOT NULL DEFAULT 'snapshot'
+                        CHECK (proposal_type IN ('snapshot', 'trait_add', 'trait_retire'));
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'trait_id'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN trait_id TEXT DEFAULT NULL;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'last_confirmed'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN last_confirmed DATE DEFAULT NULL;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'evidence_memory_ids'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN evidence_memory_ids INTEGER[] DEFAULT ARRAY[]::INTEGER[];
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'evidence_message_ids'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN evidence_message_ids INTEGER[] DEFAULT ARRAY[]::INTEGER[];
+                END IF;
+            END $$;
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_entity_card_proposals_entity
@@ -3559,10 +3602,34 @@ async def save_entity_profile(entity_id: int, profile: dict, evidence_ids: list,
 
 
 # ============================================================
-# 轻量实体卡：人工说明 + 状态快照演化
+# 轻量实体卡：人工说明 + 稳定特征 + 状态快照演化
 # ============================================================
 
 ENTITY_CARD_STATE_LIMIT = 200
+ENTITY_CARD_TRAIT_TEXT_LIMIT = 120
+ENTITY_CARD_PROPOSAL_TYPES = ("snapshot", "trait_add", "trait_retire")
+
+
+def _clean_int_list(value) -> List[int]:
+    """Coerce a JSON array (or a single int) into a de-duplicated int list."""
+    items = value if isinstance(value, list) else ([value] if value is not None else [])
+    result = []
+    seen = set()
+    for item in items:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number and number not in seen:
+            seen.add(number)
+            result.append(number)
+    return result
+
+
+def _today_date_str() -> str:
+    """Today's date in the configured timezone, as YYYY-MM-DD."""
+    local = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
+    return datetime.now(local).strftime("%Y-%m-%d")
 
 
 def _parse_entity_card(card_json) -> dict:
@@ -3572,7 +3639,7 @@ def _parse_entity_card(card_json) -> dict:
     re-sorted (not capped) so the card preserves the full evolution history; the
     newest snapshot is always last.
     """
-    card = {"description": "", "snapshots": []}
+    card = {"description": "", "stable_traits": [], "snapshots": []}
     if isinstance(card_json, str):
         try:
             card_json = json.loads(card_json)
@@ -3581,6 +3648,27 @@ def _parse_entity_card(card_json) -> dict:
     if not isinstance(card_json, dict):
         return card
     card["description"] = str(card_json.get("description") or "").strip()
+    raw_traits = card_json.get("stable_traits")
+    if isinstance(raw_traits, list):
+        traits = []
+        for raw in raw_traits:
+            if not isinstance(raw, dict):
+                continue
+            trait_id = str(raw.get("id") or "").strip()
+            text = re.sub(r"\s+", " ", str(raw.get("text") or "")).strip()
+            if not trait_id or not text:
+                continue
+            traits.append({
+                "id": trait_id,
+                "text": text[:ENTITY_CARD_TRAIT_TEXT_LIMIT],
+                "status": str(raw.get("status") or "active").strip(),
+                "first_seen": str(raw.get("first_seen") or "").strip(),
+                "last_confirmed": str(raw.get("last_confirmed") or "").strip(),
+                "evidence_memory_ids": _clean_int_list(raw.get("evidence_memory_ids")),
+                "evidence_message_ids": _clean_int_list(raw.get("evidence_message_ids")),
+                "origin": str(raw.get("origin") or "confirmed").strip(),
+            })
+        card["stable_traits"] = traits
     raw_snapshots = card_json.get("snapshots")
     if isinstance(raw_snapshots, list):
         snapshots = []
@@ -3638,6 +3726,61 @@ def _sort_snapshots(snapshots: list) -> list:
             str(item.get("recorded_at") or ""),
         ),
     )
+
+
+def _merge_stable_traits(target_traits: list, source_traits: list) -> tuple:
+    """Merge stable traits by normalized text.
+
+    Same-text traits with the same status merge evidence (union) and dates
+    (earliest first_seen, latest last_confirmed). Same-text traits with a status
+    conflict are NOT decided here — they are returned as conflict descriptors so
+    the caller can create pending proposals. Returns (merged_traits, conflicts).
+    """
+    merged = {}
+    conflicts = []
+    order = []
+    for trait in target_traits + source_traits:
+        if not isinstance(trait, dict):
+            continue
+        text = str(trait.get("text") or "").strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key not in merged:
+            merged[key] = dict(trait)
+            order.append(key)
+            continue
+        existing = merged[key]
+        if existing.get("status") != trait.get("status"):
+            conflicts.append({
+                "text": text,
+                "status_existing": existing.get("status"),
+                "status_proposed": trait.get("status"),
+                "existing_trait_id": existing.get("id"),
+                "first_seen": str(trait.get("first_seen") or "") or str(existing.get("first_seen") or ""),
+                "last_confirmed": str(trait.get("last_confirmed") or "") or str(existing.get("last_confirmed") or ""),
+                "evidence_memory_ids": sorted(set(existing.get("evidence_memory_ids") or []) | set(trait.get("evidence_memory_ids") or [])),
+                "evidence_message_ids": sorted(set(existing.get("evidence_message_ids") or []) | set(trait.get("evidence_message_ids") or [])),
+            })
+            continue
+        existing["evidence_memory_ids"] = sorted(
+            set(existing.get("evidence_memory_ids") or []) | set(trait.get("evidence_memory_ids") or [])
+        )
+        existing["evidence_message_ids"] = sorted(
+            set(existing.get("evidence_message_ids") or []) | set(trait.get("evidence_message_ids") or [])
+        )
+        for field, mode in (("first_seen", "min"), ("last_confirmed", "max")):
+            current = str(existing.get(field) or "")
+            other = str(trait.get(field) or "")
+            if not other:
+                continue
+            if not current:
+                existing[field] = other
+            elif mode == "min" and other < current:
+                existing[field] = other
+            elif mode == "max" and other > current:
+                existing[field] = other
+    return [merged[key] for key in order], conflicts
 
 
 def _snapshot_conflicts_with_tail(snapshots: list, state: str, fact_date: str) -> bool:
@@ -3829,6 +3972,29 @@ def _parse_fact_date(value):
         return None
 
 
+def _valid_date_str(value) -> str:
+    """Return a canonical YYYY-MM-DD string when valid, else '' (for JSON storage)."""
+    raw = str(value or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        return ""
+    try:
+        date.fromisoformat(raw)
+    except ValueError:
+        return ""
+    return raw
+
+
+def _resolve_trait_date(value) -> str:
+    """Return a valid YYYY-MM-DD (defaulting to today when empty), else raise ValueError."""
+    raw = str(value or "").strip()
+    if not raw:
+        return _today_date_str()
+    parsed = _valid_date_str(raw)
+    if not parsed:
+        raise ValueError(f"日期无效: {raw}")
+    return parsed
+
+
 async def create_entity_card_proposal(
     entity_id: int,
     state: str,
@@ -3837,12 +4003,30 @@ async def create_entity_card_proposal(
     evidence_message_id=None,
     source_role=None,
     reason: str = "",
+    proposal_type: str = "snapshot",
+    trait_id=None,
+    last_confirmed=None,
+    evidence_memory_ids=None,
+    evidence_message_ids=None,
 ) -> dict:
-    """Record a model-inferred or not-verbatim-provable snapshot as a pending proposal."""
+    """Record a pending entity-card proposal (snapshot / trait_add / trait_retire).
+
+    `trait_add` must cite at least two distinct evidence memories (the stable-trait
+    rule: a single message can never auto-promote a trait).
+    """
     state = re.sub(r"\s+", " ", str(state or "")).strip()
     if not state:
-        return {"error": "提案快照不能为空"}
+        return {"error": "提案内容不能为空"}
+    if proposal_type not in ENTITY_CARD_PROPOSAL_TYPES:
+        return {"error": f"未知提案类型: {proposal_type}"}
     fact_date = _parse_fact_date(fact_date)
+    last_confirmed = _parse_fact_date(last_confirmed)
+    if proposal_type == "trait_add":
+        memory_ids = _clean_int_list(evidence_memory_ids)
+        if len(memory_ids) < 2:
+            return {"error": "稳定特征候选至少需要两条不同记忆作为证据"}
+        evidence_memory_ids = memory_ids
+        evidence_message_ids = _clean_int_list(evidence_message_ids)
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id FROM entities WHERE id = $1", entity_id)
@@ -3850,10 +4034,14 @@ async def create_entity_card_proposal(
             return {"error": "实体不存在"}
         await conn.execute("""
             INSERT INTO entity_card_proposals
-                (entity_id, state, fact_date, evidence_memory_id, evidence_message_id, source_role, reason)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (entity_id, state, fact_date, evidence_memory_id, evidence_message_id,
+                 source_role, reason, proposal_type, trait_id, last_confirmed,
+                 evidence_memory_ids, evidence_message_ids)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         """, entity_id, state[:ENTITY_CARD_STATE_LIMIT], fact_date,
-            evidence_memory_id, evidence_message_id, source_role, str(reason or ""))
+            evidence_memory_id, evidence_message_id, source_role, str(reason or ""),
+            proposal_type, trait_id, last_confirmed,
+            evidence_memory_ids or [], evidence_message_ids or [])
     return {"status": "ok"}
 
 
@@ -3862,7 +4050,9 @@ async def list_entity_card_proposals(entity_id: int) -> List[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, state, fact_date, evidence_memory_id, evidence_message_id,
-                   source_role, reason, status, created_at, decided_at
+                   source_role, reason, status, created_at, decided_at,
+                   proposal_type, trait_id, last_confirmed,
+                   evidence_memory_ids, evidence_message_ids
             FROM entity_card_proposals
             WHERE entity_id = $1
             ORDER BY (status = 'pending') DESC, created_at DESC
@@ -3871,33 +4061,56 @@ async def list_entity_card_proposals(entity_id: int) -> List[dict]:
 
 
 async def accept_entity_card_proposal(proposal_id: int) -> dict:
-    """Accept a proposal: re-validate evidence, apply the snapshot as confirmed."""
+    """Accept a proposal, dispatching on proposal_type.
+
+    snapshot → apply as a confirmed snapshot; trait_add → add an active stable
+    trait (evidence must belong to the entity); trait_retire → retire the trait.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow("""
                 SELECT id, entity_id, state, fact_date, evidence_memory_id,
-                       evidence_message_id, status
+                       evidence_message_id, status, proposal_type, trait_id,
+                       last_confirmed, evidence_memory_ids, evidence_message_ids
                 FROM entity_card_proposals WHERE id = $1 FOR UPDATE
             """, proposal_id)
             if not row:
                 return {"error": "提案不存在"}
             if row["status"] != "pending":
                 return {"error": "提案已处理"}
-            if row["evidence_memory_id"]:
-                valid = await conn.fetchrow(
-                    "SELECT 1 FROM memory_entities WHERE entity_id = $1 AND memory_id = $2",
-                    row["entity_id"], row["evidence_memory_id"],
+            proposal_type = row["proposal_type"]
+            if proposal_type == "snapshot":
+                if row["evidence_memory_id"]:
+                    valid = await conn.fetchrow(
+                        "SELECT 1 FROM memory_entities WHERE entity_id = $1 AND memory_id = $2",
+                        row["entity_id"], row["evidence_memory_id"],
+                    )
+                    if not valid:
+                        return {"error": "提案证据记忆不属于该实体"}
+                result = await apply_entity_snapshot(
+                    row["entity_id"], row["state"], row["fact_date"],
+                    row["evidence_memory_id"], row["evidence_message_id"],
+                    source="confirmed", force=True,
                 )
-                if not valid:
-                    return {"error": "提案证据记忆不属于该实体"}
-            result = await apply_entity_snapshot(
-                row["entity_id"], row["state"], row["fact_date"],
-                row["evidence_memory_id"], row["evidence_message_id"],
-                source="confirmed", force=True,
-            )
-            if result.get("status") in ("not_found", "error"):
-                return {"error": result.get("error", "实体不存在")}
+                if result.get("status") in ("not_found", "error"):
+                    return {"error": result.get("error", "实体不存在")}
+            elif proposal_type == "trait_add":
+                result = await add_entity_card_trait(
+                    row["entity_id"], row["state"],
+                    first_seen=row["fact_date"], last_confirmed=row["last_confirmed"],
+                    evidence_memory_ids=row["evidence_memory_ids"],
+                    evidence_message_ids=row["evidence_message_ids"],
+                    origin="candidate",
+                )
+                if result.get("error"):
+                    return {"error": result["error"]}
+            elif proposal_type == "trait_retire":
+                result = await retire_entity_card_trait(row["entity_id"], row["trait_id"])
+                if result.get("error"):
+                    return {"error": result["error"]}
+            else:
+                return {"error": f"未知提案类型: {proposal_type}"}
             await conn.execute(
                 "UPDATE entity_card_proposals SET status = 'accepted', decided_at = NOW() WHERE id = $1",
                 proposal_id,
@@ -3915,6 +4128,128 @@ async def reject_entity_card_proposal(proposal_id: int) -> dict:
     if result == "UPDATE 0":
         return {"error": "提案不存在或已处理"}
     return {"status": "ok", "proposal_id": proposal_id}
+
+
+async def _validate_trait_evidence(conn, entity_id: int, evidence_memory_ids: list) -> tuple:
+    """Ensure all evidence memory IDs belong to the entity; return (owned, error)."""
+    memory_ids = _clean_int_list(evidence_memory_ids)
+    if not memory_ids:
+        return [], "稳定特征至少需要一条属于该实体的证据记忆"
+    rows = await conn.fetch(
+        "SELECT memory_id FROM memory_entities WHERE entity_id = $1 AND memory_id = ANY($2::int[])",
+        entity_id, memory_ids,
+    )
+    owned = {row["memory_id"] for row in rows}
+    missing = [mid for mid in memory_ids if mid not in owned]
+    if missing:
+        return [], f"证据记忆不属于该实体: {missing}"
+    return memory_ids, None
+
+
+async def add_entity_card_trait(
+    entity_id: int,
+    text: str,
+    first_seen=None,
+    last_confirmed=None,
+    evidence_memory_ids=None,
+    evidence_message_ids=None,
+    origin: str = "confirmed",
+    trait_id=None,
+) -> dict:
+    """Append a stable trait to the entity card (human-confirmed or accepted trait_add).
+
+    Requires at least one evidence memory that belongs to the entity; enforces the
+    active-trait cap. Retired traits are kept (with evidence) but never injected.
+    """
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return {"error": "稳定特征不能为空"}
+    text = text[:ENTITY_CARD_TRAIT_TEXT_LIMIT]
+    try:
+        first_seen = _resolve_trait_date(first_seen)
+        last_confirmed = _resolve_trait_date(last_confirmed)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    evidence_memory_ids = _clean_int_list(evidence_memory_ids)
+    if not evidence_memory_ids:
+        return {"error": "稳定特征至少需要一条属于该实体的证据记忆"}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        owned, err = await _validate_trait_evidence(conn, entity_id, evidence_memory_ids)
+        if err:
+            return {"error": err}
+        row = await conn.fetchrow("SELECT entity_card_json FROM entities WHERE id = $1", entity_id)
+        if not row:
+            return {"error": "实体不存在"}
+        card = _parse_entity_card(row["entity_card_json"])
+        new_trait = {
+            "id": trait_id or str(uuid.uuid4()),
+            "text": text,
+            "status": "active",
+            "first_seen": first_seen,
+            "last_confirmed": last_confirmed,
+            "evidence_memory_ids": owned,
+            "evidence_message_ids": _clean_int_list(evidence_message_ids),
+            "origin": origin,
+        }
+        card["stable_traits"].append(new_trait)
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok", "trait": new_trait}
+
+
+async def update_entity_card_trait(entity_id: int, trait_id: str, text=None, last_confirmed=None) -> dict:
+    """Edit one stable trait's text and/or last_confirmed, keyed by its id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT entity_card_json FROM entities WHERE id = $1", entity_id)
+        if not row:
+            return {"error": "实体不存在"}
+        card = _parse_entity_card(row["entity_card_json"])
+        target = next((t for t in card["stable_traits"] if t["id"] == trait_id), None)
+        if target is None:
+            return {"error": "未找到该稳定特征"}
+        if text is not None:
+            text = re.sub(r"\s+", " ", str(text)).strip()
+            if not text:
+                return {"error": "稳定特征不能为空"}
+            target["text"] = text[:ENTITY_CARD_TRAIT_TEXT_LIMIT]
+        if last_confirmed is not None:
+            try:
+                target["last_confirmed"] = _resolve_trait_date(last_confirmed)
+            except ValueError as exc:
+                return {"error": str(exc)}
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok", "trait": target}
+
+
+async def retire_entity_card_trait(entity_id: int, trait_id: str) -> dict:
+    """Retire a stable trait: keep it and its evidence but stop injecting it."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT entity_card_json FROM entities WHERE id = $1", entity_id)
+        if not row:
+            return {"error": "实体不存在"}
+        card = _parse_entity_card(row["entity_card_json"])
+        target = next((t for t in card["stable_traits"] if t["id"] == trait_id), None)
+        if target is None:
+            return {"error": "未找到该稳定特征"}
+        if target["status"] != "active":
+            return {"error": "该特征已不是活跃状态"}
+        target["status"] = "retired"
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok", "trait": target}
 
 
 async def record_memory_evidence(memory_id: int, conversation_ids: list, role: str = "user"):
@@ -3943,6 +4278,23 @@ async def get_entity_memories(entity_id: int):
             ORDER BY m.created_at DESC
         """, entity_id)
         return [dict(row) for row in rows]
+
+
+async def get_memory_evidence_message_ids(memory_ids: list) -> dict:
+    """Map memory ids → sorted evidence message (conversation) ids."""
+    ids = [int(mid) for mid in (memory_ids or []) if mid]
+    if not ids:
+        return {}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT memory_id, conversation_id FROM memory_evidence
+            WHERE memory_id = ANY($1::int[]) ORDER BY conversation_id
+        """, ids)
+    result = {}
+    for row in rows:
+        result.setdefault(row["memory_id"], []).append(row["conversation_id"])
+    return result
 
 
 async def get_unlinked_memories(limit: int = 30):
@@ -4045,14 +4397,32 @@ async def merge_entities(source_id: int, target_id: int):
                 seen_keys.add(key)
                 merged_snapshots.append(snapshot)
             merged_snapshots = _sort_snapshots(merged_snapshots)
+            merged_traits, trait_conflicts = _merge_stable_traits(
+                target_card.get("stable_traits") or [],
+                source_card.get("stable_traits") or [],
+            )
             await conn.execute("""
                 UPDATE entities SET entity_card_json = $2::jsonb,
                        entity_card_updated_at = NOW(), updated_at = NOW()
                 WHERE id = $1
             """, target_id, json.dumps(
-                {"description": combined_description, "snapshots": merged_snapshots},
+                {"description": combined_description, "stable_traits": merged_traits, "snapshots": merged_snapshots},
                 ensure_ascii=False,
             ))
+            # 同文本稳定特征状态冲突 → 待确认提案，不自行决定 active/retired
+            for conflict in trait_conflicts:
+                proposal_type = "trait_add" if conflict["status_proposed"] == "active" else "trait_retire"
+                trait_id = None if proposal_type == "trait_add" else conflict.get("existing_trait_id")
+                await conn.execute("""
+                    INSERT INTO entity_card_proposals
+                        (entity_id, state, fact_date, source_role, reason, proposal_type,
+                         trait_id, last_confirmed, evidence_memory_ids, evidence_message_ids)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                """, target_id, conflict["text"][:ENTITY_CARD_TRAIT_TEXT_LIMIT],
+                    _parse_fact_date(conflict["first_seen"]), "merge",
+                    "实体合并：同文本稳定特征状态冲突，需人工确认", proposal_type,
+                    trait_id, _parse_fact_date(conflict["last_confirmed"]),
+                    conflict["evidence_memory_ids"], conflict["evidence_message_ids"])
             await conn.execute("""
                 UPDATE entity_card_proposals SET entity_id = $2
                 WHERE entity_id = $1 AND status = 'pending'

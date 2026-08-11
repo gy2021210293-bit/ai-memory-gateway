@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 import types
@@ -46,13 +47,14 @@ class FakePool:
 
 class ProposalConnection:
     def __init__(self, proposal_row=None, entity_row=True, evidence_valid=True, card_json=None,
-                 execute_result="UPDATE 1"):
+                 execute_result="UPDATE 1", owned_memory_ids=None):
         # entity_row: True → an entity exists (id=1); None → entity missing.
         self.proposal_row = proposal_row
         self.entity_row = entity_row
         self.evidence_valid = evidence_valid
-        self.card_json = card_json if card_json is not None else {"description": "", "snapshots": []}
+        self.card_json = card_json if card_json is not None else {"description": "", "stable_traits": [], "snapshots": []}
         self.execute_result = execute_result
+        self.owned_memory_ids = owned_memory_ids or []
         self.execute_calls = []
 
     def transaction(self):
@@ -60,7 +62,15 @@ class ProposalConnection:
 
     async def fetchrow(self, sql, *_args):
         if "FOR UPDATE" in sql:
-            return self.proposal_row
+            if self.proposal_row is None:
+                return None
+            row = dict(self.proposal_row)
+            row.setdefault("proposal_type", "snapshot")
+            row.setdefault("trait_id", None)
+            row.setdefault("last_confirmed", None)
+            row.setdefault("evidence_memory_ids", [])
+            row.setdefault("evidence_message_ids", [])
+            return row
         if "entity_card_json" in sql:
             return {"entity_card_json": self.card_json}
         if "memory_entities" in sql:
@@ -68,6 +78,11 @@ class ProposalConnection:
         if self.entity_row is None:
             return None
         return {"id": 1} if self.entity_row is True else self.entity_row
+
+    async def fetch(self, sql, *_args):
+        if "memory_entities" in sql:
+            return [{"memory_id": mid} for mid in self.owned_memory_ids]
+        return []
 
     async def execute(self, sql, *args):
         self.execute_calls.append((sql, args))
@@ -308,6 +323,110 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
             result = await database.reject_entity_card_proposal(3)
         self.assertIn("error", result)
+
+    async def test_create_trait_add_proposal_requires_two_evidence(self):
+        conn = ProposalConnection()
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            # 单条证据 → 拒绝
+            result = await database.create_entity_card_proposal(
+                1, "特征", proposal_type="trait_add", evidence_memory_ids=[5],
+            )
+            self.assertIn("至少需要两条", result["error"])
+            # 两条不同证据 → 允许
+            result2 = await database.create_entity_card_proposal(
+                1, "特征", proposal_type="trait_add", evidence_memory_ids=[5, 6],
+            )
+            self.assertEqual(result2["status"], "ok")
+
+    async def test_accept_trait_add_proposal_applies_trait(self):
+        proposal = {
+            "id": 4, "entity_id": 1, "state": "长期目标是边缘设备部署", "fact_date": "2026-03-01",
+            "evidence_memory_id": None, "evidence_message_id": None, "status": "pending",
+            "proposal_type": "trait_add", "trait_id": None, "last_confirmed": "2026-08-11",
+            "evidence_memory_ids": [7, 8], "evidence_message_ids": [20],
+        }
+        conn = ProposalConnection(
+            proposal_row=proposal,
+            card_json={"description": "", "stable_traits": [], "snapshots": []},
+            owned_memory_ids=[7, 8],
+        )
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.accept_entity_card_proposal(4)
+        self.assertEqual(result["status"], "ok")
+        card_updates = [call for call in conn.execute_calls if "entity_card_json" in call[0]]
+        written = json.loads(card_updates[0][1][1])
+        self.assertEqual(written["stable_traits"][0]["text"], "长期目标是边缘设备部署")
+        self.assertEqual(written["stable_traits"][0]["status"], "active")
+        accepted = [call for call in conn.execute_calls if "SET status = 'accepted'" in call[0]]
+        self.assertEqual(len(accepted), 1)
+
+    async def test_accept_trait_add_proposal_rejects_foreign_evidence(self):
+        proposal = {
+            "id": 4, "entity_id": 1, "state": "特征", "fact_date": "2026-03-01",
+            "evidence_memory_id": None, "evidence_message_id": None, "status": "pending",
+            "proposal_type": "trait_add", "trait_id": None, "last_confirmed": "2026-08-11",
+            "evidence_memory_ids": [7, 8], "evidence_message_ids": [],
+        }
+        conn = ProposalConnection(
+            proposal_row=proposal,
+            card_json={"description": "", "stable_traits": [], "snapshots": []},
+            owned_memory_ids=[7],  # 8 不属于该实体
+        )
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.accept_entity_card_proposal(4)
+        self.assertIn("证据记忆不属于该实体", result["error"])
+
+    async def test_accept_trait_retire_proposal_retires_trait(self):
+        card_json = {"description": "", "stable_traits": [
+            {"id": "t1", "text": "习惯晨跑", "status": "active",
+             "first_seen": "2026-02-01", "last_confirmed": "2026-04-01",
+             "evidence_memory_ids": [7], "evidence_message_ids": [], "origin": "confirmed"},
+        ], "snapshots": []}
+        proposal = {
+            "id": 5, "entity_id": 1, "state": "习惯晨跑", "fact_date": None,
+            "evidence_memory_id": 9, "evidence_message_id": None, "status": "pending",
+            "proposal_type": "trait_retire", "trait_id": "t1", "last_confirmed": None,
+            "evidence_memory_ids": [], "evidence_message_ids": [],
+        }
+        conn = ProposalConnection(proposal_row=proposal, card_json=card_json)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.accept_entity_card_proposal(5)
+        self.assertEqual(result["status"], "ok")
+        card_updates = [call for call in conn.execute_calls if "entity_card_json" in call[0]]
+        written = json.loads(card_updates[0][1][1])
+        self.assertEqual(written["stable_traits"][0]["status"], "retired")
+
+    async def test_suggest_entity_trait_candidates_requires_two_evidence_and_flags_contradictions(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [
+                {"text": "单证据特征", "first_seen": "2026-03-01", "last_confirmed": "2026-08-11",
+                 "evidence_memory_ids": [1]},
+                {"text": "双证据特征", "first_seen": "2026-03-01", "last_confirmed": "2026-08-11",
+                 "evidence_memory_ids": [1, 2]},
+            ],
+            "contradictions": [
+                {"text": "已放弃的旧特征", "evidence_memory_ids": [1, 2]},
+                {"text": "不是活跃特征", "evidence_memory_ids": [1, 2]},
+            ],
+        })}}]}
+        with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient(payload)), \
+             patch("memory_extractor.get_memory_api_key", return_value="key"), \
+             patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
+            result = await memory_extractor.suggest_entity_trait_candidates(
+                {"id": 1, "name": "小明", "entity_type": "person"},
+                [
+                    {"id": 1, "content": "小明长期目标是边缘设备部署", "layer": 1},
+                    {"id": 2, "content": "小明也说过要专注部署", "layer": 1},
+                ],
+                current_traits=["双证据特征", "已放弃的旧特征"],
+            )
+        # 单条证据的候选被丢弃，两条证据的候选保留
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(result["candidates"][0]["text"], "双证据特征")
+        self.assertEqual(result["candidates"][0]["evidence_memory_ids"], [1, 2])
+        # 矛盾只保留与当前活跃特征匹配的（"不是活跃特征"被丢弃）
+        self.assertEqual(len(result["contradictions"]), 1)
+        self.assertEqual(result["contradictions"][0]["text"], "已放弃的旧特征")
 
 
 class _FakeCardResponse:

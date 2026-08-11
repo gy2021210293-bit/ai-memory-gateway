@@ -1743,6 +1743,40 @@ body::after {
     box-sizing: border-box;
 }
 
+.entity-card-traits {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 280px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.entity-card-trait {
+    padding: 10px 12px;
+    border: 1px solid rgba(126, 99, 145, .12);
+    border-radius: 12px;
+    background: rgba(249, 247, 250, .58);
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.entity-card-trait-header {
+    font-size: 12px;
+    font-weight: 650;
+    margin-bottom: 4px;
+    letter-spacing: .01em;
+}
+
+.entity-card-trait-header.trait-active {
+    color: #1b7a4f;
+}
+
+.entity-card-trait-header.trait-retired {
+    color: #8a8f98;
+    text-decoration: line-through;
+}
+
 /* Entity list */
 #entity-list {
     margin-top: 22px !important;

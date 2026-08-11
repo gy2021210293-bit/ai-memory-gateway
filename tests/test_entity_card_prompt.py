@@ -149,6 +149,43 @@ class EntityCardPromptTests(unittest.TestCase):
         rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "她当时说的原话是什么")
         self.assertEqual(rendered.strip(), "")
 
+    def test_stable_traits_injected_active_only_in_order(self):
+        entity = {
+            "id": 2, "name": "项目", "type": "project", "retrieval_status": "active",
+            "aliases": [], "description": "", "exact_name_match": True,
+            "entity_card_json": {
+                "description": "长期项目",
+                "stable_traits": [
+                    {"id": "t1", "text": "长期目标是边缘设备部署", "status": "active",
+                     "first_seen": "2026-03-01", "last_confirmed": "2026-08-11",
+                     "evidence_memory_ids": [1, 2], "evidence_message_ids": [], "origin": "confirmed"},
+                    {"id": "t2", "text": "已放弃的旧特征", "status": "retired",
+                     "first_seen": "2026-01-01", "last_confirmed": "2026-02-01",
+                     "evidence_memory_ids": [3], "evidence_message_ids": [], "origin": "confirmed"},
+                ],
+                "snapshots": [
+                    {"fact_date": "2026-07-20", "recorded_at": "", "state": "阶段2", "source": "direct"},
+                    {"fact_date": "2026-08-01", "recorded_at": "", "state": "阶段3", "source": "direct"},
+                ],
+            },
+        }
+        rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "这个项目最近怎么样")
+        # 注入顺序：实体说明 → 长期稳定特征（仅 active）→ 最近状态快照
+        self.assertIn("· 长期稳定特征：长期目标是边缘设备部署", rendered)
+        self.assertLess(rendered.index("长期项目"), rendered.index("长期稳定特征：长期目标是边缘设备部署"))
+        self.assertLess(rendered.index("长期稳定特征：长期目标是边缘设备部署"), rendered.index("2026-08-01"))
+        self.assertNotIn("已放弃的旧特征", rendered)  # retired 绝不注入
+        self.assertIn("2026-07-20：阶段2", rendered)
+
+    def test_trait_generate_not_on_chat_path(self):
+        source = (ROOT / "main.py").read_text(encoding="utf-8")
+        self.assertIn("api_generate_entity_trait_candidates", source)
+        # 聊天注入段（_format_matched_entity_overview → build_system_prompt）不调用候选生成，
+        # 生成只由 Dashboard 的 traits/generate 端点触发，聊天路径不新增 LLM 调用
+        inject_start = source.index("def _format_matched_entity_overview")
+        inject_end = source.index("def build_system_prompt_with_memories")
+        self.assertNotIn("suggest_entity_trait_candidates", source[inject_start:inject_end])
+
 
 class EntityCardSearchSqlTests(unittest.TestCase):
     def test_entity_search_sql_carries_card_column(self):

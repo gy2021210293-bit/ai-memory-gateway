@@ -30,11 +30,11 @@ from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
-from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence
+from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, BACKFILL_SNAPSHOT_CHUNK
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, BACKFILL_SNAPSHOT_CHUNK
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -457,6 +457,13 @@ def _format_matched_entity_overview(memories: list, user_message: str = "") -> s
         if description:
             header += f"—— {description}"
         lines.append(header)
+        # 注入顺序：实体说明 → 长期稳定特征（仅 active，retired/pending/rejected 一律不注入）→ 最近状态快照
+        for trait in (card.get("stable_traits") or []):
+            if not isinstance(trait, dict) or trait.get("status") != "active":
+                continue
+            trait_text = str(trait.get("text") or "").strip()
+            if trait_text:
+                lines.append(f"  · 长期稳定特征：{trait_text}")
         recent = snapshots[-3:]
         exact_match = bool(entity.get("exact_name_match"))
         for i, snapshot in enumerate(recent):
@@ -2729,6 +2736,159 @@ async def api_reject_entity_card_proposal(entity_id: int, proposal_id: int):
     if result.get("error"):
         return JSONResponse(status_code=400, content=result)
     return result
+
+
+@app.post("/api/entities/{entity_id}/card/traits")
+async def api_add_entity_card_trait(entity_id: int, request: Request):
+    """Manually add a stable trait (human-confirmed). Requires ≥1 owned evidence memory."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "稳定特征不能为空"})
+    try:
+        evidence_memory_ids = [int(mid) for mid in (data.get("evidence_memory_ids") or [])]
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "证据记忆ID必须是整数"})
+    if not evidence_memory_ids:
+        return JSONResponse(status_code=400, content={"error": "稳定特征至少需要一条属于该实体的证据记忆"})
+    result = await add_entity_card_trait(
+        entity_id, text,
+        first_seen=data.get("first_seen"),
+        last_confirmed=data.get("last_confirmed"),
+        evidence_memory_ids=evidence_memory_ids,
+        evidence_message_ids=data.get("evidence_message_ids"),
+        origin="confirmed",
+    )
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    card = await get_entity_card(entity_id)
+    return {"status": "ok", "card": card or {"description": "", "stable_traits": [], "snapshots": []}}
+
+
+@app.put("/api/entities/{entity_id}/card/traits/{trait_id}")
+async def api_update_entity_card_trait(entity_id: int, trait_id: str, request: Request):
+    """Edit one stable trait's text and/or last_confirmed."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    result = await update_entity_card_trait(
+        entity_id, trait_id, data.get("text"), data.get("last_confirmed"),
+    )
+    if result.get("error"):
+        code = 404 if "未找到" in result["error"] else 400
+        return JSONResponse(status_code=code, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/traits/{trait_id}/retire")
+async def api_retire_entity_card_trait(entity_id: int, trait_id: str):
+    """Retire a stable trait: kept with evidence, no longer injected."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    result = await retire_entity_card_trait(entity_id, trait_id)
+    if result.get("error"):
+        code = 404 if "未找到" in result["error"] else 400
+        return JSONResponse(status_code=code, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/traits/generate")
+async def api_generate_entity_trait_candidates(entity_id: int, request: Request):
+    """Dashboard-triggered: LLM proposes stable-trait candidates from entity memories.
+
+    Never runs on the chat request path. Every candidate must cite ≥2 distinct
+    evidence memories and becomes a pending trait_add proposal (human-only accept).
+    """
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    memories = await get_entity_memories(entity_id)
+    if not memories:
+        return JSONResponse(status_code=400, content={"error": "该实体没有关联记忆，无法生成候选"})
+    evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+    card = await get_entity_card(entity_id) or {}
+    current_traits = [
+        t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+    ]
+    suggestion = await suggest_entity_trait_candidates(
+        entity, memories, evidence_message_map, current_traits,
+    )
+    candidates = suggestion.get("candidates") or []
+    contradictions = suggestion.get("contradictions") or []
+    existing = await list_entity_card_proposals(entity_id)
+    pending_texts = {
+        str(p["state"]).strip().casefold() for p in existing
+        if p["status"] == "pending" and p.get("proposal_type") == "trait_add"
+    }
+    pending_retire_texts = {
+        str(p["state"]).strip().casefold() for p in existing
+        if p["status"] == "pending" and p.get("proposal_type") == "trait_retire"
+    }
+    proposed = 0
+    skipped = 0
+    retired_proposed = 0
+    errors = []
+    for candidate in candidates:
+        if str(candidate["text"]).strip().casefold() in pending_texts:
+            skipped += 1
+            continue
+        result = await create_entity_card_proposal(
+            entity_id,
+            candidate["text"],
+            fact_date=candidate["first_seen"] or None,
+            source_role="candidate",
+            reason="稳定特征候选：LLM 从实体关联记忆生成，需人工确认",
+            proposal_type="trait_add",
+            last_confirmed=candidate["last_confirmed"] or None,
+            evidence_memory_ids=candidate["evidence_memory_ids"],
+            evidence_message_ids=candidate["evidence_message_ids"],
+        )
+        if result.get("error"):
+            errors.append(result["error"])
+        else:
+            proposed += 1
+            pending_texts.add(str(candidate["text"]).strip().casefold())
+    # 矛盾检测：被新证据推翻的活跃特征 → trait_retire 提案（绝不静默删除）
+    active_by_text = {
+        str(t.get("text") or "").strip().casefold(): t
+        for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+    }
+    for contradiction in contradictions:
+        text = str(contradiction.get("text") or "").strip()
+        trait = active_by_text.get(text.casefold())
+        if trait is None:
+            continue
+        if text.casefold() in pending_retire_texts:
+            skipped += 1
+            continue
+        result = await create_entity_card_proposal(
+            entity_id,
+            text,
+            source_role="candidate",
+            reason="稳定特征矛盾：新证据表明该活跃特征已不再成立/被取代",
+            proposal_type="trait_retire",
+            trait_id=trait["id"],
+            evidence_memory_ids=contradiction.get("evidence_memory_ids"),
+        )
+        if result.get("error"):
+            errors.append(result["error"])
+        else:
+            retired_proposed += 1
+            pending_retire_texts.add(text.casefold())
+    return {
+        "status": "ok",
+        "proposed": proposed,
+        "retired_proposed": retired_proposed,
+        "skipped": skipped,
+        "errors": errors,
+        "candidates": [{"text": c["text"]} for c in candidates],
+        "contradictions": [{"text": c["text"]} for c in contradictions],
+    }
 
 
 @app.post("/api/entities/merge")
