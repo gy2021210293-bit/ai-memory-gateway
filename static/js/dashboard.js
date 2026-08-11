@@ -708,14 +708,29 @@ async function backfillEntityCards() {
     const status = document.getElementById('entity-status');
     if (!confirm('将调用记忆模型，为最多 20 个没有状态卡的旧实体提取「当前状态」建议。\n\n生成的是待确认提案，不会自动进卡——你在下方确认后才写入。是否继续？')) return;
     status.textContent = '正在补全实体状态卡，请稍候…';
-    const response = await fetch('/api/entities/backfill-cards', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 20 }),
-    });
-    const data = await response.json();
-    status.textContent = data.error || `处理 ${data.processed} 个实体，生成 ${data.proposed} 条待确认提案（跳过 ${data.skipped}，失败 ${data.errors}）。`;
-    if (response.ok) {
-        await loadEntities();
-        if (selectedEntity) await loadEntityCard(selectedEntity.id);
+    try {
+        const response = await fetch('/api/entities/backfill-cards', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 20 }),
+        });
+        const data = await response.json().catch(() => null);
+        let message;
+        if (!data) {
+            message = `请求失败（HTTP ${response.status}），后端未返回 JSON。可能服务未重启或路由未生效，请查看后端控制台。`;
+        } else if (data.error || data.detail) {
+            message = data.error || data.detail;
+        } else {
+            message = `处理 ${data.processed} 个实体，生成 ${data.proposed} 条待确认提案（跳过 ${data.skipped}，失败 ${data.errors}）。`;
+            if (Array.isArray(data.errors_detail) && data.errors_detail.length) {
+                message += ` 失败原因：${data.errors_detail.join('；')}`;
+            }
+        }
+        if (response.ok) {
+            await loadEntities();
+            if (selectedEntity) await loadEntityCard(selectedEntity.id);
+        }
+        status.textContent = message;  // 结果最后显示，避免被列表刷新的"加载中…"覆盖
+    } catch (error) {
+        status.textContent = `补全失败：${error.message}`;
     }
 }
 

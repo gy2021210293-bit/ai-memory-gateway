@@ -864,6 +864,7 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[
                 by_id[entity_id].get("memories") or [],
             )
             results[entity_id] = snapshot
+        print(f"📝 状态卡补全批次：{len(entities)} 个实体，模型返回 {len(results)} 条状态建议")
         return results
     except Exception as exc:
         print(f"⚠️ 实体状态卡补全失败: {exc}")

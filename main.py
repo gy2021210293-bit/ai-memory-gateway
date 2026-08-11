@@ -2772,45 +2772,52 @@ async def api_backfill_entity_cards(request: Request):
     proposed = 0
     skipped = 0
     errors = 0
+    errors_detail = []
     for i in range(0, len(entities), BACKFILL_SNAPSHOT_CHUNK):
         chunk = entities[i:i + BACKFILL_SNAPSHOT_CHUNK]
-        for entity in chunk:
-            entity["memories"] = await get_entity_memories(entity["id"])
-        suggestions = await suggest_entity_snapshots_batch(chunk)
-        if suggestions is None:
+        try:
+            for entity in chunk:
+                entity["memories"] = await get_entity_memories(entity["id"])
+            suggestions = await suggest_entity_snapshots_batch(chunk)
+            if suggestions is None:
+                errors += len(chunk)
+                errors_detail.append(f"LLM 批次失败（{len(chunk)} 个实体）")
+                continue
+            for entity in chunk:
+                suggestion = suggestions.get(entity["id"])
+                if not suggestion:
+                    skipped += 1
+                    continue
+                existing = await list_entity_card_proposals(entity["id"])
+                if any(
+                    p["status"] == "pending" and p["state"] == suggestion["state"]
+                    for p in existing
+                ):
+                    skipped += 1
+                    continue
+                reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
+                if suggestion.get("evidence_quote"):
+                    reason += f"；证据引文：{suggestion['evidence_quote']}"
+                await create_entity_card_proposal(
+                    entity["id"],
+                    suggestion["state"],
+                    suggestion.get("fact_date"),
+                    evidence_memory_id=suggestion.get("evidence_memory_id"),
+                    evidence_message_id=None,
+                    source_role="backfill",
+                    reason=reason,
+                )
+                proposed += 1
+        except Exception as exc:
             errors += len(chunk)
-            continue
-        for entity in chunk:
-            suggestion = suggestions.get(entity["id"])
-            if not suggestion:
-                skipped += 1
-                continue
-            existing = await list_entity_card_proposals(entity["id"])
-            if any(
-                p["status"] == "pending" and p["state"] == suggestion["state"]
-                for p in existing
-            ):
-                skipped += 1
-                continue
-            reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
-            if suggestion.get("evidence_quote"):
-                reason += f"；证据引文：{suggestion['evidence_quote']}"
-            await create_entity_card_proposal(
-                entity["id"],
-                suggestion["state"],
-                suggestion.get("fact_date"),
-                evidence_memory_id=suggestion.get("evidence_memory_id"),
-                evidence_message_id=None,
-                source_role="backfill",
-                reason=reason,
-            )
-            proposed += 1
+            errors_detail.append(f"批次处理异常：{exc}")
     return {
         "status": "ok",
         "processed": len(entities),
         "proposed": proposed,
         "skipped": skipped,
         "errors": errors,
+        "errors_detail": errors_detail,
     }
 
 
