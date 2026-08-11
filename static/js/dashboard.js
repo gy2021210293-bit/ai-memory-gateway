@@ -704,31 +704,62 @@ async function backfillEntities() {
     if (response.ok) loadEntities();
 }
 
+let _cardBackfillTimer = null;
+
 async function backfillEntityCards() {
     const status = document.getElementById('entity-status');
     if (!confirm('将调用记忆模型，为最多 20 个没有状态卡的旧实体提取「当前状态」建议。\n\n生成的是待确认提案，不会自动进卡——你在下方确认后才写入。是否继续？')) return;
-    status.textContent = '正在补全实体状态卡，请稍候…';
+    if (_cardBackfillTimer) {
+        status.textContent = '补卡任务已在运行中，请等待完成。';
+        return;
+    }
+    status.textContent = '正在启动补全…';
     try {
         const response = await fetch('/api/entities/backfill-cards', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 20 }),
         });
         const data = await response.json().catch(() => null);
-        let message;
-        if (!data) {
-            message = `请求失败（HTTP ${response.status}），后端未返回 JSON。可能服务未重启或路由未生效，请查看后端控制台。`;
-        } else if (data.error || data.detail) {
-            message = data.error || data.detail;
-        } else {
-            message = `处理 ${data.processed} 个实体，生成 ${data.proposed} 条待确认提案（跳过 ${data.skipped}，失败 ${data.errors}）。`;
-            if (Array.isArray(data.errors_detail) && data.errors_detail.length) {
-                message += ` 失败原因：${data.errors_detail.join('；')}`;
-            }
+        if (!response.ok || !data) {
+            status.textContent = (data && (data.error || data.detail))
+                ? (data.error || data.detail)
+                : `请求失败（HTTP ${response.status}），后端未返回 JSON，请查看后端控制台。`;
+            return;
         }
-        if (response.ok) {
+        if (data.error) {
+            status.textContent = data.error;
+            return;
+        }
+        if (data.status === 'done') {
+            status.textContent = '没有需要补卡的实体。';
             await loadEntities();
-            if (selectedEntity) await loadEntityCard(selectedEntity.id);
+            return;
         }
-        status.textContent = message;  // 结果最后显示，避免被列表刷新的"加载中…"覆盖
+        status.textContent = `补卡已启动（${data.total} 个实体），后台执行中…`;
+        _cardBackfillTimer = setInterval(async () => {
+            try {
+                const sresp = await fetch('/api/entities/backfill-cards/status');
+                const sdata = await sresp.json();
+                if (sdata.running) {
+                    status.textContent = `补卡中 ${sdata.processed}/${sdata.total}，已生成 ${sdata.proposed} 条提案（跳过 ${sdata.skipped}，失败 ${sdata.errors}）…`;
+                    return;
+                }
+                clearInterval(_cardBackfillTimer);
+                _cardBackfillTimer = null;
+                let message = sdata.error
+                    ? `补卡失败：${sdata.error}`
+                    : `补卡完成：处理 ${sdata.total} 个实体，生成 ${sdata.proposed} 条待确认提案（跳过 ${sdata.skipped}，失败 ${sdata.errors}）。`;
+                if (Array.isArray(sdata.errors_detail) && sdata.errors_detail.length) {
+                    message += ` 失败原因：${sdata.errors_detail.join('；')}`;
+                }
+                status.textContent = message;
+                await loadEntities();
+                if (selectedEntity) await loadEntityCard(selectedEntity.id);
+            } catch (error) {
+                clearInterval(_cardBackfillTimer);
+                _cardBackfillTimer = null;
+                status.textContent = `补全失败：${error.message}`;
+            }
+        }, 2000);
     } catch (error) {
         status.textContent = `补全失败：${error.message}`;
     }

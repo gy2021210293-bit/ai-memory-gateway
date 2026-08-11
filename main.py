@@ -2754,13 +2754,89 @@ async def api_backfill_entities(request: Request):
     }
 
 
+# ============================================================
+# 旧实体状态卡补全（后台异步执行，前端轮询进度）
+# 老实体没有逐字消息回链，因此只生成「待确认提案」，人工在 Dashboard 接受后才进卡。
+# ============================================================
+
+_card_backfill_status = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "proposed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "errors_detail": [],
+    "error": None,
+    "finished_at": None,
+}
+
+
+async def _run_card_backfill(entities: list) -> None:
+    """Process one backfill task: chunked LLM suggestions → pending proposals."""
+    proposed = 0
+    skipped = 0
+    errors = 0
+    errors_detail = []
+    try:
+        for i in range(0, len(entities), BACKFILL_SNAPSHOT_CHUNK):
+            chunk = entities[i:i + BACKFILL_SNAPSHOT_CHUNK]
+            _card_backfill_status["processed"] = min(i + len(chunk), len(entities))
+            try:
+                for entity in chunk:
+                    entity["memories"] = await get_entity_memories(entity["id"])
+                suggestions = await suggest_entity_snapshots_batch(chunk)
+                if suggestions is None:
+                    errors += len(chunk)
+                    errors_detail.append(f"LLM 批次失败（{len(chunk)} 个实体）")
+                else:
+                    for entity in chunk:
+                        suggestion = suggestions.get(entity["id"])
+                        if not suggestion:
+                            skipped += 1
+                            continue
+                        existing = await list_entity_card_proposals(entity["id"])
+                        if any(
+                            p["status"] == "pending" and p["state"] == suggestion["state"]
+                            for p in existing
+                        ):
+                            skipped += 1
+                            continue
+                        reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
+                        if suggestion.get("evidence_quote"):
+                            reason += f"；证据引文：{suggestion['evidence_quote']}"
+                        await create_entity_card_proposal(
+                            entity["id"],
+                            suggestion["state"],
+                            suggestion.get("fact_date"),
+                            evidence_memory_id=suggestion.get("evidence_memory_id"),
+                            evidence_message_id=None,
+                            source_role="backfill",
+                            reason=reason,
+                        )
+                        proposed += 1
+            except Exception as exc:
+                errors += len(chunk)
+                errors_detail.append(f"批次处理异常：{exc}")
+            _card_backfill_status["proposed"] = proposed
+            _card_backfill_status["skipped"] = skipped
+            _card_backfill_status["errors"] = errors
+            _card_backfill_status["errors_detail"] = list(errors_detail)
+        _card_backfill_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+        print(f"✅ 实体状态卡补全完成：{len(entities)} 个实体，生成 {proposed} 条提案，跳过 {skipped}，失败 {errors}")
+    except Exception as exc:
+        _card_backfill_status["error"] = str(exc)
+        print(f"❌ 实体状态卡补全异常: {exc}")
+    finally:
+        _card_backfill_status["running"] = False
+        _card_backfill_status["processed"] = len(entities)
+
+
 @app.post("/api/entities/backfill-cards")
 async def api_backfill_entity_cards(request: Request):
-    """Legacy entities with empty cards: one LLM call per batch, all results as pending proposals.
-
-    老实体没有逐字消息回链，因此这里只生成「待确认提案」，由人工在 Dashboard 接受后才进卡。
-    每批 BACKFILL_SNAPSHOT_CHUNK 个实体一次 LLM 调用；同状态待确认提案已存在则跳过。
-    """
+    """启动旧实体状态卡补全（立即返回，后台逐批执行）。"""
+    if _card_backfill_status["running"]:
+        return {"error": "补卡任务正在运行中，请稍候"}
     data = await request.json()
     try:
         limit = max(1, min(50, int(data.get("limit", 20))))
@@ -2768,57 +2844,26 @@ async def api_backfill_entity_cards(request: Request):
         return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
     entities = await list_entities_without_card(limit)
     if not entities:
-        return {"status": "ok", "processed": 0, "proposed": 0, "skipped": 0, "errors": 0}
-    proposed = 0
-    skipped = 0
-    errors = 0
-    errors_detail = []
-    for i in range(0, len(entities), BACKFILL_SNAPSHOT_CHUNK):
-        chunk = entities[i:i + BACKFILL_SNAPSHOT_CHUNK]
-        try:
-            for entity in chunk:
-                entity["memories"] = await get_entity_memories(entity["id"])
-            suggestions = await suggest_entity_snapshots_batch(chunk)
-            if suggestions is None:
-                errors += len(chunk)
-                errors_detail.append(f"LLM 批次失败（{len(chunk)} 个实体）")
-                continue
-            for entity in chunk:
-                suggestion = suggestions.get(entity["id"])
-                if not suggestion:
-                    skipped += 1
-                    continue
-                existing = await list_entity_card_proposals(entity["id"])
-                if any(
-                    p["status"] == "pending" and p["state"] == suggestion["state"]
-                    for p in existing
-                ):
-                    skipped += 1
-                    continue
-                reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
-                if suggestion.get("evidence_quote"):
-                    reason += f"；证据引文：{suggestion['evidence_quote']}"
-                await create_entity_card_proposal(
-                    entity["id"],
-                    suggestion["state"],
-                    suggestion.get("fact_date"),
-                    evidence_memory_id=suggestion.get("evidence_memory_id"),
-                    evidence_message_id=None,
-                    source_role="backfill",
-                    reason=reason,
-                )
-                proposed += 1
-        except Exception as exc:
-            errors += len(chunk)
-            errors_detail.append(f"批次处理异常：{exc}")
-    return {
-        "status": "ok",
-        "processed": len(entities),
-        "proposed": proposed,
-        "skipped": skipped,
-        "errors": errors,
-        "errors_detail": errors_detail,
-    }
+        return {"status": "done", "total": 0, "proposed": 0, "skipped": 0, "errors": 0}
+    _card_backfill_status.update(
+        running=True,
+        total=len(entities),
+        processed=0,
+        proposed=0,
+        skipped=0,
+        errors=0,
+        errors_detail=[],
+        error=None,
+        finished_at=None,
+    )
+    asyncio.create_task(_run_card_backfill(entities))
+    return {"status": "started", "total": len(entities)}
+
+
+@app.get("/api/entities/backfill-cards/status")
+async def api_backfill_entity_cards_status():
+    """查询补卡任务进度（前端轮询）。"""
+    return dict(_card_backfill_status)
 
 
 @app.get("/api/memories/search")
