@@ -58,8 +58,16 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
         self.assertIn(".entity-card-proposal", self.css)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=6.1", self.html)
-        self.assertIn("/static/css/dashboard.css?v=7.0", self.html)
+        self.assertIn("/static/js/dashboard.js?v=6.2", self.html)
+        self.assertIn("/static/css/dashboard.css?v=7.1", self.html)
+
+    def test_entity_list_shows_card_and_proposal_badges(self):
+        self.assertIn("entity-item-badges", self.javascript)
+        self.assertIn("pending_proposal_count", self.javascript)
+        self.assertIn("card_last_state_date", self.javascript)
+        self.assertIn(".entity-badge-pending", self.css)
+        self.assertIn(".entity-badge-card", self.css)
+        self.assertIn(".entity-badge-date", self.css)
 
     def test_conversation_detail_uses_query_parameter_session_id(self):
         self.assertIn("/api/conversation-messages?", self.javascript)

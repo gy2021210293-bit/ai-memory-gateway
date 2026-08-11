@@ -144,6 +144,41 @@ class EntityCardTests(unittest.TestCase):
         })
         self.assertNotIn("current_state", card)
 
+    def test_entity_card_summary_reports_card_and_last_date(self):
+        self.assertEqual(database._entity_card_summary(None), (False, None))
+        self.assertEqual(database._entity_card_summary({"description": "x", "snapshots": []}), (False, None))
+        card = {
+            "snapshots": [
+                {"fact_date": "2026-07-01", "recorded_at": "", "state": "A", "source": "direct"},
+                {"fact_date": "2026-07-20", "recorded_at": "", "state": "B", "source": "direct"},
+            ]
+        }
+        self.assertEqual(database._entity_card_summary(card), (True, "2026-07-20"))
+        # jsonb 列以字符串返回时同样解析
+        self.assertEqual(database._entity_card_summary(json.dumps(card, ensure_ascii=False)), (True, "2026-07-20"))
+
+    def test_list_entities_includes_pending_count_and_card_summary(self):
+        calls = []
+
+        async def fake_fetch(sql, *args):
+            calls.append((sql, args))
+            return [{
+                "id": 1, "name": "Alice", "entity_type": "person", "description": "",
+                "profile_json": None, "profile_evidence_ids": [], "profile_updated_at": None,
+                "profile_model": None, "entity_card_json": None, "entity_card_updated_at": None,
+                "evidence_count": 5, "status_override": None, "created_at": None, "updated_at": None,
+                "memory_count": 2, "aliases": [], "pending_proposal_count": 1,
+            }]
+
+        conn = types.SimpleNamespace(fetch=fake_fetch)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            entities = asyncio.run(database.list_entities())
+        self.assertIn("pending_proposal_count", calls[0][0])
+        self.assertIn("status = 'pending'", calls[0][0])
+        self.assertEqual(entities[0]["pending_proposal_count"], 1)
+        self.assertFalse(entities[0]["card_has_snapshots"])
+        self.assertIsNone(entities[0]["card_last_state_date"])
+
     def test_list_entities_without_card_filters_empty_cards(self):
         calls = []
 
@@ -158,6 +193,9 @@ class EntityCardTests(unittest.TestCase):
         sql = calls[0][0]
         self.assertIn("entity_card_json->'snapshots'", sql)
         self.assertIn("HAVING COUNT(DISTINCT me.memory_id) > 0", sql)
+        # 只补可命中（活跃）实体：与检索路径同一过滤条件
+        self.assertIn("status_override = 'active'", sql)
+        self.assertIn("evidence_count >= 3", sql)
         self.assertIn("LIMIT $1", sql)
         self.assertEqual(calls[0][1], (5,))
 

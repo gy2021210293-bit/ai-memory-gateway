@@ -1770,7 +1770,8 @@ details.entity-group[open] > summary {
     grid-template-columns: minmax(0, 1fr) auto 16px;
     grid-template-areas:
         "identity metrics arrow"
-        "aliases metrics arrow";
+        "aliases metrics arrow"
+        "badges metrics arrow";
     align-items: center;
     gap: 7px 14px;
     width: 100%;
@@ -1885,6 +1886,39 @@ details.entity-group[open] > summary {
     line-height: 1.2;
 }
 
+.entity-item-badges {
+    grid-area: badges;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.entity-badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: nowrap;
+}
+
+.entity-badge-pending {
+    color: #8a5a00;
+    background: rgba(255, 193, 7, .22);
+    border: 1px solid rgba(214, 158, 0, .35);
+}
+
+.entity-badge-card {
+    color: #1b7a4f;
+    background: rgba(46, 204, 113, .18);
+    border: 1px solid rgba(27, 122, 79, .32);
+}
+
+.entity-badge-date {
+    color: #5f5670;
+    background: rgba(120, 110, 140, .12);
+    border: 1px solid rgba(120, 110, 140, .22);
+}
+
 .entity-item-aliases {
     grid-area: aliases;
     overflow: hidden;
@@ -1922,6 +1956,7 @@ details.entity-group[open] > summary {
         grid-template-areas:
             "identity arrow"
             "aliases arrow"
+            "badges badges"
             "metrics metrics";
         padding: 14px;
     }
