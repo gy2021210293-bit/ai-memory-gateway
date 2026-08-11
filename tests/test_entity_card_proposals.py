@@ -85,8 +85,18 @@ class EntityCardHarnessTests(unittest.TestCase):
     def test_normalize_snapshot_rejects_bad_date_and_missing_state(self):
         self.assertIsNone(memory_extractor.normalize_entity_snapshot({"state": "", "fact_date": "2026-07-10"}))
         self.assertIsNone(memory_extractor.normalize_entity_snapshot(None))
-        bad = memory_extractor.normalize_entity_snapshot({"state": "x", "fact_date": "2026-13-40"})
-        self.assertIsNone(bad["fact_date"])
+
+    def test_normalize_snapshot_defaults_missing_date_to_today(self):
+        # 缺日期 / 无效日期 → 兜底为今天（不丢弃状态，也不留"未知日期"）
+        today = memory_extractor._today_date_str()
+        for raw in (
+            {"state": "住在上海"},
+            {"state": "住在上海", "fact_date": ""},
+            {"state": "住在上海", "fact_date": "2026-13-40"},
+        ):
+            snap = memory_extractor.normalize_entity_snapshot(raw)
+            self.assertIsNotNone(snap)
+            self.assertEqual(snap["fact_date"], today)
 
     def test_sanitize_user_references_replaces_user_words(self):
         self.assertEqual(memory_extractor.sanitize_user_references("用户住在上海"), "晏晏住在上海")
@@ -148,12 +158,12 @@ class EntityCardHarnessTests(unittest.TestCase):
             )[0],
             "proposal",
         )
-        # 日期无效/缺失 → proposal
+        # 日期缺失 → 兜底为今天，逐字证据存在 → 不再因日期降为提案（也不会丢弃）
         self.assertEqual(
             memory_extractor.classify_snapshot_suggestion(
                 {"state": "住在上海", "fact_date": "", "evidence_quote": "最近心情不错"}, messages,
             )[0],
-            "proposal",
+            "accept",
         )
         # 空快照 → proposal
         self.assertEqual(

@@ -203,8 +203,8 @@ states that entity's current or past state:
   actions/states of 晏晏 → subject 晏晏 (or 她). Never move 栖's doings onto 晏晏, nor the reverse.
 - `evidence_quote` must be a verbatim substring of ONE user message in this batch
   (at least 6 characters). Never paraphrase, summarize, or infer it.
-- `fact_date` is the date the stated state is true on; if the user only implies
-  "now", use today's date; omit when genuinely unknown.
+- `fact_date` is REQUIRED (valid YYYY-MM-DD): the date the stated state is true
+  on. If the user only implies "now", use today's date; never leave it empty.
 - `state` captures the entity's state exactly as stated, with the user's own words
   where possible; do NOT add opinions, intentions, or relationship judgments.
   A state may be an ongoing situation OR a landmark milestone (毕业、入职、搬家、
@@ -345,12 +345,19 @@ def sanitize_user_references(text: str) -> str:
     return text.replace("用户", "晏晏")
 
 
+def _today_date_str() -> str:
+    """Today's date in the configured timezone, as YYYY-MM-DD."""
+    local = timezone(timedelta(hours=TIMEZONE_HOURS))
+    return datetime.now(local).strftime("%Y-%m-%d")
+
+
 def normalize_entity_snapshot(raw) -> Optional[Dict]:
     """Clean an LLM-supplied snapshot suggestion into a stable shape.
 
-    Returns None when no usable state text is present. `fact_date` is kept only
-    when it is a valid YYYY-MM-DD; `evidence_quote` is trimmed of surrounding
-    quotes/backticks and capped in length.
+    Returns None when there is no usable state text. `fact_date` must be a valid
+    YYYY-MM-DD; when missing or invalid it defaults to today's date so every
+    state still carries a concrete date (never "未知日期") without dropping the
+    state. `evidence_quote` is trimmed of surrounding quotes/backticks and capped.
     """
     if not isinstance(raw, dict):
         return None
@@ -366,12 +373,12 @@ def normalize_entity_snapshot(raw) -> Optional[Dict]:
         match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw_date)
         if match:
             try:
-                datetime(
-                    int(match.group(1)), int(match.group(2)), int(match.group(3))
-                )
+                datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
                 fact_date = raw_date
             except ValueError:
                 fact_date = None
+    if fact_date is None:
+        fact_date = _today_date_str()
 
     evidence_quote = str(raw.get("evidence_quote") or "").strip()
     evidence_quote = evidence_quote.strip("\"'“”‘’` ")
@@ -818,7 +825,7 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
         "判断标准：只有**长期有价值、影响后续互动**的状态或节点才进卡；模棱两可的宁可不要。\n\n"
         "请对每个实体，仅依据它下方的证据记忆，列出该实体的**状态与重要节点史**。\n"
         "每个实体输出一个数组，数组里每条：\n"
-        '{"state": "完整的一句话状态（≤200字）", "fact_date": "YYYY-MM-DD 或留空字符串", '
+        '{"state": "完整的一句话状态（≤200字）", "fact_date": "YYYY-MM-DD（必填）", '
         '"evidence_quote": "证据记忆里逐字出现、用于人工核对的短句（≥6字）"}。\n'
         "要求：\n"
         "- 快照状态以我的第一人称口吻写：证据里是「我/栖」的状态或行为，主语用「我」（栖的第一人称），不要用「栖」称呼；"
@@ -827,6 +834,7 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
         "- 把时间上先后不同的状态/节点各自列为一条，按时间先后排列（旧→新）；\n"
         "- 相同状态只保留一条；数量不设上限，但只收录**长期有回看价值**的状态与重要节点，宁可少而精，不要把琐碎日常写进来\n"
         "- 若证据里没有明确、值得长期记录的状态或重要节点，输出空数组 [];\n"
+        "- 每条快照的 fact_date 必填且为 YYYY-MM-DD：证据里有明确时间就用证据时间，只暗示「现在」就用今天日期，绝不输出空日期；\n"
         "- 不得推测证据中没有的信息；\n"
         "- 指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
         + "\n\n".join(blocks)
