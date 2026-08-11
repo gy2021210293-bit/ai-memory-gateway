@@ -885,8 +885,8 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
         print(f"📝 状态卡补全批次：{len(entities)} 个实体，模型返回 {len(results)} 条状态建议")
         return {"results": results}
     except Exception as exc:
-        print(f"⚠️ 实体状态卡补全失败: {exc}")
-        return {"error": f"调用异常: {exc}"}
+        print(f"⚠️ 实体状态卡补全失败: type={type(exc).__name__}, {exc!r}")
+        return {"error": f"调用异常({type(exc).__name__}): {exc!r}"}
 
 
 COGNITIVE_DRAFT_RULES = {

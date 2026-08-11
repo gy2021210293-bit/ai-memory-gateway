@@ -2789,6 +2789,7 @@ async def _run_card_backfill(entities: list) -> None:
                 if suggestions.get("error"):
                     errors += len(chunk)
                     errors_detail.append(suggestions["error"])
+                    print(f"⚠️ 补卡批次失败：{suggestions['error']}")
                 else:
                     results = suggestions.get("results") or {}
                     for entity in chunk:
@@ -2796,29 +2797,40 @@ async def _run_card_backfill(entities: list) -> None:
                         if not suggestion:
                             skipped += 1
                             continue
-                        existing = await list_entity_card_proposals(entity["id"])
-                        if any(
-                            p["status"] == "pending" and p["state"] == suggestion["state"]
-                            for p in existing
-                        ):
-                            skipped += 1
-                            continue
-                        reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
-                        if suggestion.get("evidence_quote"):
-                            reason += f"；证据引文：{suggestion['evidence_quote']}"
-                        await create_entity_card_proposal(
-                            entity["id"],
-                            suggestion["state"],
-                            suggestion.get("fact_date"),
-                            evidence_memory_id=suggestion.get("evidence_memory_id"),
-                            evidence_message_id=None,
-                            source_role="backfill",
-                            reason=reason,
-                        )
-                        proposed += 1
+                        try:
+                            existing = await list_entity_card_proposals(entity["id"])
+                            if any(
+                                p["status"] == "pending" and p["state"] == suggestion["state"]
+                                for p in existing
+                            ):
+                                skipped += 1
+                                continue
+                            reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
+                            if suggestion.get("evidence_quote"):
+                                reason += f"；证据引文：{suggestion['evidence_quote']}"
+                            result = await create_entity_card_proposal(
+                                entity["id"],
+                                suggestion["state"],
+                                suggestion.get("fact_date"),
+                                evidence_memory_id=suggestion.get("evidence_memory_id"),
+                                evidence_message_id=None,
+                                source_role="backfill",
+                                reason=reason,
+                            )
+                            if result.get("error"):
+                                errors += 1
+                                errors_detail.append(f"实体 {entity['id']} 提案创建失败：{result['error']}")
+                                print(f"⚠️ 补卡落库失败：实体 {entity['id']}：{result['error']}")
+                            else:
+                                proposed += 1
+                        except Exception as exc:
+                            errors += 1
+                            errors_detail.append(f"实体 {entity['id']} 落库异常：type={type(exc).__name__}, {exc!r}")
+                            print(f"⚠️ 补卡落库异常：实体 {entity['id']}：type={type(exc).__name__}, {exc!r}")
             except Exception as exc:
                 errors += len(chunk)
-                errors_detail.append(f"批次处理异常：{exc}")
+                errors_detail.append(f"批次处理异常：type={type(exc).__name__}, {exc!r}")
+                print(f"⚠️ 补卡批次处理异常：type={type(exc).__name__}, {exc!r}")
             _card_backfill_status["proposed"] = proposed
             _card_backfill_status["skipped"] = skipped
             _card_backfill_status["errors"] = errors
@@ -2840,7 +2852,7 @@ async def api_backfill_entity_cards(request: Request):
         return {"error": "补卡任务正在运行中，请稍候"}
     data = await request.json()
     try:
-        limit = max(1, min(50, int(data.get("limit", 20))))
+        limit = max(1, min(50, int(data.get("limit", 5))))
     except (TypeError, ValueError):
         return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
     entities = await list_entities_without_card(limit)
