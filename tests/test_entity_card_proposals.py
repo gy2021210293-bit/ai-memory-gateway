@@ -88,6 +88,20 @@ class EntityCardHarnessTests(unittest.TestCase):
         bad = memory_extractor.normalize_entity_snapshot({"state": "x", "fact_date": "2026-13-40"})
         self.assertIsNone(bad["fact_date"])
 
+    def test_sanitize_user_references_replaces_user_words(self):
+        self.assertEqual(memory_extractor.sanitize_user_references("用户住在上海"), "晏晏住在上海")
+        self.assertEqual(memory_extractor.sanitize_user_references("the user lives here"), "晏晏 lives here")
+        self.assertEqual(memory_extractor.sanitize_user_references("USER 在画画"), "晏晏 在画画")
+        self.assertEqual(memory_extractor.sanitize_user_references("无关内容"), "无关内容")
+        self.assertEqual(memory_extractor.sanitize_user_references(""), "")
+        self.assertIsNone(memory_extractor.sanitize_user_references(None))
+
+    def test_normalize_snapshot_sanitizes_user_references(self):
+        snap = memory_extractor.normalize_entity_snapshot(
+            {"state": "用户住在上海", "fact_date": "2026-07-10"},
+        )
+        self.assertEqual(snap["state"], "晏晏住在上海")
+
     def test_verbatim_evidence_must_be_user_and_verbatim(self):
         messages = [
             {"id": 1, "role": "assistant", "content": "我现在住在上海"},
@@ -180,7 +194,7 @@ class EntityCardHarnessTests(unittest.TestCase):
         self.assertIn("小文（person，别名：文文、小W）", prompt)
         self.assertIn("[ID=2] 住在杭州", prompt)
         self.assertNotIn("长" * 300, prompt)  # 超长记忆被截断
-        self.assertIn('"state": null', prompt)
+        self.assertIn('"226": []', prompt)  # 新格式示例：无稳定状态输出空数组
 
 
 class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -280,10 +294,11 @@ class _FakeCardClient:
 
 SNAPSHOT_BACKFILL_OK = {
     "choices": [{"message": {"content": (
-        '{"1":{"state":" 住在上海 ","fact_date":"2026-07-20","evidence_quote":"我搬到上海了"},'
-        '"2":{"state":null},'
-        '"3":{"state":"二期进行中","fact_date":"2026-08-01","evidence_quote":"不存在的引文"},'
-        '"999":{"state":"无关","fact_date":"2026-07-01","evidence_quote":"x"}}'
+        '{"1":[{"state":" 住在上海 ","fact_date":"2026-07-20","evidence_quote":"我搬到上海了"}],'
+        '"2":[],'
+        '"3":[{"state":"一期已交付","fact_date":"2026-06-01","evidence_quote":"一期上线了"},'
+        '{"state":"二期进行中","fact_date":"2026-08-01","evidence_quote":"不存在的引文"}],'
+        '"999":[{"state":"无关","fact_date":"2026-07-01","evidence_quote":"x"}]}'
     )}}]
 }
 
@@ -308,12 +323,14 @@ class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
             payload = await memory_extractor.suggest_entity_snapshots_batch(entities)
         self.assertNotIn("error", payload)
         results = payload["results"]
-        self.assertEqual(results[1]["state"], "住在上海")
-        self.assertEqual(results[1]["fact_date"], "2026-07-20")
-        self.assertEqual(results[1]["evidence_memory_id"], 7)   # 逐字引文命中记忆 7
-        self.assertNotIn(2, results)                              # state: null → 无建议
-        self.assertNotIn(999, results)                            # 批次外实体 → 丢弃
-        self.assertEqual(results[3]["evidence_memory_id"], 11)    # 引文未命中 → 取最新记忆
+        self.assertEqual(results[1][0]["state"], "住在上海")
+        self.assertEqual(results[1][0]["fact_date"], "2026-07-20")
+        self.assertEqual(results[1][0]["evidence_memory_id"], 7)   # 逐字引文命中记忆 7
+        self.assertNotIn(2, results)                                # 空数组 → 无建议
+        self.assertNotIn(999, results)                              # 批次外实体 → 丢弃
+        self.assertEqual(len(results[3]), 2)                        # 多条演化快照都保留
+        self.assertEqual(results[3][0]["evidence_memory_id"], 11)   # 引文未命中 → 取最新记忆
+        self.assertEqual(results[3][1]["evidence_memory_id"], 11)
 
     async def test_suggest_snapshots_batch_request_failure_returns_error_reason(self):
         with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient({}, status=500)), \
@@ -324,6 +341,24 @@ class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIn("error", payload)
         self.assertIn("500", payload["error"])
+
+    async def test_suggest_snapshots_batch_accepts_name_keyed_response(self):
+        # 模型偶尔用实体名当键而不是数字 ID，必须能容错匹配，否则 0 条建议
+        entities = [
+            {"id": 235, "name": "小明", "entity_type": "person", "aliases": ["阿明"], "memories": [
+                {"id": 7, "content": "我搬到上海了"},
+            ]},
+        ]
+        payload = {"choices": [{"message": {"content": (
+            '{"小明": {"state": "住在上海", "fact_date": "2026-07-20", "evidence_quote": "我搬到上海了"}}'
+        )}}]}
+        with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient(payload)), \
+             patch("memory_extractor.get_memory_api_key", return_value="key"), \
+             patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
+            result = await memory_extractor.suggest_entity_snapshots_batch(entities)
+        # 名字键命中 + 单个对象被兼容包成数组
+        self.assertEqual(result["results"][235][0]["state"], "住在上海")
+        self.assertEqual(result["results"][235][0]["evidence_memory_id"], 7)
 
 
 if __name__ == "__main__":

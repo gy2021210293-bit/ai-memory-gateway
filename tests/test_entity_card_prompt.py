@@ -32,7 +32,6 @@ PROMPT_SYMBOLS = {
     "_format_matched_entity_overview",
     "_classify_entity_query",
     "ENTITY_SPECIFIC_QUERY_KEYWORDS",
-    "ENTITY_HISTORY_QUERY_KEYWORDS",
 }
 
 
@@ -58,14 +57,16 @@ class EntityCardPromptTests(unittest.TestCase):
     def setUpClass(cls):
         cls.ns = _load_prompt_functions()
 
-    def test_classify_history_specific_ordinary(self):
+    def test_classify_specific_vs_rest(self):
         classify = self.ns["_classify_entity_query"]
-        self.assertEqual(classify("他以前是怎么发展的"), "history")
-        self.assertEqual(classify("他们当时经历了什么"), "history")
-        self.assertEqual(classify("她当时说的原话是什么"), "specific")
-        self.assertEqual(classify("具体是哪一天去的"), "specific")
-        self.assertEqual(classify("她最近怎么样"), "ordinary")
-        self.assertEqual(classify(""), "ordinary")
+        # 具体（原话/日期）问题 → True，跳过卡片
+        self.assertTrue(classify("她当时说的原话是什么"))
+        self.assertTrue(classify("具体是哪一天去的"))
+        # 历史/普通问题不再区分 → False，统一注入卡片
+        self.assertFalse(classify("他以前是怎么发展的"))
+        self.assertFalse(classify("他们当时经历了什么"))
+        self.assertFalse(classify("她最近怎么样"))
+        self.assertFalse(classify(""))
 
     def test_candidate_entities_never_rendered(self):
         rendered = self.ns["_format_matched_entity_overview"]([{
@@ -98,7 +99,8 @@ class EntityCardPromptTests(unittest.TestCase):
         }
         rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "她最近怎么样")
         self.assertIn("手写卡说明", rendered)
-        self.assertIn("截至2026-07-20的最后已知状态：搬到上海", rendered)
+        self.assertIn("2026-07-20：搬到上海", rendered)
+        self.assertIn("2026-07-01：住在杭州", rendered)
         for forbidden in ("旧概况摘要", "旧关系", "旧稳定事实", "旧近期动态", "旧偏好", "旧待确认"):
             self.assertNotIn(forbidden, rendered)
 
@@ -120,7 +122,7 @@ class EntityCardPromptTests(unittest.TestCase):
         self.assertNotIn("阶段1", rendered)  # 更早快照不注入
         self.assertNotIn("阶段2", rendered)
 
-    def test_ambiguous_match_labels_last_known_state(self):
+    def test_ambiguous_match_labels_latest_snapshot(self):
         entity = {
             "id": 2, "name": "Alice", "type": "person", "retrieval_status": "active",
             "aliases": ["小艾"], "description": "", "exact_name_match": False,
@@ -133,7 +135,7 @@ class EntityCardPromptTests(unittest.TestCase):
             },
         }
         rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "她最近怎么样")
-        self.assertIn("截至2026-07-20的最后已知状态：住在上海", rendered)
+        self.assertIn("2026-07-20：住在上海", rendered)
         self.assertIn("不确定是否仍为最新", rendered)
 
     def test_specific_question_skips_card(self):

@@ -201,6 +201,8 @@ states that entity's current or past state:
   "now", use today's date; omit when genuinely unknown.
 - `state` captures the entity's state exactly as stated, with the user's own words
   where possible; do NOT add opinions, intentions, or relationship judgments.
+- When the state refers to the user themself, always use the name 晏晏 or the
+  pronoun 她; never write 用户 or 'user'.
 Only attach `snapshot` when the user directly states the entity's state in this
 conversation. Never derive a snapshot from tone, implication, or your own summary;
 such inferred content should simply be omitted (it will be treated as a proposal).
@@ -320,6 +322,19 @@ SNAPSHOT_QUOTE_LIMIT = 120
 SNAPSHOT_QUOTE_MIN_LEN = 6
 
 
+def sanitize_user_references(text: str) -> str:
+    """Replace user words ('用户' / 'user' / 'the user') with the canonical name 晏晏.
+
+    Entity card content must never refer to the human as '用户'; the user is 晏晏.
+    English matching is case-insensitive, word-boundary only. Other text untouched.
+    """
+    if not text:
+        return text
+    text = re.sub(r"\bthe user\b", "晏晏", text, flags=re.IGNORECASE)
+    text = re.sub(r"\buser\b", "晏晏", text, flags=re.IGNORECASE)
+    return text.replace("用户", "晏晏")
+
+
 def normalize_entity_snapshot(raw) -> Optional[Dict]:
     """Clean an LLM-supplied snapshot suggestion into a stable shape.
 
@@ -332,6 +347,7 @@ def normalize_entity_snapshot(raw) -> Optional[Dict]:
     state = re.sub(r"\s+", " ", str(raw.get("state") or "")).strip()
     if not state:
         return None
+    state = sanitize_user_references(state)
     state = state[:SNAPSHOT_STATE_LIMIT]
 
     fact_date = None
@@ -781,19 +797,25 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
             f"（{entity.get('entity_type', 'other')}，别名：{aliases}）\n{evidence}"
         )
     return (
-        "我是栖，正在给一批实体补「状态卡」。状态卡只记录实体**当前仍然成立的稳定状态**"
-        "（如住在某地、从事某职业、负责某个项目、处于某个关系阶段）；"
+        "我是栖，正在给一批实体补「状态卡」。状态卡记录实体**随时间演进的稳定状态**"
+        "（如先住在上海、后来搬到北京；或职业从 A 公司换到 B 公司）；"
         "一次性事件、一时的心情、短期计划都不算。\n\n"
-        "请对每个实体，仅依据它下方的证据记忆，判断当前是否存在一个可表述的稳定状态。\n"
-        "为每个实体输出一条：\n"
+        "请对每个实体，仅依据它下方的证据记忆，列出该实体的**稳定状态演化史**。\n"
+        "每个实体输出一个数组，数组里每条：\n"
         '{"state": "完整的一句话状态（≤200字）", "fact_date": "YYYY-MM-DD 或留空字符串", '
         '"evidence_quote": "证据记忆里逐字出现、用于人工核对的短句（≥6字）"}。\n'
-        '若证据不足以确定稳定状态，输出 {"state": null}。\n'
-        "不得推测证据中没有的信息。\n\n"
+        "要求：\n"
+        "- 把时间上先后不同的稳定状态各自列为一条，按时间先后排列（旧→新）；\n"
+        "- 相同状态只保留一条；最多 6 条；\n"
+        "- 若证据不足以确定任何稳定状态，输出空数组 [];\n"
+        "- 不得推测证据中没有的信息；\n"
+        "- 状态文本里指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
         + "\n\n".join(blocks)
-        + '\n\n只返回一个 JSON 对象，键为实体ID，例如：\n'
-        '{"1": {"state": "住在上海", "fact_date": "2026-07-20", '
-        '"evidence_quote": "我搬到上海了"}, "2": {"state": null}}'
+        + "\n\n只返回一个 JSON 对象，键必须是上面每个实体行开头标记的数字实体ID"
+        "（如 235），值是该实体的快照数组，绝对不要用实体名称当键。例如：\n"
+        '{"235": [{"state": "住在上海", "fact_date": "2026-07-20", '
+        '"evidence_quote": "我搬到上海了"}, {"state": "搬到北京", "fact_date": "2026-08-01", '
+        '"evidence_quote": "准备搬家去北京"}], "226": []}'
     )
 
 
@@ -845,6 +867,7 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
             if not text:
                 print(f"⚠️ 实体状态卡补全返回空内容 (model={MEMORY_MODEL})")
                 return {"error": f"LLM返回空内容 (model={MEMORY_MODEL})"}
+            raw_text = text
             try:
                 raw = parse_json_object(text)
             except ValueError as first_error:
@@ -870,33 +893,52 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
                     return {"error": "LLM重试返回空内容"}
                 try:
                     raw = parse_json_object(retry_text)
+                    raw_text = retry_text
                 except ValueError as retry_error:
                     print(f"⚠️ 实体状态卡补全重试结果仍无法解析: {retry_error}")
                     return {"error": f"LLM返回无法解析: {retry_text[:200]}"}
         if not isinstance(raw, dict):
             return {"results": {}}
         by_id = {int(entity["id"]): entity for entity in entities}
+        # 模型可能用实体名（或别名）当键而不是数字 ID，一并容错匹配
+        by_name = {}
+        for entity in entities:
+            by_name[str(entity.get("name") or "").strip().casefold()] = entity["id"]
+            for alias in entity.get("aliases") or []:
+                by_name[str(alias).strip().casefold()] = entity["id"]
         results = {}
         for key, value in raw.items():
+            entity_id = None
             try:
                 entity_id = int(key)
             except (TypeError, ValueError):
+                entity_id = by_name.get(str(key).strip().casefold())
+            if entity_id is None or entity_id not in by_id:
                 continue
-            if entity_id not in by_id or not isinstance(value, dict):
-                continue
-            snapshot = normalize_entity_snapshot({
-                "state": value.get("state"),
-                "fact_date": value.get("fact_date"),
-                "evidence_quote": value.get("evidence_quote"),
-            })
-            if not snapshot or not snapshot.get("state"):
-                continue
-            snapshot["evidence_memory_id"] = _resolve_evidence_memory(
-                snapshot.get("evidence_quote", ""),
-                by_id[entity_id].get("memories") or [],
-            )
-            results[entity_id] = snapshot
-        print(f"📝 状态卡补全批次：{len(entities)} 个实体，模型返回 {len(results)} 条状态建议")
+            # 模型应输出数组（多条演化快照）；若给了单个对象，兼容包成数组
+            items = value if isinstance(value, list) else ([value] if isinstance(value, dict) else [])
+            snapshots = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                snapshot = normalize_entity_snapshot({
+                    "state": item.get("state"),
+                    "fact_date": item.get("fact_date"),
+                    "evidence_quote": item.get("evidence_quote"),
+                })
+                if not snapshot or not snapshot.get("state"):
+                    continue
+                snapshot["evidence_memory_id"] = _resolve_evidence_memory(
+                    snapshot.get("evidence_quote", ""),
+                    by_id[entity_id].get("memories") or [],
+                )
+                snapshots.append(snapshot)
+            if snapshots:
+                results[entity_id] = snapshots
+        if not results:
+            print(f"📝 状态卡补全原始返回（截断，用于排查 0 条建议）: {raw_text[:500]}")
+        total = sum(len(snapshots) for snapshots in results.values())
+        print(f"📝 状态卡补全批次：{len(entities)} 个实体，模型返回 {total} 条状态建议")
         return {"results": results}
     except Exception as exc:
         print(f"⚠️ 实体状态卡补全失败: type={type(exc).__name__}, {exc!r}")

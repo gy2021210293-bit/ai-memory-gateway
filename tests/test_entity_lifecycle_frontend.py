@@ -35,7 +35,6 @@ class EntityLifecycleFrontendTests(unittest.TestCase):
             "_format_matched_entity_overview",
             "_classify_entity_query",
             "ENTITY_SPECIFIC_QUERY_KEYWORDS",
-            "ENTITY_HISTORY_QUERY_KEYWORDS",
         }
         nodes = []
         for node in tree.body:

@@ -456,8 +456,84 @@ function renderEntityCardSnapshots(snapshots) {
         body.textContent = snapshot.state;
         item.appendChild(header);
         item.appendChild(body);
+        const actions = document.createElement('div');
+        actions.className = 'toolbar entity-card-snapshot-actions';
+        const editButton = document.createElement('button');
+        editButton.className = 'btn';
+        editButton.textContent = '编辑';
+        editButton.onclick = () => startEditEntityCardSnapshot(snapshot, item);
+        const deleteButton = document.createElement('button');
+        deleteButton.className = 'btn btn-danger';
+        deleteButton.textContent = '删除';
+        deleteButton.onclick = () => deleteEntityCardSnapshot(snapshot.recorded_at);
+        actions.appendChild(editButton);
+        actions.appendChild(deleteButton);
+        item.appendChild(actions);
         container.appendChild(item);
     });
+}
+
+function startEditEntityCardSnapshot(snapshot, item) {
+    item.replaceChildren();
+    const editBox = document.createElement('div');
+    editBox.className = 'entity-card-snapshot-edit';
+    const stateInput = document.createElement('textarea');
+    stateInput.value = snapshot.state || '';
+    stateInput.maxLength = 200;
+    const dateInput = document.createElement('input');
+    dateInput.type = 'date';
+    dateInput.value = snapshot.fact_date || '';
+    const row = document.createElement('div');
+    row.className = 'toolbar';
+    const saveButton = document.createElement('button');
+    saveButton.className = 'btn btn-primary';
+    saveButton.textContent = '保存';
+    saveButton.onclick = () => saveEntityCardSnapshot(snapshot.recorded_at, stateInput.value, dateInput.value);
+    const cancelButton = document.createElement('button');
+    cancelButton.className = 'btn';
+    cancelButton.textContent = '取消';
+    cancelButton.onclick = () => loadEntityCard(selectedEntity ? selectedEntity.id : 0);
+    row.appendChild(saveButton);
+    row.appendChild(cancelButton);
+    editBox.appendChild(stateInput);
+    editBox.appendChild(dateInput);
+    editBox.appendChild(row);
+    item.appendChild(editBox);
+}
+
+async function saveEntityCardSnapshot(recordedAt, state, factDate) {
+    const status = document.getElementById('entity-status');
+    if (!selectedEntity) return;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/snapshots`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ recorded_at: recordedAt, state, fact_date: factDate }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        status.textContent = '快照已更新。';
+        await loadEntityCard(selectedEntity.id);
+    } catch (error) {
+        status.textContent = `快照更新失败：${error.message}`;
+    }
+}
+
+async function deleteEntityCardSnapshot(recordedAt) {
+    const status = document.getElementById('entity-status');
+    if (!selectedEntity || !confirm('删除这条状态快照？此操作不可撤销。')) return;
+    try {
+        const response = await fetch(
+            `/api/entities/${selectedEntity.id}/card/snapshots?recorded_at=${encodeURIComponent(recordedAt)}`,
+            { method: 'DELETE' },
+        );
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        status.textContent = '快照已删除。';
+        await loadEntityCard(selectedEntity.id);
+    } catch (error) {
+        status.textContent = `快照删除失败：${error.message}`;
+    }
 }
 
 function renderEntityCardProposals(proposals) {

@@ -1720,6 +1720,29 @@ body::after {
     background: rgba(236, 226, 244, .35);
 }
 
+.entity-card-snapshot-actions {
+    margin-top: 8px;
+    gap: 6px;
+}
+
+.entity-card-snapshot-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.entity-card-snapshot-edit textarea {
+    width: 100%;
+    min-height: 72px;
+    box-sizing: border-box;
+    resize: vertical;
+}
+
+.entity-card-snapshot-edit input[type="date"] {
+    width: 100%;
+    box-sizing: border-box;
+}
+
 /* Entity list */
 #entity-list {
     margin-top: 22px !important;

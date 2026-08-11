@@ -32,6 +32,9 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
             "function decideEntityCardProposal(",
             "function renderEntityCardSnapshots(",
             "function renderEntityCardProposals(",
+            "function startEditEntityCardSnapshot(",
+            "function saveEntityCardSnapshot(",
+            "function deleteEntityCardSnapshot(",
         ):
             self.assertIn(function_name, self.javascript)
 
@@ -59,8 +62,15 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
         self.assertIn(".entity-card-proposal", self.css)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=6.6", self.html)
-        self.assertIn("/static/css/dashboard.css?v=7.1", self.html)
+        self.assertIn("/static/js/dashboard.js?v=6.7", self.html)
+        self.assertIn("/static/css/dashboard.css?v=7.2", self.html)
+
+    def test_snapshot_edit_delete_endpoints_and_ui_exist(self):
+        self.assertIn("/card/snapshots", self.javascript)
+        self.assertIn("method: 'PUT'", self.javascript)
+        self.assertIn("method: 'DELETE'", self.javascript)
+        self.assertIn("entity-card-snapshot-actions", self.javascript)
+        self.assertIn("entity-card-snapshot-edit", self.javascript)
 
     def test_entity_list_shows_card_and_proposal_badges(self):
         self.assertIn("entity-item-badges", self.javascript)

@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone as dt_timezone
 
 import asyncpg
 from message_pipeline import normalize_content_text
+from memory_extractor import sanitize_user_references
 
 # 时区偏移（和 main.py 保持一致）
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -3670,7 +3671,7 @@ async def apply_entity_snapshot(
 
     Returns {"status": "ok" | "duplicate" | "conflict" | "not_found" | "error"}.
     """
-    state = re.sub(r"\s+", " ", str(state or "")).strip()
+    state = sanitize_user_references(re.sub(r"\s+", " ", str(state or "")).strip())
     if not state:
         return {"status": "error", "error": "快照状态不能为空"}
     if not state[:ENTITY_CARD_STATE_LIMIT]:
@@ -3714,7 +3715,7 @@ async def apply_entity_snapshot(
 
 async def update_entity_card_description(entity_id: int, description: str) -> dict:
     """Manually set the entity card's short description (human-only)."""
-    description = re.sub(r"\s+", " ", str(description or "")).strip()
+    description = sanitize_user_references(re.sub(r"\s+", " ", str(description or "")).strip())
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -3730,6 +3731,69 @@ async def update_entity_card_description(entity_id: int, description: str) -> di
             WHERE id = $1
         """, entity_id, json.dumps(card, ensure_ascii=False))
     return {"status": "ok", "description": description}
+
+
+async def update_entity_card_snapshot(entity_id: int, recorded_at: str, state: str = None, fact_date=None) -> dict:
+    """Edit one snapshot's state/date, keyed by its recorded_at (stable per snapshot)."""
+    state = sanitize_user_references(re.sub(r"\s+", " ", str(state or "")).strip())
+    if not state:
+        return {"error": "快照状态不能为空"}
+    state = state[:ENTITY_CARD_STATE_LIMIT]
+    if fact_date in (None, ""):
+        fact_date_str = ""
+    else:
+        parsed = _parse_fact_date(fact_date)
+        fact_date_str = str(parsed) if parsed else ""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT entity_card_json FROM entities WHERE id = $1", entity_id,
+        )
+        if not row:
+            return {"error": "实体不存在"}
+        card = _parse_entity_card(row["entity_card_json"])
+        target = None
+        for snap in card["snapshots"]:
+            if str(snap.get("recorded_at") or "") == recorded_at:
+                target = snap
+                break
+        if target is None:
+            return {"error": "未找到该快照"}
+        target["state"] = state
+        target["fact_date"] = fact_date_str
+        card["snapshots"] = _sort_and_cap_snapshots(card["snapshots"])
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok"}
+
+
+async def delete_entity_card_snapshot(entity_id: int, recorded_at: str) -> dict:
+    """Remove one snapshot from the card, keyed by its recorded_at."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT entity_card_json FROM entities WHERE id = $1", entity_id,
+        )
+        if not row:
+            return {"error": "实体不存在"}
+        card = _parse_entity_card(row["entity_card_json"])
+        before = len(card["snapshots"])
+        card["snapshots"] = [
+            snap for snap in card["snapshots"]
+            if str(snap.get("recorded_at") or "") != recorded_at
+        ]
+        if len(card["snapshots"]) == before:
+            return {"error": "未找到该快照"}
+        card["snapshots"] = _sort_and_cap_snapshots(card["snapshots"])
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok"}
 
 
 def _parse_fact_date(value):

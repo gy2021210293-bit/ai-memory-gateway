@@ -289,6 +289,71 @@ class EntityCardAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("INSERT INTO memory_evidence", sql)
         self.assertEqual(rows, [(5, 10, "user"), (5, 11, "user")])
 
+    async def test_update_snapshot_edits_state_and_date(self):
+        card = {
+            "description": "",
+            "snapshots": [
+                {"fact_date": "2026-07-01", "recorded_at": "2026-07-01T00:00:00+00:00",
+                 "state": "住在上海", "evidence_memory_id": 1, "evidence_message_id": 2, "source": "confirmed"},
+            ],
+        }
+        conn = CardConnection(card)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.update_entity_card_snapshot(
+                1, "2026-07-01T00:00:00+00:00", "搬到北京", "2026-07-20",
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(conn.execute_calls), 1)
+        updated = json.loads(conn.execute_calls[0][1][1])
+        self.assertEqual(updated["snapshots"][0]["state"], "搬到北京")
+        self.assertEqual(updated["snapshots"][0]["fact_date"], "2026-07-20")
+
+    async def test_update_snapshot_sanitizes_user_references(self):
+        card = {
+            "description": "",
+            "snapshots": [
+                {"fact_date": "2026-07-01", "recorded_at": "2026-07-01T00:00:00+00:00",
+                 "state": "住在上海", "source": "confirmed"},
+            ],
+        }
+        conn = CardConnection(card)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.update_entity_card_snapshot(
+                1, "2026-07-01T00:00:00+00:00", "用户在画画", None,
+            )
+        self.assertEqual(result["status"], "ok")
+        updated = json.loads(conn.execute_calls[0][1][1])
+        self.assertEqual(updated["snapshots"][0]["state"], "晏晏在画画")
+
+    async def test_update_snapshot_not_found(self):
+        conn = CardConnection({"description": "", "snapshots": []})
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.update_entity_card_snapshot(1, "no-such", "x", "2026-07-20")
+        self.assertIn("未找到", result["error"])
+
+    async def test_delete_snapshot_removes_and_resorts(self):
+        card = {
+            "description": "",
+            "snapshots": [
+                {"fact_date": "2026-07-20", "recorded_at": "2026-07-20T00:00:00+00:00",
+                 "state": "住在北京", "source": "confirmed"},
+                {"fact_date": "2026-07-01", "recorded_at": "2026-07-01T00:00:00+00:00",
+                 "state": "住在上海", "source": "confirmed"},
+            ],
+        }
+        conn = CardConnection(card)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.delete_entity_card_snapshot(1, "2026-07-01T00:00:00+00:00")
+        self.assertEqual(result["status"], "ok")
+        updated = json.loads(conn.execute_calls[0][1][1])
+        self.assertEqual([s["state"] for s in updated["snapshots"]], ["住在北京"])
+
+    async def test_delete_snapshot_not_found(self):
+        conn = CardConnection({"description": "", "snapshots": []})
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.delete_entity_card_snapshot(1, "no-such")
+        self.assertIn("未找到", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
