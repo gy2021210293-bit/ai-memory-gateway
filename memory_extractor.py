@@ -18,6 +18,7 @@ v2.4.5: 实体概况与实体回填不再发送 max_tokens（推理模型的思�
 import os
 import json
 import re
+import asyncio
 import unicodedata
 import httpx
 from llm_json import parse_json_array, parse_json_object
@@ -738,9 +739,9 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 
 # ---- 旧实体补卡：从既有记忆为每个实体建议一条当前状态（全部走提案，不自动入卡） ----
 
-BACKFILL_SNAPSHOT_CHUNK = 10
-BACKFILL_MEMORIES_PER_ENTITY = 8
-BACKFILL_MEMORY_CHARS = 150
+BACKFILL_SNAPSHOT_CHUNK = 5
+BACKFILL_MEMORIES_PER_ENTITY = 4
+BACKFILL_MEMORY_CHARS = 120
 
 
 def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
@@ -800,14 +801,21 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
     if not entities or not get_memory_api_key():
         return {"results": {}}
     prompt = _build_snapshot_backfill_prompt(entities)
-    request_messages = [{"role": "user", "content": prompt}]
+    # 与可正常工作的 extract_memories 同一请求结构：完整说明放 system，数据放 user。
+    request_messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "请根据上述每个实体的证据记忆，为每个实体返回一条当前状态建议（JSON 对象，键为实体ID）。"},
+    ]
     try:
         async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(
-                get_memory_api_base_url(),
-                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
-                json={"model": MEMORY_MODEL, "messages": request_messages},
-            )
+            headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
+            payload = {"model": MEMORY_MODEL, "messages": request_messages}
+            response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
+            if response.status_code == 500:
+                # 提供商偶发 500，睡 2 秒重试一次
+                print("⚠️ 实体状态卡补全遇到 500，2 秒后重试一次")
+                await asyncio.sleep(2)
+                response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
             if response.status_code != 200:
                 reason = f"LLM请求失败 HTTP {response.status_code}: {response.text[:300]}"
                 print(f"⚠️ 实体状态卡补全请求失败: {response.status_code} {response.text[:500]} (model={MEMORY_MODEL})")
@@ -823,7 +831,7 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
                 print(f"⚠️  原始文本前500字符: {text[:500]}")
                 retry_response = await client.post(
                     get_memory_api_base_url(),
-                    headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                    headers=headers,
                     json={"model": MEMORY_MODEL, "messages": request_messages + [
                         {"role": "assistant", "content": text},
                         {
