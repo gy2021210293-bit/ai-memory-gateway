@@ -807,12 +807,15 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[
             response = await client.post(
                 get_memory_api_base_url(),
                 headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
-                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
+                json={"model": MEMORY_MODEL, "messages": request_messages},
             )
             if response.status_code != 200:
-                print(f"⚠️ 实体状态卡补全请求失败: {response.status_code} {response.text[:200]}")
+                print(f"⚠️ 实体状态卡补全请求失败: {response.status_code} {response.text[:500]} (model={MEMORY_MODEL})")
                 return None
             text = _extract_response_content(response.json()).strip()
+            if not text:
+                print(f"⚠️ 实体状态卡补全返回空内容 (model={MEMORY_MODEL})")
+                return None
             try:
                 raw = parse_json_object(text)
             except ValueError as first_error:
@@ -821,7 +824,7 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[
                 retry_response = await client.post(
                     get_memory_api_base_url(),
                     headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
-                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages + [
+                    json={"model": MEMORY_MODEL, "messages": request_messages + [
                         {"role": "assistant", "content": text},
                         {
                             "role": "user",
