@@ -108,6 +108,17 @@ class EntitySurfaceTests(unittest.TestCase):
         self.assertEqual(database.canonicalize_entity_surface("小明同学"), "小明")
         self.assertEqual(database.canonicalize_entity_surface("王老师"), "王老师")  # 余下 1 字不剥
 
+    def test_canonicalize_strips_more_honorific_suffixes(self):
+        self.assertEqual(database.canonicalize_entity_surface("小明哥"), "小明")
+        self.assertEqual(database.canonicalize_entity_surface("小红姐"), "小红")
+        self.assertEqual(database.canonicalize_entity_surface("佐藤さん"), "佐藤")
+        self.assertEqual(database.canonicalize_entity_surface("小明san"), "小明")
+
+    def test_canonicalize_keeps_latin_names_ending_in_suffix(self):
+        # 拉丁敬称只加在中文名后剥离，避免误剥真实拉丁人名
+        self.assertEqual(database.canonicalize_entity_surface("Henderson"), "henderson")
+        self.assertEqual(database.canonicalize_entity_surface("Julian"), "julian")
+
     def test_similar_enough_thresholds(self):
         self.assertTrue(database._entity_similar_enough("小明", "小明"))
         self.assertTrue(database._entity_similar_enough("xiaoming", "xiaomingo"))
@@ -204,11 +215,30 @@ class FindDuplicateEntitiesTests(unittest.IsolatedAsyncioTestCase):
         target = next(e for e in group["entities"] if e["is_target"])
         self.assertEqual(target["name"], "小明")
 
+    async def test_canonical_group_is_cross_type(self):
+        # LLM 类型噪声：同一人被标成 person 和 other，也应归组
+        groups = await self._run(DuplicateScanConnection([
+            {"id": 1, "name": "小明", "normalized_name": "小明", "entity_type": "person", "evidence_count": 5, "memory_count": 2},
+            {"id": 2, "name": "小明哥", "normalized_name": "小明哥", "entity_type": "other", "evidence_count": 1, "memory_count": 1},
+        ]))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["reason"], "canonical")
+        self.assertEqual({e["name"] for e in groups[0]["entities"]}, {"小明", "小明哥"})
+
     async def test_similarity_pair_detected(self):
         groups = await self._run(DuplicateScanConnection([
             {"id": 5, "name": "xiaoming", "normalized_name": "xiaoming", "entity_type": "person", "evidence_count": 3, "memory_count": 1},
             {"id": 6, "name": "xiaomingo", "normalized_name": "xiaomingo", "entity_type": "person", "evidence_count": 1, "memory_count": 1},
             {"id": 7, "name": "上海", "normalized_name": "上海", "entity_type": "place", "evidence_count": 6, "memory_count": 3},
+        ]))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["reason"], "similarity")
+
+    async def test_containment_pair_detected(self):
+        # 相似度不达标但一个规范名是另一个的子串，也应建议（只建议，人工确认）
+        groups = await self._run(DuplicateScanConnection([
+            {"id": 8, "name": "xiaoming", "normalized_name": "xiaoming", "entity_type": "person", "evidence_count": 3, "memory_count": 1},
+            {"id": 9, "name": "xiaomingboss", "normalized_name": "xiaomingboss", "entity_type": "person", "evidence_count": 1, "memory_count": 1},
         ]))
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["reason"], "similarity")

@@ -2844,27 +2844,46 @@ def normalize_entity_name(name: str) -> str:
     return re.sub(r"\s+", " ", value).casefold()
 
 
-# 称呼后缀：仅在余下部分长度 >=2 时才剥离（避免「王老师」->「王」这种单字误并）
-HONORIFIC_SUFFIXES = ("同学", "先生", "女士", "老师", "师傅", "教授")
+# 称呼后缀：仅在余下部分长度 >=2 时才剥离（避免「王老师」->「王」这种单字误并）。
+# 包含中文亲属/敬称、日文敬称与拼音转写；匹配时按长度降序，保证长后缀优先。
+HONORIFIC_SUFFIXES = (
+    "同学", "先生", "女士", "老师", "师傅", "教授",
+    "ちゃん", "さま", "さん", "くん",
+    "哥", "姐", "弟", "妹", "酱",
+    "chan", "sama", "san", "kun",
+)
+_HONORIFIC_SUFFIXES_SORTED = tuple(sorted(HONORIFIC_SUFFIXES, key=len, reverse=True))
 
 # 括号注释：`(...)` / `（...）` 视为对实体名的补充说明，匹配时剥离
 _BRACKET_ANNOTATION_RE = re.compile(r"[\(（][^\)）]*[\)）]")
+
+
+# 拉丁敬称后缀（san/chan/kun/sama）可能是真实拉丁人名的结尾，只有加在中文名后
+# 才当作敬称剥离，避免「Henderson」「Julian」这类名字被误剥。
+_LATIN_HONORIFIC_SUFFIXES = {"san", "chan", "kun", "sama"}
 
 
 def canonicalize_entity_surface(name: str) -> str:
     """Aggressive matching form of an entity surface, used only for identity
     matching (never stored as the UNIQUE lookup key).
 
-    Strips bracketed annotations like "Alice (朋友)" and CJK honorific
-    suffixes like "小明同学" -> "小明", but only when the remainder is still
-    >= 2 characters to avoid collapsing single-character names.
+    Strips bracketed annotations like "Alice (朋友)" and honorific suffixes like
+    "小明同学" -> "小明" / "佐藤さん" -> "佐藤", but only when the remainder is
+    still >= 2 characters to avoid collapsing single-character names. Latin
+    honorifics (san/chan/kun) are only stripped when attached to a CJK name.
     """
     value = normalize_entity_name(name)
     value = _BRACKET_ANNOTATION_RE.sub("", value)
-    for suffix in HONORIFIC_SUFFIXES:
-        if value.endswith(suffix) and len(value) - len(suffix) >= 2:
-            value = value[: -len(suffix)]
-            break
+    for suffix in _HONORIFIC_SUFFIXES_SORTED:
+        if not value.endswith(suffix):
+            continue
+        remainder = value[: -len(suffix)]
+        if len(remainder) < 2:
+            continue
+        if suffix in _LATIN_HONORIFIC_SUFFIXES and not _HAS_CJK_RE.search(remainder):
+            continue
+        value = remainder
+        break
     return re.sub(r"\s+", " ", value).strip()
 
 
@@ -3207,7 +3226,9 @@ async def list_entities():
                    e.entity_card_json, e.entity_card_updated_at,
                    e.evidence_count, e.status_override, e.created_at, e.updated_at,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
-                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
+                   (SELECT COUNT(*) FROM entity_card_proposals p
+                    WHERE p.entity_id = e.id AND p.status = 'pending')::int AS pending_proposal_count
             FROM entities e
             LEFT JOIN memory_entities me ON me.entity_id = e.id
             LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
@@ -3215,6 +3236,10 @@ async def list_entities():
             ORDER BY memory_count DESC, e.name
         """)
         entities = [attach_entity_lifecycle(row) for row in rows]
+        for entity in entities:
+            entity["card_has_snapshots"], entity["card_last_state_date"] = _entity_card_summary(
+                entity.get("entity_card_json")
+            )
         entities.sort(key=lambda item: (
             item["retrieval_status"] != "active",
             -int(item.get("evidence_count") or 0),
@@ -3233,15 +3258,19 @@ async def list_entities_without_card(limit: int = 20):
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT e.id, e.name, e.entity_type, e.evidence_count,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e
             LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
             LEFT JOIN memory_entities me ON me.entity_id = e.id
-            WHERE e.entity_card_json IS NULL
-               OR COALESCE(jsonb_array_length(e.entity_card_json->'snapshots'), 0) = 0
+            WHERE (e.entity_card_json IS NULL
+               OR COALESCE(jsonb_array_length(e.entity_card_json->'snapshots'), 0) = 0)
+              AND (
+                  e.status_override = 'active'
+                  OR (e.status_override IS NULL AND (e.profile_json IS NOT NULL OR e.evidence_count >= {ENTITY_ACTIVE_EVIDENCE_THRESHOLD}))
+              )
             GROUP BY e.id
             HAVING COUNT(DISTINCT me.memory_id) > 0
             ORDER BY memory_count DESC, e.name
@@ -3280,6 +3309,12 @@ def _length_ratio_ok(a: str, b: str) -> bool:
     return long >= 2 and short * 2 >= long
 
 
+def _entity_type_compatible(a: str, b: str) -> bool:
+    """LLM 给的类型噪声很大，同一事物常被标成不同类型：同类型或任一侧是 'other'
+    都视为可合并候选（结果只做建议，人工确认）。"""
+    return a == b or a == "other" or b == "other"
+
+
 def _pick_duplicate_group(members, reason):
     """Pick the merge target (highest evidence) and shape one suggestion group."""
     members = sorted(
@@ -3308,9 +3343,11 @@ async def find_duplicate_entities():
     """Read-only scan for likely-duplicate entities. Never writes.
 
     Pass 1 groups entities whose canonical surface collapses to the same key
-    (e.g. "小明同学" / "小明（朋友）" / "小明"). Pass 2 pairs same-type entities
-    whose canonical surfaces share character bigrams and pass a high similarity
-    threshold. Each group carries a recommended merge target (highest evidence).
+    (e.g. "小明同学" / "小明（朋友）" / "小明" / "小明哥"), across entity types
+    since the LLM assigns types noisily. Pass 2 pairs entities whose canonical
+    surfaces share character bigrams and are type-compatible (same type, or one
+    side is 'other'), flagging high similarity OR containment. Each group carries
+    a recommended merge target (highest evidence).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -3325,58 +3362,58 @@ async def find_duplicate_entities():
     groups = []
     seen_ids = set()
 
-    # ---- pass 1: canonical-surface equality groups ----
+    # ---- pass 1: canonical-surface equality groups (cross-type) ----
     by_canonical = {}
     for r in rows:
         canonical = canonicalize_entity_surface(r["normalized_name"])
         if len(canonical) < 2:
             continue
-        by_canonical.setdefault((r["entity_type"], canonical), []).append(r)
+        by_canonical.setdefault(canonical, []).append(r)
     for members in by_canonical.values():
         if len(members) >= 2:
             group = _pick_duplicate_group(members, "canonical")
             groups.append(group)
             seen_ids.update(m["id"] for m in group["entities"])
 
-    # ---- pass 2: high-similarity pairs within the same type ----
-    by_type = {}
+    # ---- pass 2: high-similarity / containment pairs ----
+    items = []
     for r in rows:
         if r["id"] in seen_ids:
             continue
         canonical = canonicalize_entity_surface(r["normalized_name"])
         if len(canonical) < 2:
             continue
-        by_type.setdefault(r["entity_type"], []).append((r, canonical))
-
-    for items in by_type.values():
-        # bigram index so we only compare pairs that share at least one bigram
-        bigram_index = {}
-        for r, canonical in items:
-            for bigram in _entity_bigrams(canonical):
-                bigram_index.setdefault(bigram, []).append((r, canonical))
-        matched = set()
-        for r, canonical in items:
-            if r["id"] in matched:
-                continue
-            best = None
-            best_sim = 0.0
-            seen_partners = set()
-            for bigram in _entity_bigrams(canonical):
-                for other, other_canonical in bigram_index.get(bigram, []):
-                    if other["id"] == r["id"] or other["id"] in matched or other["id"] in seen_partners:
-                        continue
-                    seen_partners.add(other["id"])
-                    if not _length_ratio_ok(canonical, other_canonical):
-                        continue
-                    if _entity_similar_enough(canonical, other_canonical):
-                        sim = _entity_similarity(canonical, other_canonical)
-                        if sim > best_sim:
-                            best_sim = sim
-                            best = other
-            if best is not None:
-                group = _pick_duplicate_group([r, best], "similarity")
-                groups.append(group)
-                matched.update(m["id"] for m in group["entities"])
+        items.append((r, canonical))
+    bigram_index = {}
+    for r, canonical in items:
+        for bigram in _entity_bigrams(canonical):
+            bigram_index.setdefault(bigram, []).append((r, canonical))
+    matched = set()
+    for r, canonical in items:
+        if r["id"] in matched:
+            continue
+        best = None
+        best_sim = 0.0
+        seen_partners = set()
+        for bigram in _entity_bigrams(canonical):
+            for other, other_canonical in bigram_index.get(bigram, []):
+                if other["id"] == r["id"] or other["id"] in matched or other["id"] in seen_partners:
+                    continue
+                seen_partners.add(other["id"])
+                if not _entity_type_compatible(r["entity_type"], other["entity_type"]):
+                    continue
+                if not _length_ratio_ok(canonical, other_canonical):
+                    continue
+                contained = canonical in other_canonical or other_canonical in canonical
+                if contained or _entity_similar_enough(canonical, other_canonical):
+                    sim = 1.0 if contained else _entity_similarity(canonical, other_canonical)
+                    if sim > best_sim:
+                        best_sim = sim
+                        best = other
+        if best is not None:
+            group = _pick_duplicate_group([r, best], "similarity")
+            groups.append(group)
+            matched.update(m["id"] for m in group["entities"])
     return groups
 
 
@@ -3394,7 +3431,12 @@ async def get_entity_detail(entity_id: int):
             WHERE e.id = $1
             GROUP BY e.id
         """, entity_id)
-        return attach_entity_lifecycle(row) if row else None
+        entity = attach_entity_lifecycle(row) if row else None
+        if entity:
+            entity["card_has_snapshots"], entity["card_last_state_date"] = _entity_card_summary(
+                entity.get("entity_card_json")
+            )
+        return entity
 
 
 async def set_entity_status(entity_id: int, status: str):
@@ -3548,6 +3590,18 @@ def _parse_entity_card(card_json) -> dict:
             })
         card["snapshots"] = _sort_and_cap_snapshots(snapshots)
     return card
+
+
+def _entity_card_summary(card_json) -> tuple:
+    """Return (has_snapshots, last_state_date) for a card payload.
+
+    Card presence = at least one snapshot; last_state_date is the newest
+    snapshot's fact_date (the card's derived current state date).
+    """
+    snapshots = _parse_entity_card(card_json)["snapshots"]
+    if not snapshots:
+        return False, None
+    return True, snapshots[-1].get("fact_date") or None
 
 
 def _sort_and_cap_snapshots(snapshots: list, cap: int = ENTITY_CARD_SNAPSHOT_CAP) -> list:

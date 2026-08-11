@@ -250,6 +250,27 @@ function renderEntities() {
                 metrics.appendChild(metric);
             });
 
+            const badges = document.createElement('span');
+            badges.className = 'entity-item-badges';
+            if (entity.pending_proposal_count > 0) {
+                const pending = document.createElement('span');
+                pending.className = 'entity-badge entity-badge-pending';
+                pending.textContent = `待确认 ${entity.pending_proposal_count}`;
+                badges.appendChild(pending);
+            }
+            if (entity.card_has_snapshots) {
+                const hasCard = document.createElement('span');
+                hasCard.className = 'entity-badge entity-badge-card';
+                hasCard.textContent = '有卡';
+                badges.appendChild(hasCard);
+                if (entity.card_last_state_date) {
+                    const date = document.createElement('span');
+                    date.className = 'entity-badge entity-badge-date';
+                    date.textContent = `状态至 ${entity.card_last_state_date}`;
+                    badges.appendChild(date);
+                }
+            }
+
             const aliases = document.createElement('span');
             aliases.className = `entity-item-aliases${entity.aliases?.length ? '' : ' is-empty'}`;
             aliases.textContent = entity.aliases?.length ? `别名：${entity.aliases.join('、')}` : '暂无别名';
@@ -259,7 +280,7 @@ function renderEntities() {
             arrow.setAttribute('aria-hidden', 'true');
             arrow.textContent = '›';
 
-            row.append(identity, metrics, aliases, arrow);
+            row.append(identity, metrics, badges, aliases, arrow);
             row.onclick = () => {
                 list.querySelectorAll('.entity-item.is-selected').forEach(item => item.classList.remove('is-selected'));
                 row.classList.add('is-selected');
@@ -629,7 +650,7 @@ async function detectDuplicateEntities() {
 function renderDuplicateGroup(group, index) {
     const target = group.entities.find(entity => entity.is_target) || group.entities[0];
     const others = group.entities.filter(entity => entity.id !== target.id);
-    const reasonLabel = group.reason === 'canonical' ? '规范名相同' : '名称高度相似';
+    const reasonLabel = group.reason === 'canonical' ? '规范名相同' : '名称相似或包含';
     const listHtml = group.entities.map(entity => {
         const mark = entity.is_target ? ' <span class="combo-option-meta">（保留目标）</span>' : '';
         return `<div class="dup-entity">${escapeHtml(entity.name)}` +
