@@ -2852,7 +2852,7 @@ async def api_backfill_entity_cards(request: Request):
         return {"error": "补卡任务正在运行中，请稍候"}
     data = await request.json()
     try:
-        limit = max(1, min(50, int(data.get("limit", 5))))
+        limit = max(1, min(50, int(data.get("limit", 3))))
     except (TypeError, ValueError):
         return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
     entities = await list_entities_without_card(limit)

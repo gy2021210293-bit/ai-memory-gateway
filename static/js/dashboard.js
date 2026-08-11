@@ -708,7 +708,7 @@ let _cardBackfillTimer = null;
 
 async function backfillEntityCards() {
     const status = document.getElementById('entity-status');
-    if (!confirm('将调用记忆模型，为最多 5 个没有状态卡的旧实体提取「当前状态」建议。\n\n生成的是待确认提案，不会自动进卡——你在下方确认后才写入。是否继续？')) return;
+    if (!confirm('将调用记忆模型，为最多 3 个没有状态卡的旧实体提取「当前状态」建议。\n\n生成的是待确认提案，不会自动进卡——你在下方确认后才写入。是否继续？')) return;
     if (_cardBackfillTimer) {
         status.textContent = '补卡任务已在运行中，请等待完成。';
         return;
@@ -716,7 +716,7 @@ async function backfillEntityCards() {
     status.textContent = '正在启动补全…';
     try {
         const response = await fetch('/api/entities/backfill-cards', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 5 }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 3 }),
         });
         const data = await response.json().catch(() => null);
         if (!response.ok || !data) {

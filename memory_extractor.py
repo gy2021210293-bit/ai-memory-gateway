@@ -739,7 +739,7 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 
 # ---- 旧实体补卡：从既有记忆为每个实体建议一条当前状态（全部走提案，不自动入卡） ----
 
-BACKFILL_SNAPSHOT_CHUNK = 5
+BACKFILL_SNAPSHOT_CHUNK = 3
 BACKFILL_MEMORIES_PER_ENTITY = 10
 BACKFILL_MEMORY_CHARS = 120
 
@@ -814,15 +814,29 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
         {"role": "user", "content": "请根据上述每个实体的证据记忆，为每个实体返回一条当前状态建议（JSON 对象，键为实体ID）。"},
     ]
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             headers = {"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"}
             payload = {"model": MEMORY_MODEL, "messages": request_messages}
-            response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
+            try:
+                response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
+            except httpx.ReadTimeout:
+                # 提供商/中转偶尔响应偏慢，睡 2 秒重试一次
+                print("⚠️ 实体状态卡补全超时，2 秒后重试一次")
+                await asyncio.sleep(2)
+                try:
+                    response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
+                except httpx.ReadTimeout:
+                    print("⚠️ 实体状态卡补全重试仍超时")
+                    return {"error": f"LLM请求超时（重试后仍超时）(model={MEMORY_MODEL})"}
             if response.status_code == 500:
                 # 提供商偶发 500，睡 2 秒重试一次
                 print("⚠️ 实体状态卡补全遇到 500，2 秒后重试一次")
                 await asyncio.sleep(2)
-                response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
+                try:
+                    response = await client.post(get_memory_api_base_url(), headers=headers, json=payload)
+                except httpx.ReadTimeout:
+                    print("⚠️ 实体状态卡补全重试超时")
+                    return {"error": f"LLM请求超时（重试后仍超时）(model={MEMORY_MODEL})"}
             if response.status_code != 200:
                 reason = f"LLM请求失败 HTTP {response.status_code}: {response.text[:300]}"
                 print(f"⚠️ 实体状态卡补全请求失败: {response.status_code} {response.text[:500]} (model={MEMORY_MODEL})")
