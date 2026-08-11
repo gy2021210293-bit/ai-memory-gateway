@@ -740,18 +740,22 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 # ---- 旧实体补卡：从既有记忆为每个实体建议一条当前状态（全部走提案，不自动入卡） ----
 
 BACKFILL_SNAPSHOT_CHUNK = 5
-BACKFILL_MEMORIES_PER_ENTITY = 4
+BACKFILL_MEMORIES_PER_ENTITY = 10
 BACKFILL_MEMORY_CHARS = 120
 
 
 def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
-    """Map an evidence quote to the memory that contains it (verbatim), else the newest."""
+    """Map an evidence quote to the memory that contains it (verbatim), else the newest.
+
+    `memories` 由 get_entity_memories 返回，created_at DESC（最新在前），
+    所以取最近的那条兜底用 memories[0]。
+    """
     if quote:
-        for memory in reversed(memories or []):
+        for memory in memories or []:
             if quote in str(memory.get("content") or ""):
                 return memory.get("id")
     if memories:
-        return memories[-1].get("id")
+        return memories[0].get("id")
     return None
 
 
@@ -761,7 +765,10 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
     for entity in entities:
         aliases = "、".join(entity.get("aliases") or []) or "无"
         memory_lines = []
-        for memory in (entity.get("memories") or [])[-BACKFILL_MEMORIES_PER_ENTITY:]:
+        # memories 最新在前，取最近 N 条后反转为时间正序（旧 → 新）喂给模型，
+        # 便于它从历史推进中判断「当前」稳定状态。
+        recent = (entity.get("memories") or [])[:BACKFILL_MEMORIES_PER_ENTITY]
+        for memory in reversed(recent):
             content = str(memory.get("content") or "").strip()
             if not content:
                 continue

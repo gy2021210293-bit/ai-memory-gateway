@@ -157,7 +157,11 @@ class EntityCardHarnessTests(unittest.TestCase):
         )
 
     def test_resolve_evidence_memory_prefers_verbatim_then_newest(self):
-        memories = [{"id": 6, "content": "小明在备考"}, {"id": 7, "content": "我搬到上海了，现在住上海"}]
+        # 列表按 created_at DESC（最新在前），与 get_entity_memories 一致
+        memories = [
+            {"id": 7, "content": "我搬到上海了，现在住上海"},  # 最新
+            {"id": 6, "content": "小明在备考"},
+        ]
         self.assertEqual(memory_extractor._resolve_evidence_memory("我搬到上海了", memories), 7)
         self.assertEqual(memory_extractor._resolve_evidence_memory("没有这句", memories), 7)
         self.assertIsNone(memory_extractor._resolve_evidence_memory("", []))
@@ -284,14 +288,15 @@ SNAPSHOT_BACKFILL_OK = {
 class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_suggest_snapshots_batch_parses_and_resolves_evidence(self):
         entities = [
+            # memories 按 created_at DESC（最新在前），与 get_entity_memories 一致
             {"id": 1, "name": "小明", "entity_type": "person", "aliases": ["阿明"], "memories": [
+                {"id": 7, "content": "小明说：我搬到上海了，现在住上海"},  # 最新
                 {"id": 6, "content": "小明正在准备考试"},
-                {"id": 7, "content": "小明说：我搬到上海了，现在住上海"},
             ]},
             {"id": 2, "name": "小猫", "entity_type": "pet", "aliases": [], "memories": []},
             {"id": 3, "name": "项目A", "entity_type": "project", "aliases": [], "memories": [
+                {"id": 11, "content": "项目A 二期进行中"},  # 最新
                 {"id": 10, "content": "项目A 一期已交付"},
-                {"id": 11, "content": "项目A 二期进行中"},
             ]},
         ]
         with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient(SNAPSHOT_BACKFILL_OK)), \
