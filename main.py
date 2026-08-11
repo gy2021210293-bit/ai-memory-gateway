@@ -2786,12 +2786,13 @@ async def _run_card_backfill(entities: list) -> None:
                 for entity in chunk:
                     entity["memories"] = await get_entity_memories(entity["id"])
                 suggestions = await suggest_entity_snapshots_batch(chunk)
-                if suggestions is None:
+                if suggestions.get("error"):
                     errors += len(chunk)
-                    errors_detail.append(f"LLM 批次失败（{len(chunk)} 个实体）")
+                    errors_detail.append(suggestions["error"])
                 else:
+                    results = suggestions.get("results") or {}
                     for entity in chunk:
-                        suggestion = suggestions.get(entity["id"])
+                        suggestion = results.get(entity["id"])
                         if not suggestion:
                             skipped += 1
                             continue

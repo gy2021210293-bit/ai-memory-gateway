@@ -789,17 +789,16 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
     )
 
 
-async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[int, Dict]]:
+async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Dict:
     """One LLM call to propose current-state snapshots for a batch of legacy entities.
 
     每个实体只生成「待确认提案」，永远不会直接进卡：老数据没有逐字消息回链，
-    一律需要人工在 Dashboard 接受。返回 {entity_id: {"state","fact_date",
-    "evidence_memory_id","evidence_quote"}}（没有稳定状态的实体不出现）；
-    请求或解析失败返回 None，供调用方统计报错。
+    一律需要人工在 Dashboard 接受。成功返回 {"results": {entity_id: {...}}}；
+    失败返回 {"error": "具体原因"}，原因会直接显示在 Dashboard 上，便于定位。
     """
     entities = [entity for entity in entities or [] if entity and entity.get("id")]
     if not entities or not get_memory_api_key():
-        return {}
+        return {"results": {}}
     prompt = _build_snapshot_backfill_prompt(entities)
     request_messages = [{"role": "user", "content": prompt}]
     try:
@@ -810,12 +809,13 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[
                 json={"model": MEMORY_MODEL, "messages": request_messages},
             )
             if response.status_code != 200:
+                reason = f"LLM请求失败 HTTP {response.status_code}: {response.text[:300]}"
                 print(f"⚠️ 实体状态卡补全请求失败: {response.status_code} {response.text[:500]} (model={MEMORY_MODEL})")
-                return None
+                return {"error": reason}
             text = _extract_response_content(response.json()).strip()
             if not text:
                 print(f"⚠️ 实体状态卡补全返回空内容 (model={MEMORY_MODEL})")
-                return None
+                return {"error": f"LLM返回空内容 (model={MEMORY_MODEL})"}
             try:
                 raw = parse_json_object(text)
             except ValueError as first_error:
@@ -834,18 +834,18 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[
                 )
                 if retry_response.status_code != 200:
                     print(f"⚠️ 实体状态卡补全重试失败: {retry_response.status_code} {retry_response.text[:200]}")
-                    return None
+                    return {"error": f"LLM重试失败 HTTP {retry_response.status_code}: {retry_response.text[:200]}"}
                 retry_text = _extract_response_content(retry_response.json()).strip()
                 if not retry_text:
                     print("⚠️ 实体状态卡补全重试返回空内容")
-                    return None
+                    return {"error": "LLM重试返回空内容"}
                 try:
                     raw = parse_json_object(retry_text)
                 except ValueError as retry_error:
                     print(f"⚠️ 实体状态卡补全重试结果仍无法解析: {retry_error}")
-                    return None
+                    return {"error": f"LLM返回无法解析: {retry_text[:200]}"}
         if not isinstance(raw, dict):
-            return {}
+            return {"results": {}}
         by_id = {int(entity["id"]): entity for entity in entities}
         results = {}
         for key, value in raw.items():
@@ -868,10 +868,10 @@ async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[
             )
             results[entity_id] = snapshot
         print(f"📝 状态卡补全批次：{len(entities)} 个实体，模型返回 {len(results)} 条状态建议")
-        return results
+        return {"results": results}
     except Exception as exc:
         print(f"⚠️ 实体状态卡补全失败: {exc}")
-        return None
+        return {"error": f"调用异常: {exc}"}
 
 
 COGNITIVE_DRAFT_RULES = {

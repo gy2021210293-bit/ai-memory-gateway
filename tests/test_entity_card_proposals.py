@@ -297,7 +297,9 @@ class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient(SNAPSHOT_BACKFILL_OK)), \
              patch("memory_extractor.get_memory_api_key", return_value="key"), \
              patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
-            results = await memory_extractor.suggest_entity_snapshots_batch(entities)
+            payload = await memory_extractor.suggest_entity_snapshots_batch(entities)
+        self.assertNotIn("error", payload)
+        results = payload["results"]
         self.assertEqual(results[1]["state"], "住在上海")
         self.assertEqual(results[1]["fact_date"], "2026-07-20")
         self.assertEqual(results[1]["evidence_memory_id"], 7)   # 逐字引文命中记忆 7
@@ -305,14 +307,15 @@ class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(999, results)                            # 批次外实体 → 丢弃
         self.assertEqual(results[3]["evidence_memory_id"], 11)    # 引文未命中 → 取最新记忆
 
-    async def test_suggest_snapshots_batch_request_failure_returns_none(self):
+    async def test_suggest_snapshots_batch_request_failure_returns_error_reason(self):
         with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient({}, status=500)), \
              patch("memory_extractor.get_memory_api_key", return_value="key"), \
              patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
-            results = await memory_extractor.suggest_entity_snapshots_batch(
+            payload = await memory_extractor.suggest_entity_snapshots_batch(
                 [{"id": 1, "name": "x", "entity_type": "person", "aliases": [], "memories": []}]
             )
-        self.assertIsNone(results)
+        self.assertIn("error", payload)
+        self.assertIn("500", payload["error"])
 
 
 if __name__ == "__main__":
