@@ -158,6 +158,16 @@ class EntityCardTests(unittest.TestCase):
         # jsonb 列以字符串返回时同样解析
         self.assertEqual(database._entity_card_summary(json.dumps(card, ensure_ascii=False)), (True, "2026-07-20"))
 
+    def test_card_has_description_mirrors_display_fallback(self):
+        # 卡内说明存在 → True
+        self.assertTrue(database._card_has_description({"description": "  朋友  ", "snapshots": []}, ""))
+        # 卡内无说明但遗留说明存在 → True（聊天注入的兜底）
+        self.assertTrue(database._card_has_description({"description": "", "snapshots": []}, "旧说明"))
+        # 两者皆空 → False
+        self.assertFalse(database._card_has_description({"description": "", "snapshots": []}, ""))
+        self.assertFalse(database._card_has_description(None, ""))
+        self.assertFalse(database._card_has_description(None, "   "))
+
     def test_list_entities_includes_pending_count_and_card_summary(self):
         calls = []
 
@@ -179,6 +189,7 @@ class EntityCardTests(unittest.TestCase):
         self.assertEqual(entities[0]["pending_proposal_count"], 1)
         self.assertFalse(entities[0]["card_has_snapshots"])
         self.assertIsNone(entities[0]["card_last_state_date"])
+        self.assertFalse(entities[0]["card_has_description"])
 
     def test_list_entities_without_card_filters_empty_cards(self):
         calls = []

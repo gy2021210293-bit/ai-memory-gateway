@@ -270,6 +270,12 @@ function renderEntities() {
                     badges.appendChild(date);
                 }
             }
+            if (!entity.card_has_description) {
+                const noDesc = document.createElement('span');
+                noDesc.className = 'entity-badge entity-badge-nodesc';
+                noDesc.textContent = '无说明';
+                badges.appendChild(noDesc);
+            }
 
             const aliases = document.createElement('span');
             aliases.className = `entity-item-aliases${entity.aliases?.length ? '' : ' is-empty'}`;

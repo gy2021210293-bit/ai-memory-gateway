@@ -3241,6 +3241,9 @@ async def list_entities():
             entity["card_has_snapshots"], entity["card_last_state_date"] = _entity_card_summary(
                 entity.get("entity_card_json")
             )
+            entity["card_has_description"] = _card_has_description(
+                entity.get("entity_card_json"), entity.get("description")
+            )
         entities.sort(key=lambda item: (
             item["retrieval_status"] != "active",
             -int(item.get("evidence_count") or 0),
@@ -3437,6 +3440,9 @@ async def get_entity_detail(entity_id: int):
             entity["card_has_snapshots"], entity["card_last_state_date"] = _entity_card_summary(
                 entity.get("entity_card_json")
             )
+            entity["card_has_description"] = _card_has_description(
+                entity.get("entity_card_json"), entity.get("description")
+            )
         return entity
 
 
@@ -3603,6 +3609,19 @@ def _entity_card_summary(card_json) -> tuple:
     if not snapshots:
         return False, None
     return True, snapshots[-1].get("fact_date") or None
+
+
+def _card_has_description(card_json, legacy_description) -> bool:
+    """True when the entity has a non-empty 说明.
+
+    Mirrors the chat-time display which shows the card description, falling
+    back to the legacy entities.description when the card has none.
+    """
+    card = _parse_entity_card(card_json)
+    return bool(
+        (card.get("description") or "").strip()
+        or str(legacy_description or "").strip()
+    )
 
 
 def _sort_snapshots(snapshots: list) -> list:

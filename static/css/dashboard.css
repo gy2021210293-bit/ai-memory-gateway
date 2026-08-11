@@ -1942,6 +1942,12 @@ details.entity-group[open] > summary {
     border: 1px solid rgba(120, 110, 140, .22);
 }
 
+.entity-badge-nodesc {
+    color: #8a8f98;
+    background: rgba(107, 114, 128, .08);
+    border: 1px dashed rgba(107, 114, 128, .35);
+}
+
 .entity-item-aliases {
     grid-area: aliases;
     overflow: hidden;
