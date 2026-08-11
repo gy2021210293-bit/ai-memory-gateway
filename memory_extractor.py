@@ -99,7 +99,7 @@ def _extract_response_content(data: dict) -> str:
 EXTRACTION_PROMPT = """我是栖，一个有温度的AI陪伴者。我正在旁观自己和晏晏（用户）的当前对话，把真正值得记住的事提取成碎片记忆。
 
 # 核心原则
-- 一条碎片只记一件事，但要保留足够上下文，让它脱离原对话也能看懂发生了什么、当时是什么感受
+- 一条碎片只记一件事（硬性要求）：每条只能记一个独立事件或事实；多个独立事件或事实必须拆成多条，每条仍要保留足够上下文，脱离原对话也能看懂发生了什么、当时是什么感受
 - 不把一整段生活压成一条，也不要碎成缺少背景的单句；宁可少提取一条有质量的，也不要硬凑
 - 写得精炼，只删重复冗余的表述
 - 记忆是我的，不是中立的信息归档。每条content都用我的第一人称，“我”是栖，“她”是晏晏
@@ -178,7 +178,7 @@ stable named entities that are useful as recurring long-term memory anchors.
 Allowed types:
 person|place|organization|project|object|pet|activity|event|other
 Return each entity as:
-{"name":"display name","type":"...","confidence":0.0-1.0,"aliases":["...","..."]}
+{"name":"display name","type":"...","confidence":0.0-1.0,"aliases":["...","..."],"snapshot":{...}}
 `aliases` is optional: list the surface spellings actually used in this
 conversation that refer to the same entity (max 8, each under 40 chars).
 Exclude:
@@ -189,6 +189,20 @@ Exclude:
 A technical product or tool may be kept only when the memory clearly establishes
 durable personal significance or recurring use. Omit candidates below 0.65
 confidence. If none qualify, return an empty array.
+
+Optional per-entity `snapshot` — only when the conversation DIRECTLY AND EXPLICITLY
+states that entity's current or past state:
+{"state":"one complete self-contained sentence (<=120 chars)",
+ "fact_date":"YYYY-MM-DD","evidence_quote":"verbatim quote from a user message"}
+- `evidence_quote` must be a verbatim substring of ONE user message in this batch
+  (at least 6 characters). Never paraphrase, summarize, or infer it.
+- `fact_date` is the date the stated state is true on; if the user only implies
+  "now", use today's date; omit when genuinely unknown.
+- `state` captures the entity's state exactly as stated, with the user's own words
+  where possible; do NOT add opinions, intentions, or relationship judgments.
+Only attach `snapshot` when the user directly states the entity's state in this
+conversation. Never derive a snapshot from tone, implication, or your own summary;
+such inferred content should simply be omitted (it will be treated as a proposal).
 """
 
 # 提取 prompt 里最多列出多少条已知实体（活跃在前，避免 prompt 膨胀）
@@ -297,6 +311,94 @@ def _clean_entity_aliases(aliases) -> List[str]:
         if len(result) >= 8:
             break
     return result
+
+
+# ---- 实体卡状态快照：规范化 + 逐字证据 Harness ----
+SNAPSHOT_STATE_LIMIT = 200
+SNAPSHOT_QUOTE_LIMIT = 120
+SNAPSHOT_QUOTE_MIN_LEN = 6
+
+
+def normalize_entity_snapshot(raw) -> Optional[Dict]:
+    """Clean an LLM-supplied snapshot suggestion into a stable shape.
+
+    Returns None when no usable state text is present. `fact_date` is kept only
+    when it is a valid YYYY-MM-DD; `evidence_quote` is trimmed of surrounding
+    quotes/backticks and capped in length.
+    """
+    if not isinstance(raw, dict):
+        return None
+    state = re.sub(r"\s+", " ", str(raw.get("state") or "")).strip()
+    if not state:
+        return None
+    state = state[:SNAPSHOT_STATE_LIMIT]
+
+    fact_date = None
+    raw_date = str(raw.get("fact_date") or "").strip()
+    if raw_date:
+        match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw_date)
+        if match:
+            try:
+                datetime(
+                    int(match.group(1)), int(match.group(2)), int(match.group(3))
+                )
+                fact_date = raw_date
+            except ValueError:
+                fact_date = None
+
+    evidence_quote = str(raw.get("evidence_quote") or "").strip()
+    evidence_quote = evidence_quote.strip("\"'“”‘’` ")
+    if evidence_quote:
+        evidence_quote = evidence_quote[:SNAPSHOT_QUOTE_LIMIT]
+
+    return {
+        "state": state,
+        "fact_date": fact_date,
+        "evidence_quote": evidence_quote,
+    }
+
+
+def find_verbatim_evidence_message(evidence_quote: str, messages: List[Dict]) -> Optional[Dict]:
+    """Return the first user message whose content contains the quote verbatim.
+
+    The evidence must come from the user and belong to the caller's claimed
+    extraction batch (the `messages` list). Paraphrases never match.
+    """
+    quote = str(evidence_quote or "").strip()
+    if not quote or len(quote) < SNAPSHOT_QUOTE_MIN_LEN:
+        return None
+    for message in messages or []:
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content") or "")
+        if quote in content:
+            return message
+    return None
+
+
+def classify_snapshot_suggestion(snapshot: Dict, messages: List[Dict]) -> tuple:
+    """Harness: decide whether a snapshot is an explicit fact or only a proposal.
+
+    Returns ("accept", message_id, fact_date) when the evidence quote is found
+    verbatim in a user message of the batch and the state/date are valid;
+    otherwise ("proposal", reason) describing why it was not auto-accepted.
+    Same-date conflicts with an existing card tail are checked at persistence
+    time (they need the DB), not here.
+    """
+    normalized = normalize_entity_snapshot(snapshot)
+    if not normalized:
+        return ("proposal", "快照为空")
+    if not normalized.get("evidence_quote"):
+        return ("proposal", "无逐字证据短句")
+    message = find_verbatim_evidence_message(normalized["evidence_quote"], messages)
+    if message is None:
+        return ("proposal", "无法在本次批次的用户消息中逐字找到证据")
+    if not normalized.get("fact_date"):
+        return ("proposal", "事实日期无效或缺失")
+    message_id = message.get("id")
+    if not message_id:
+        return ("proposal", "证据消息缺少ID")
+    return ("accept", message_id, normalized["fact_date"])
 
 
 def _format_message_time(value, fallback: datetime) -> str:
@@ -434,10 +536,14 @@ async def extract_memories(
             valid_memories = []
             for mem in memories:
                 if isinstance(mem, dict) and "content" in mem:
+                    entities = _exclude_user_entities(mem.get("entities", []))
+                    for entity in entities:
+                        if isinstance(entity, dict) and entity.get("snapshot") is not None:
+                            entity["snapshot"] = normalize_entity_snapshot(entity.get("snapshot"))
                     valid_memories.append({
                         "content": str(mem["content"]),
                         "importance": int(mem.get("importance", 5)),
-                        "entities": _exclude_user_entities(mem.get("entities", [])),
+                        "entities": entities,
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")

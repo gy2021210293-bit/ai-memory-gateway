@@ -1685,10 +1685,39 @@ body::after {
     background: rgba(244, 239, 248, 0.98);
 }
 
-.entity-profile-editor-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 16px;
+/* Entity card */
+.entity-card-snapshots,
+.entity-card-proposals {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.entity-card-snapshot,
+.entity-card-proposal {
+    padding: 10px 12px;
+    border: 1px solid rgba(126, 99, 145, .12);
+    border-radius: 12px;
+    background: rgba(249, 247, 250, .58);
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.entity-card-snapshot-header,
+.entity-card-proposal-header {
+    font-size: 12px;
+    font-weight: 650;
+    color: #7a6b86;
+    margin-bottom: 4px;
+    letter-spacing: .01em;
+}
+
+.entity-card-snapshot:last-child {
+    border-color: rgba(126, 99, 145, .28);
+    background: rgba(236, 226, 244, .35);
 }
 
 /* Entity list */
@@ -2400,10 +2429,6 @@ details.entity-group[open] > summary {
 }
 
 @media (max-width: 768px) {
-    .entity-profile-editor-grid {
-        grid-template-columns: 1fr;
-    }
-
     .sidebar {
         width: 72px;
     }

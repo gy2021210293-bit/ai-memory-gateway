@@ -281,9 +281,7 @@ async function loadEntityMemories(entity) {
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
         selectedEntity = data.entity || entity;
-        pendingEntityProfile = null;
         selectedEntityMemoryIds = new Set((data.memories || []).map(memory => Number(memory.id)));
-        document.getElementById('entity-profile-draft').style.display = 'none';
         document.getElementById('entity-memory-title').textContent = `${selectedEntity.name} 的实体详情`;
         document.getElementById('entity-name-edit').value = selectedEntity.name || '';
         document.getElementById('entity-type-edit').value = selectedEntity.entity_type || 'other';
@@ -293,7 +291,6 @@ async function loadEntityMemories(entity) {
             `${selectedEntity.retrieval_status === 'active' ? '活跃实体' : '候选实体'} · ` +
             `累计原始证据 ${selectedEntity.evidence_count || 0} 条 · 当前关联记忆 ${(data.memories || []).length} 条 · ` +
             `判定来源：${sourceLabels[selectedEntity.status_source] || selectedEntity.status_source || '自动'}`;
-        document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
         const list = document.getElementById('entity-memory-list');
         list.replaceChildren();
         (data.memories || []).forEach(memory => {
@@ -304,6 +301,7 @@ async function loadEntityMemories(entity) {
             list.appendChild(item);
         });
         document.getElementById('entity-memory-card').style.display = 'block';
+        await loadEntityCard(selectedEntity.id);
         return selectedEntity;
     } catch (error) {
         status.textContent = `实体详情加载失败：${error.message}`;
@@ -361,7 +359,7 @@ async function saveEntityEdits() {
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || '保存失败');
         selectedEntity = data.entity;
-        document.getElementById('entity-profile-current').textContent = formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
+        await loadEntityCard(selectedEntity.id);
         await loadEntities();
         const reloaded = await loadEntityMemories(data.entity);
         status.textContent = reloaded
@@ -415,150 +413,170 @@ function formatEntityProfile(profile, fallback = '') {
         .map(([title, content]) => `${title}：${Array.isArray(content) ? content.join('；') : content}`).join('\n');
 }
 
-const ENTITY_PROFILE_LIST_FIELDS = [
-    ['stable_facts', 'entity-profile-stable-facts-edit', '稳定事实'],
-    ['recent_updates', 'entity-profile-recent-updates-edit', '近期动态'],
-    ['preferences', 'entity-profile-preferences-edit', '重要偏好'],
-    ['uncertainties', 'entity-profile-uncertainties-edit', '待确认信息'],
-];
-
-function fillEntityProfileEditor(profile) {
-    const value = parseEntityProfile(profile) || {};
-    document.getElementById('entity-profile-summary-edit').value = value.summary || '';
-    document.getElementById('entity-profile-relationship-edit').value = value.relationship || '';
-    ENTITY_PROFILE_LIST_FIELDS.forEach(([key, elementId]) => {
-        document.getElementById(elementId).value = Array.isArray(value[key]) ? value[key].join('\n') : '';
-    });
-    document.getElementById('entity-profile-evidence-edit').value =
-        (value.evidence_memory_ids || []).map(id => `#${id}`).join('\n');
-}
-
-function readEntityProfileList(elementId, label) {
-    const values = document.getElementById(elementId).value
-        .split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-    if (values.length > 6) throw new Error(`${label}最多填写6项。`);
-    const tooLong = values.find(value => value.length > 80);
-    if (tooLong) throw new Error(`${label}每项最多80字：“${tooLong.slice(0, 20)}…”`);
-    return values;
-}
-
-function readEntityProfileEvidenceIds() {
-    const tokens = document.getElementById('entity-profile-evidence-edit').value
-        .split(/[\s,，;；]+/).map(value => value.trim()).filter(Boolean);
-    const ids = [];
-    for (const token of tokens) {
-        const value = token.replace(/^#/, '');
-        if (!/^\d+$/.test(value)) throw new Error(`证据记忆 ID 格式错误：${token}`);
-        const id = Number(value);
-        if (!selectedEntityMemoryIds.has(id)) throw new Error(`证据记忆 #${id} 不属于当前实体。`);
-        if (!ids.includes(id)) ids.push(id);
-    }
-    if (!ids.length) throw new Error('至少保留一条属于当前实体的证据记忆。');
-    return ids;
-}
-
-function collectEntityProfileEditor() {
-    const summary = document.getElementById('entity-profile-summary-edit').value.trim();
-    const relationship = document.getElementById('entity-profile-relationship-edit').value.trim();
-    if (!summary) throw new Error('实体摘要不能为空。');
-    if (summary.length > 200) throw new Error('实体摘要最多200字。');
-    if (relationship.length > 120) throw new Error('关系最多120字。');
-    const profile = { summary, relationship };
-    ENTITY_PROFILE_LIST_FIELDS.forEach(([key, elementId, label]) => {
-        profile[key] = readEntityProfileList(elementId, label);
-    });
-    profile.evidence_memory_ids = readEntityProfileEvidenceIds();
-    return profile;
-}
-
-function openEntityProfileEditor(profile, title) {
-    pendingEntityProfile = parseEntityProfile(profile) || {};
-    document.getElementById('entity-profile-old').textContent =
-        formatEntityProfile(selectedEntity.profile_json, selectedEntity.description);
-    document.getElementById('entity-profile-editor-title').textContent = title;
-    fillEntityProfileEditor(pendingEntityProfile);
-    document.getElementById('entity-profile-draft').style.display = 'block';
-}
-
-function startEntityProfileEdit() {
-    if (!selectedEntity) return;
-    const current = parseEntityProfile(selectedEntity.profile_json) || {
-        summary: selectedEntity.description || '',
-        relationship: '',
-        stable_facts: [],
-        recent_updates: [],
-        preferences: [],
-        uncertainties: [],
-        evidence_memory_ids: [],
-    };
-    openEntityProfileEditor(current, '手动编辑概况（所有字段均可修改）');
-    document.getElementById('entity-status').textContent = '正在编辑当前概况，保存前不会修改数据库。';
-}
-
-async function generateEntityProfileDraft() {
-    if (!selectedEntity) return;
-    const status = document.getElementById('entity-status');
-    const button = document.getElementById('entity-profile-generate');
-    button.disabled = true;
-    status.textContent = `正在为 ${selectedEntity.name} 生成概况草稿…`;
-    try {
-        const response = await fetch(`/api/entities/${selectedEntity.id}/profile/draft`, { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok || data.error) throw new Error(data.error || '生成失败');
-        openEntityProfileEditor(data.draft, '模型生成的新草稿（所有字段均可修改）');
-        status.textContent = '草稿已生成，可修改全部字段后确认。';
-    } catch (error) {
-        status.textContent = error.message;
-    } finally {
-        button.disabled = false;
-    }
-}
-
-async function saveEntityProfileDraft() {
-    if (!selectedEntity || !pendingEntityProfile) return;
-    const status = document.getElementById('entity-status');
-    const button = document.getElementById('entity-profile-save');
-    try {
-        pendingEntityProfile = collectEntityProfileEditor();
-    } catch (error) {
-        status.textContent = error.message;
+function renderEntityCardSnapshots(snapshots) {
+    const container = document.getElementById('entity-card-snapshots');
+    container.replaceChildren();
+    if (!snapshots || !snapshots.length) {
+        container.textContent = '暂无状态快照。';
         return;
     }
-    button.disabled = true;
-    status.textContent = '正在保存实体概况…';
-    try {
-        const response = await fetch(`/api/entities/${selectedEntity.id}/profile`, {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ profile: pendingEntityProfile }),
-        });
-        const responseText = await response.text();
-        let data;
-        try {
-            data = JSON.parse(responseText);
-        } catch (_) {
-            throw new Error(`保存接口返回 HTTP ${response.status}：${responseText.slice(0, 160) || '空响应'}`);
+    snapshots.forEach((snapshot, index) => {
+        const item = document.createElement('div');
+        item.className = 'entity-card-snapshot';
+        const badges = snapshot.source === 'direct' ? '直接证据' : '人工确认';
+        const evidence = [];
+        if (snapshot.evidence_memory_id) evidence.push(`记忆 #${snapshot.evidence_memory_id}`);
+        if (snapshot.evidence_message_id) evidence.push(`消息 #${snapshot.evidence_message_id}`);
+        const isTail = index === snapshots.length - 1;
+        const header = document.createElement('div');
+        header.className = 'entity-card-snapshot-header';
+        header.textContent = `${snapshot.fact_date || '未知日期'}${isTail ? '（最后已知状态）' : ''} · ${badges}${evidence.length ? ' · ' + evidence.join('，') : ''}`;
+        const body = document.createElement('div');
+        body.textContent = snapshot.state;
+        item.appendChild(header);
+        item.appendChild(body);
+        container.appendChild(item);
+    });
+}
+
+function renderEntityCardProposals(proposals) {
+    const container = document.getElementById('entity-card-proposals');
+    container.replaceChildren();
+    if (!proposals || !proposals.length) {
+        container.textContent = '暂无待确认提案。';
+        return;
+    }
+    proposals.forEach(proposal => {
+        const item = document.createElement('div');
+        item.className = 'entity-card-proposal';
+        const header = document.createElement('div');
+        header.className = 'entity-card-proposal-header';
+        header.textContent = `#${proposal.id} · ${proposal.fact_date || '未知日期'} · ${proposal.status}`;
+        const body = document.createElement('div');
+        body.textContent = proposal.state;
+        const meta = document.createElement('div');
+        meta.className = 'section-desc';
+        const parts = [];
+        if (proposal.evidence_memory_id) parts.push(`证据记忆 #${proposal.evidence_memory_id}`);
+        if (proposal.evidence_message_id) parts.push(`证据消息 #${proposal.evidence_message_id}`);
+        if (proposal.reason) parts.push(`原因：${proposal.reason}`);
+        meta.textContent = parts.join(' · ');
+        item.appendChild(header);
+        item.appendChild(body);
+        if (meta.textContent) item.appendChild(meta);
+        if (proposal.status === 'pending') {
+            const actions = document.createElement('div');
+            actions.className = 'toolbar';
+            const acceptButton = document.createElement('button');
+            acceptButton.className = 'btn btn-primary';
+            acceptButton.textContent = '接受';
+            acceptButton.onclick = () => decideEntityCardProposal(proposal.id, 'accept');
+            const rejectButton = document.createElement('button');
+            rejectButton.className = 'btn btn-danger';
+            rejectButton.textContent = '拒绝';
+            rejectButton.onclick = () => decideEntityCardProposal(proposal.id, 'reject');
+            actions.appendChild(acceptButton);
+            actions.appendChild(rejectButton);
+            item.appendChild(actions);
         }
+        container.appendChild(item);
+    });
+}
+
+async function loadEntityCard(entityId) {
+    if (!entityId) return;
+    const status = document.getElementById('entity-status');
+    try {
+        const response = await fetch(`/api/entities/${entityId}/card`);
+        const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
-        if (!data.entity || !data.profile) throw new Error('保存接口没有返回持久化后的实体概况');
-        selectedEntity = data.entity;
-        document.getElementById('entity-profile-current').textContent = formatEntityProfile(data.profile, selectedEntity.description);
-        cancelEntityProfileDraft();
-        await loadEntities();
-        const reloaded = await loadEntityMemories(data.entity);
-        status.textContent = reloaded
-            ? '实体概况已保存并重新加载。'
-            : '实体概况已保存并显示，但关联记忆重新加载失败。';
+        const card = data.card || { description: '', snapshots: [] };
+        document.getElementById('entity-card-description-edit').value = card.description || '';
+        renderEntityCardSnapshots(card.snapshots || []);
+        renderEntityCardProposals(data.proposals || []);
+        document.getElementById('entity-profile-current').textContent = formatEntityProfile(
+            selectedEntity ? selectedEntity.profile_json : null,
+            selectedEntity ? selectedEntity.description : '',
+        );
+        return data;
     } catch (error) {
-        console.error('实体概况保存失败:', error);
-        status.textContent = `实体概况保存失败：${error.message}`;
-    } finally {
-        button.disabled = false;
+        status.textContent = `实体卡加载失败：${error.message}`;
+        return null;
     }
 }
 
-function cancelEntityProfileDraft() {
-    pendingEntityProfile = null;
-    document.getElementById('entity-profile-draft').style.display = 'none';
+async function saveEntityCardDescription() {
+    if (!selectedEntity) return;
+    const status = document.getElementById('entity-status');
+    const description = document.getElementById('entity-card-description-edit').value.trim();
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/description`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ description }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '保存失败');
+        status.textContent = '实体卡说明已保存。';
+    } catch (error) {
+        status.textContent = error.message;
+    }
+}
+
+async function addEntityCardSnapshot() {
+    if (!selectedEntity) return;
+    const status = document.getElementById('entity-status');
+    const feedback = document.getElementById('entity-card-feedback');
+    const state = document.getElementById('entity-card-snapshot-state').value.trim();
+    const factDate = document.getElementById('entity-card-snapshot-date').value;
+    const memoryIdText = document.getElementById('entity-card-snapshot-memory').value.trim();
+    const messageIdText = document.getElementById('entity-card-snapshot-message').value.trim();
+    if (!state) {
+        feedback.textContent = '快照状态不能为空。';
+        return;
+    }
+    if (!factDate) {
+        feedback.textContent = '快照日期不能为空。';
+        return;
+    }
+    const payload = { state, fact_date: factDate };
+    if (memoryIdText) {
+        if (!/^\d+$/.test(memoryIdText)) { feedback.textContent = '证据记忆 ID 必须是整数。'; return; }
+        payload.evidence_memory_id = Number(memoryIdText);
+    }
+    if (messageIdText) {
+        if (!/^\d+$/.test(messageIdText)) { feedback.textContent = '证据消息 ID 必须是整数。'; return; }
+        payload.evidence_message_id = Number(messageIdText);
+    }
+    feedback.textContent = '';
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/snapshots`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '保存失败');
+        document.getElementById('entity-card-snapshot-state').value = '';
+        document.getElementById('entity-card-snapshot-memory').value = '';
+        document.getElementById('entity-card-snapshot-message').value = '';
+        renderEntityCardSnapshots(data.card ? data.card.snapshots : []);
+        status.textContent = '已新增快照，当前状态由末节点自动更新。';
+    } catch (error) {
+        feedback.textContent = error.message;
+    }
+}
+
+async function decideEntityCardProposal(proposalId, action) {
+    if (!selectedEntity) return;
+    const status = document.getElementById('entity-status');
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/card/proposals/${proposalId}/${action}`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '处理失败');
+        status.textContent = action === 'accept' ? '提案已接受，快照已入卡。' : '提案已拒绝。';
+        await loadEntityCard(selectedEntity.id);
+    } catch (error) {
+        status.textContent = error.message;
+    }
 }
 
 async function mergeSelectedEntities() {

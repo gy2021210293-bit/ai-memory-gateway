@@ -30,10 +30,11 @@ from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, get_entities_for_memory_ids, list_entities, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
+from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -394,34 +395,91 @@ async def gateway_auth_middleware(request: Request, call_next):
 # 记忆注入
 # ============================================================
 
-def _format_matched_entity_overview(memories: list) -> str:
-    """Format each entity once even when it recalled several memories."""
+# 实体卡注入的关键词驱动意图分类（纯字符串规则，聊天路径无 LLM）。
+# 明确历史问题（以前/怎么变/为什么改/历程/当时…）补投最近快照；原话/日期/具体经历问题
+# 优先事件与碎片，不把实体卡当作证据替代品；其余普通问题只给说明 + 截至某日的最后已知状态。
+ENTITY_SPECIFIC_QUERY_KEYWORDS = (
+    "原话", "原话是", "说过", "当时说", "怎么说的", "怎么回答", "如何回答",
+    "具体", "哪一天", "什么时候", "几号", "日期", "细节", "原文",
+)
+ENTITY_HISTORY_QUERY_KEYWORDS = (
+    "以前", "之前", "曾经", "过去", "当时", "原来", "原本", "最初", "一开始",
+    "怎么变", "如何变", "为什么改", "为什么变", "历程", "经过", "发展", "变化",
+    "后来", "回顾", "演变", "阶段",
+)
+
+
+def _classify_entity_query(user_message: str) -> str:
+    """Keyword-driven intent classifier for entity-card injection (no LLM).
+
+    Returns "specific" | "history" | "ordinary". Specific (quote/date) questions
+    take precedence so a sentence like "他当时说的原话是什么" is treated as a
+    lived-detail question, not a history question. Empty or unmatched text falls
+    back to "ordinary".
+    """
+    text = str(user_message or "")
+    if any(keyword in text for keyword in ENTITY_SPECIFIC_QUERY_KEYWORDS):
+        return "specific"
+    if any(keyword in text for keyword in ENTITY_HISTORY_QUERY_KEYWORDS):
+        return "history"
+    return "ordinary"
+
+
+def _format_matched_entity_overview(memories: list, user_message: str = "") -> str:
+    """Render the matched-entity block from entity cards.
+
+    The legacy profile_json (summary / relationship / stable_facts / recent_updates
+    / preferences / uncertainties) is never injected here. Ordinary questions get
+    the card's short description plus the last-known state dated "截至…"; history
+    questions additionally get the most recent 3 snapshots by fact date; specific
+    quote/date questions skip the card so the existing Top-K events/fragments answer
+    directly; ambiguous (non-exact-name) matches are labelled "（不确定是否仍为最新）".
+    """
     entities = {}
     for memory in memories:
         for entity in memory.get("matched_entities", []):
             if entity.get("retrieval_status") == "active":
                 entities[entity["id"]] = entity
+    intent = _classify_entity_query(user_message)
     lines = []
     for entity in entities.values():
-        aliases = f"，别名：{'、'.join(entity.get('aliases', []))}" if entity.get("aliases") else ""
-        profile = entity.get("profile") or {}
-        if isinstance(profile, str):
+        card = entity.get("entity_card_json") or {}
+        if isinstance(card, str):
             try:
-                profile = json.loads(profile)
+                card = json.loads(card)
             except json.JSONDecodeError:
-                profile = {}
-        summary = profile.get("summary") or entity.get("description", "")
-        details = []
-        if profile.get("relationship"):
-            details.append(f"关系：{profile['relationship']}")
-        for key, label in (("stable_facts", "稳定事实"), ("recent_updates", "近期动态"),
-                           ("preferences", "偏好"), ("uncertainties", "待确认")):
-            values = profile.get(key) or []
-            if values:
-                details.append(f"{label}：{'；'.join(values)}")
-        description = f"；概况：{summary}" if summary else ""
-        detail_text = f"；{'；'.join(details)}" if details else ""
-        lines.append(f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）{description}{detail_text}")
+                card = {}
+        snapshots = card.get("snapshots") or []
+        try:
+            snapshots = sorted(
+                (snap for snap in snapshots if isinstance(snap, dict) and snap.get("state")),
+                key=lambda snap: (str(snap.get("fact_date") or ""), str(snap.get("recorded_at") or "")),
+            )
+        except Exception:
+            snapshots = []
+        tail = snapshots[-1] if snapshots else None
+        description = (card.get("description") or entity.get("description") or "").strip()
+        aliases = f"，别名：{'、'.join(entity.get('aliases', []))}" if entity.get("aliases") else ""
+        header = f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）"
+        if intent == "specific":
+            continue
+        if intent == "history":
+            if description:
+                header += f"—— {description}"
+            lines.append(header)
+            for snapshot in snapshots[-3:]:
+                lines.append(f"  · {snapshot.get('fact_date') or '未知日期'}：{snapshot['state']}")
+            continue
+        exact_match = bool(entity.get("exact_name_match"))
+        if description:
+            header += f"—— {description}"
+        if tail:
+            state_text = f"截至{tail.get('fact_date') or '某日'}的最后已知状态：{tail['state']}"
+            if not exact_match:
+                state_text += "（不确定是否仍为最新）"
+            lines.append(f"{header}。{state_text}")
+        else:
+            lines.append(header)
     return "\n".join(lines)
 
 async def build_system_prompt_with_memories(user_message: str, base_system_prompt: str) -> str:
@@ -464,7 +522,7 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
             memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         memory_text = "\n".join(memory_lines)
-        entity_overview = _format_matched_entity_overview(memories)
+        entity_overview = _format_matched_entity_overview(memories, user_message)
         entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
         
         cognitive_section = f"\n{cognitive_text}\n" if cognitive_text else ""
@@ -1211,7 +1269,7 @@ async def build_memory_text(user_message: str) -> str:
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
             memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         
-        entity_overview = _format_matched_entity_overview(memories)
+        entity_overview = _format_matched_entity_overview(memories, user_message)
         entity_block = f"<matched_entities>\n{entity_overview}\n</matched_entities>\n" if entity_overview else ""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
@@ -1238,6 +1296,75 @@ async def build_cognitive_text() -> str:
 # ============================================================
 # 后台记忆处理
 # ============================================================
+
+async def apply_entity_card_suggestions(memory_id: int, entities: list, messages: list) -> dict:
+    """Apply entity-card snapshot suggestions produced by the same extraction call.
+
+    Harness gate (background path only, never on the chat request path):
+      - verbatim-provable user facts → 'direct' snapshot on the linked entity card;
+      - same-date-as-tail conflicts, inferred content, and anything not provable
+        verbatim → pending proposal awaiting human confirmation.
+    Entities that did not get persisted (one-off events, weak candidates) have no
+    card and are skipped — a one-off event never creates a card by itself.
+    """
+    suggestions = [
+        entity for entity in (entities or [])
+        if isinstance(entity, dict) and entity.get("snapshot")
+    ]
+    if not suggestions:
+        return {"accepted": 0, "proposals": 0}
+    try:
+        linked = await get_entities_for_memory_ids([memory_id])
+    except Exception as exc:
+        print(f"⚠️ 实体卡建议：读取记忆 {memory_id} 的关联实体失败: {exc}")
+        return {"accepted": 0, "proposals": 0}
+    entity_ids = {}
+    for linked_entity in linked.get(memory_id, []):
+        key = _db_module.normalize_entity_name(linked_entity.get("name") or "")
+        if key:
+            entity_ids.setdefault(key, linked_entity["id"])
+    accepted = 0
+    proposals = 0
+    for entity in suggestions:
+        snapshot = entity.get("snapshot") or {}
+        entity_id = entity_ids.get(_db_module.normalize_entity_name(entity.get("name") or ""))
+        if entity_id is None:
+            continue  # 未落库的实体（一次性事件/弱候选）没有卡
+        verdict = classify_snapshot_suggestion(snapshot, messages)
+        if verdict[0] == "accept":
+            _, message_id, fact_date = verdict
+            try:
+                result = await apply_entity_snapshot(
+                    entity_id, snapshot.get("state"), fact_date,
+                    memory_id, message_id, source="direct", force=False,
+                )
+            except Exception as exc:
+                print(f"⚠️ 实体卡快照写入失败: {exc}")
+                continue
+            if result.get("status") == "conflict":
+                proposals += 1
+                try:
+                    await create_entity_card_proposal(
+                        entity_id, snapshot.get("state"), fact_date,
+                        memory_id, message_id, "user", "与既有快照同日冲突，需人工确认",
+                    )
+                except Exception as exc:
+                    print(f"⚠️ 实体卡冲突提案创建失败: {exc}")
+            elif result.get("status") == "ok":
+                accepted += 1
+            # duplicate → 已存在相同快照，无需操作
+        else:
+            proposals += 1
+            try:
+                await create_entity_card_proposal(
+                    entity_id, snapshot.get("state"), snapshot.get("fact_date"),
+                    memory_id, None, "user", verdict[1],
+                )
+            except Exception as exc:
+                print(f"⚠️ 实体卡提案创建失败: {exc}")
+    if accepted or proposals:
+        print(f"📇 实体卡更新: {accepted} 条已直接入卡，{proposals} 条转为待确认提案")
+    return {"accepted": accepted, "proposals": proposals}
 
 async def process_memories_background(
     session_id: str,
@@ -1419,6 +1546,11 @@ async def process_memories_background(
                 continue
             filtered_memories.append(mem)
         
+        # 本次已认领批次的用户消息：作为新记忆回链到原始对话的证据。
+        batch_user_ids = [
+            msg["id"] for msg in (messages_for_extraction or [])
+            if msg.get("role") == "user" and msg.get("id")
+        ]
         for mem in filtered_memories:
             memory_id = await save_memory(
                 content=mem["content"],
@@ -1426,7 +1558,18 @@ async def process_memories_background(
                 source_session=session_id,
             )
             await link_memory_entities(memory_id, mem.get("entities", []))
+            try:
+                await record_memory_evidence(memory_id, batch_user_ids)
+            except Exception as exc:
+                print(f"⚠️ 记忆证据回链失败（记忆 {memory_id}）: {exc}")
             await mark_memories_entity_scanned([memory_id])
+            # 实体卡：复用同一提取结果中的状态快照建议，Harness 判定直接入卡或转提案。
+            try:
+                await apply_entity_card_suggestions(
+                    memory_id, mem.get("entities", []), messages_for_extraction,
+                )
+            except Exception as exc:
+                print(f"⚠️ 实体卡建议应用失败（记忆 {memory_id}）: {exc}")
 
         progress_completed = await complete_memory_extraction(
             session_id,
@@ -2468,52 +2611,104 @@ async def api_delete_entity(entity_id: int):
     return result
 
 
-@app.post("/api/entities/{entity_id}/profile/draft")
-async def api_generate_entity_profile_draft(entity_id: int):
-    """Generate but do not persist an entity-profile draft."""
+@app.get("/api/entities/{entity_id}/profile")
+async def api_get_entity_profile_legacy(entity_id: int):
+    """Legacy entity overview, now read-only. Never injected into chat prompts."""
     entity = await get_entity_detail(entity_id)
     if not entity:
         return JSONResponse(status_code=404, content={"error": "实体不存在"})
-    memories = [memory for memory in await get_entity_memories(entity_id) if memory.get("is_active") is not False]
-    memories.sort(key=lambda memory: (-(memory.get("layer") or 1), -memory.get("importance", 5)))
-    memories = memories[:80]
-    if not memories:
-        return JSONResponse(status_code=400, content={"error": "该实体没有可用的活跃记忆"})
-    draft = await generate_entity_profile(entity, memories)
-    if not draft or not draft.get("summary") or not draft.get("evidence_memory_ids"):
-        return JSONResponse(status_code=502, content={"error": "模型未生成有效且带证据的实体概况，现有概况未改变"})
     return {
-        "status": "draft",
         "entity": entity,
-        "current_profile": entity.get("profile_json"),
-        "draft": draft,
-        "model": _memory_extractor_module.MEMORY_MODEL,
+        "profile": entity.get("profile_json"),
+        "readonly": True,
     }
 
 
-@app.put("/api/entities/{entity_id}/profile")
-async def api_save_entity_profile(entity_id: int, request: Request):
-    """Persist a profile only after explicit Dashboard confirmation."""
+@app.get("/api/entities/{entity_id}/card")
+async def api_get_entity_card(entity_id: int):
+    """Return the entity card and its pending/decided proposals for the Dashboard."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    card = await get_entity_card(entity_id)
+    proposals = await list_entity_card_proposals(entity_id)
+    return {"entity": entity, "card": card or {"description": "", "snapshots": []}, "proposals": proposals}
+
+
+@app.put("/api/entities/{entity_id}/card/description")
+async def api_update_entity_card_description(entity_id: int, request: Request):
+    """Manually set the entity card's short description (human-only)."""
     entity = await get_entity_detail(entity_id)
     if not entity:
         return JSONResponse(status_code=404, content={"error": "实体不存在"})
     data = await request.json()
-    raw_profile = data.get("profile")
-    if not isinstance(raw_profile, dict):
-        return JSONResponse(status_code=400, content={"error": "profile 必须是 JSON 对象"})
-    memories = await get_entity_memories(entity_id)
-    allowed_ids = {int(memory["id"]) for memory in memories}
-    profile = normalize_entity_profile(raw_profile, allowed_ids)
-    if not profile.get("summary") or not profile.get("evidence_memory_ids"):
-        return JSONResponse(status_code=400, content={"error": "概况摘要和证据记忆不能为空"})
-    result = await save_entity_profile(entity_id, profile, profile["evidence_memory_ids"], _memory_extractor_module.MEMORY_MODEL)
+    description = str(data.get("description") or "").strip()
+    result = await update_entity_card_description(entity_id, description)
     if result.get("error"):
         return JSONResponse(status_code=400, content=result)
-    saved_entity = await get_entity_detail(entity_id)
-    if not saved_entity or not saved_entity.get("profile_json"):
-        return JSONResponse(status_code=500, content={"error": "实体概况保存后回读失败"})
-    result["entity"] = saved_entity
-    result["profile"] = saved_entity["profile_json"]
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/snapshots")
+async def api_add_entity_card_snapshot(entity_id: int, request: Request):
+    """Manually add or correct a snapshot on the entity card (human-confirmed)."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    state = str(data.get("state") or "").strip()
+    fact_date = str(data.get("fact_date") or "").strip()
+    if not state:
+        return JSONResponse(status_code=400, content={"error": "快照状态不能为空"})
+    if not fact_date:
+        return JSONResponse(status_code=400, content={"error": "快照日期不能为空"})
+    evidence_memory_id = data.get("evidence_memory_id")
+    evidence_message_id = data.get("evidence_message_id")
+    if evidence_memory_id is not None:
+        try:
+            evidence_memory_id = int(evidence_memory_id)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "证据记忆ID必须是整数"})
+        memories = await get_entity_memories(entity_id)
+        if evidence_memory_id not in {int(memory["id"]) for memory in memories}:
+            return JSONResponse(status_code=400, content={"error": "证据记忆不属于该实体"})
+    message_role = None
+    if evidence_message_id is not None:
+        try:
+            evidence_message_id = int(evidence_message_id)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "证据消息ID必须是整数"})
+        pool = await _db_module.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT role FROM conversations WHERE id = $1", evidence_message_id,
+            )
+        if not row:
+            return JSONResponse(status_code=400, content={"error": "证据消息不存在"})
+        message_role = row["role"]
+    result = await apply_entity_snapshot(
+        entity_id, state, fact_date,
+        evidence_memory_id, evidence_message_id, source="confirmed", force=True,
+    )
+    if result.get("status") in ("not_found", "error"):
+        return JSONResponse(status_code=400, content=result)
+    card = await get_entity_card(entity_id)
+    return {"status": "ok", "card": card or {"description": "", "snapshots": []}}
+
+
+@app.post("/api/entities/{entity_id}/card/proposals/{proposal_id}/accept")
+async def api_accept_entity_card_proposal(entity_id: int, proposal_id: int):
+    result = await accept_entity_card_proposal(proposal_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/proposals/{proposal_id}/reject")
+async def api_reject_entity_card_proposal(entity_id: int, proposal_id: int):
+    result = await reject_entity_card_proposal(proposal_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
     return result
 
 

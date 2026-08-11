@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memory Gateway</title>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=6.0">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=7.0">
 </head>
 <body>
     <div class="dashboard">
@@ -503,7 +503,6 @@
                 <div class="card" id="entity-memory-card" style="display:none">
                     <div class="toolbar" style="justify-content:space-between">
                         <h3 id="entity-memory-title">关联记忆</h3>
-                        <button class="btn btn-primary" id="entity-profile-generate" onclick="generateEntityProfileDraft()">生成/刷新概况</button>
                     </div>
                     <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-top:16px">
                         <div class="form-group">
@@ -539,50 +538,37 @@
                         <button class="btn btn-danger" id="entity-delete" onclick="deleteSelectedEntity()">仅删除实体</button>
                         <span class="section-desc">删除实体不会删除原始记忆。</span>
                     </div>
-                    <div class="toolbar" style="justify-content:space-between;margin-top:16px">
-                        <h4 style="margin:0">当前实体概况</h4>
-                        <button class="btn btn-secondary" id="entity-profile-edit" onclick="startEntityProfileEdit()">手动编辑概况</button>
-                    </div>
-                    <pre id="entity-profile-current" style="white-space:pre-wrap;line-height:1.6"></pre>
-                    <div id="entity-profile-draft" style="display:none;margin:16px 0">
-                        <div class="entity-profile-editor-grid">
-                            <div><h4>保存中的概况</h4><pre id="entity-profile-old" style="white-space:pre-wrap;line-height:1.6"></pre></div>
-                            <div>
-                                <h4 id="entity-profile-editor-title">待保存概况（所有字段均可修改）</h4>
-                                <div class="form-group">
-                                    <label for="entity-profile-summary-edit">摘要（必填，最多200字）</label>
-                                    <textarea id="entity-profile-summary-edit" class="textarea" rows="5" maxlength="200"></textarea>
-                                </div>
-                                <div class="form-group">
-                                    <label for="entity-profile-relationship-edit">关系（最多120字）</label>
-                                    <textarea id="entity-profile-relationship-edit" class="textarea" rows="2" maxlength="120"></textarea>
-                                </div>
-                                <div class="form-group">
-                                    <label for="entity-profile-stable-facts-edit">稳定事实（每行一项，最多6项，每项80字）</label>
-                                    <textarea id="entity-profile-stable-facts-edit" class="textarea" rows="4"></textarea>
-                                </div>
-                                <div class="form-group">
-                                    <label for="entity-profile-recent-updates-edit">近期动态（每行一项，最多6项，每项80字）</label>
-                                    <textarea id="entity-profile-recent-updates-edit" class="textarea" rows="4"></textarea>
-                                </div>
-                                <div class="form-group">
-                                    <label for="entity-profile-preferences-edit">重要偏好（每行一项，最多6项，每项80字）</label>
-                                    <textarea id="entity-profile-preferences-edit" class="textarea" rows="4"></textarea>
-                                </div>
-                                <div class="form-group">
-                                    <label for="entity-profile-uncertainties-edit">待确认信息（每行一项，最多6项，每项80字）</label>
-                                    <textarea id="entity-profile-uncertainties-edit" class="textarea" rows="4"></textarea>
-                                </div>
-                                <div class="form-group">
-                                    <label for="entity-profile-evidence-edit">证据记忆 ID（必填，用空格、逗号或换行分隔）</label>
-                                    <textarea id="entity-profile-evidence-edit" class="textarea" rows="3" placeholder="#12, #18"></textarea>
-                                </div>
-                            </div>
+                    <div class="card" style="margin:16px 0;padding:12px">
+                        <div class="toolbar" style="justify-content:space-between">
+                            <h4 style="margin:0">实体卡</h4>
+                            <span class="section-desc">说明仅人工编辑；当前状态由最后一条有效快照派生，不单独保存。</span>
                         </div>
-                        <div class="toolbar" style="margin-top:12px">
-                            <button class="btn btn-primary" id="entity-profile-save" onclick="saveEntityProfileDraft()">确认保存</button>
-                            <button class="btn btn-secondary" onclick="cancelEntityProfileDraft()">取消</button>
+                        <div class="form-group">
+                            <label for="entity-card-description-edit">简短说明（人工确认的稳定身份说明）</label>
+                            <textarea id="entity-card-description-edit" class="textarea" rows="2" maxlength="200"></textarea>
                         </div>
+                        <div class="toolbar">
+                            <button class="btn btn-primary" onclick="saveEntityCardDescription()">保存说明</button>
+                        </div>
+                        <h5 style="margin:16px 0 8px">状态快照（按事实日期排序，末节点即最后已知状态）</h5>
+                        <div id="entity-card-snapshots" class="entity-card-snapshots"></div>
+                        <h5 style="margin:16px 0 8px">手动新增 / 修正快照</h5>
+                        <div style="display:grid;grid-template-columns:1fr 160px;gap:8px">
+                            <input id="entity-card-snapshot-state" class="input" placeholder="完整状态文本，如：住在上海，从事建筑设计">
+                            <input id="entity-card-snapshot-date" class="input" type="date">
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+                            <input id="entity-card-snapshot-memory" class="input" placeholder="证据记忆 ID（可选）" inputmode="numeric">
+                            <input id="entity-card-snapshot-message" class="input" placeholder="证据消息 ID（可选）" inputmode="numeric">
+                        </div>
+                        <div class="toolbar" style="margin-top:10px">
+                            <button class="btn btn-primary" onclick="addEntityCardSnapshot()">新增快照</button>
+                            <span id="entity-card-feedback" class="section-desc"></span>
+                        </div>
+                        <h5 style="margin:16px 0 8px">待确认提案（模型推断需人工确认）</h5>
+                        <div id="entity-card-proposals"></div>
+                        <h5 style="margin:16px 0 8px">遗留概况（只读，不再注入聊天）</h5>
+                        <pre id="entity-profile-current" style="white-space:pre-wrap;line-height:1.6"></pre>
                     </div>
                     <h4 style="margin:16px 0 8px">关联记忆</h4>
                     <div id="entity-memory-list"></div>
@@ -823,6 +809,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=5.0"></script>
+    <script src="/static/js/dashboard.js?v=6.0"></script>
 </body>
 </html>

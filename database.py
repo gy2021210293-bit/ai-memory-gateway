@@ -491,6 +491,58 @@ async def init_tables():
             END $$;
         """)
 
+        # ---- 轻量实体卡：人工说明 + 状态快照演化 ----
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entities' AND column_name = 'entity_card_json'
+                ) THEN
+                    ALTER TABLE entities ADD COLUMN entity_card_json JSONB DEFAULT NULL;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entities' AND column_name = 'entity_card_updated_at'
+                ) THEN
+                    ALTER TABLE entities ADD COLUMN entity_card_updated_at TIMESTAMPTZ DEFAULT NULL;
+                END IF;
+            END $$;
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS entity_card_proposals (
+                id                  SERIAL PRIMARY KEY,
+                entity_id           INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                state               TEXT NOT NULL,
+                fact_date           DATE DEFAULT NULL,
+                evidence_memory_id  INTEGER DEFAULT NULL,
+                evidence_message_id INTEGER DEFAULT NULL,
+                source_role         TEXT DEFAULT NULL,
+                reason              TEXT DEFAULT '',
+                status              TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK (status IN ('pending', 'accepted', 'rejected')),
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                decided_at          TIMESTAMPTZ DEFAULT NULL
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entity_card_proposals_entity
+            ON entity_card_proposals (entity_id, status);
+        """)
+        # 记忆证据链：新保存的记忆回链到原始对话消息；碎片合并成事件时继承该链。
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_evidence (
+                memory_id       INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                role            TEXT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (memory_id, conversation_id)
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_evidence_conversation
+            ON memory_evidence (conversation_id);
+        """)
+
         # ---- 三元一场认知模型：用户 / AI 自我 / 双方关系 / 当前认知场 ----
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS cognitive_items (
@@ -1154,7 +1206,7 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
         WITH matched AS (
             SELECT m.id, m.content, m.importance, m.created_at, m.layer, m.title,
                    e.id AS entity_id, e.name AS entity_name, e.normalized_name,
-                   e.entity_type, e.description, e.profile_json,
+                   e.entity_type, e.description, e.profile_json, e.entity_card_json,
                    e.evidence_count, e.status_override, me.confidence,
                    COALESCE(array_agg(DISTINCT ea.alias)
                        FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
@@ -1234,8 +1286,10 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
             "id": row["entity_id"], "name": row["entity_name"], "type": row["entity_type"],
             "description": row["description"] or "", "aliases": list(row["aliases"] or []),
             "profile": row["profile_json"], "profile_json": row["profile_json"],
+            "entity_card_json": row.get("entity_card_json"),
             "evidence_count": row.get("evidence_count", 0),
             "status_override": row.get("status_override"),
+            "exact_name_match": bool(exact),
         })
         item = candidates.setdefault(row["id"], {
             "content": row["content"], "importance": row["importance"],
@@ -1255,7 +1309,7 @@ async def _attach_entity_context(conn, results: list):
     ids = [int(result["id"]) for result in results]
     rows = await conn.fetch("""
         SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description, e.profile_json,
-               e.evidence_count, e.status_override,
+               e.entity_card_json, e.evidence_count, e.status_override,
                COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
         FROM memory_entities me
         JOIN entities e ON e.id = me.entity_id
@@ -1271,6 +1325,7 @@ async def _attach_entity_context(conn, results: list):
             "description": row["description"] or "", "aliases": list(row["aliases"] or []),
             "profile": row["profile_json"],
             "profile_json": row["profile_json"],
+            "entity_card_json": row.get("entity_card_json"),
             "evidence_count": row["evidence_count"],
             "status_override": row["status_override"],
             "confidence": row["confidence"],
@@ -2441,7 +2496,14 @@ async def create_event_memory(title: str, content: str, importance: int,
                 ON CONFLICT (memory_id, entity_id) DO UPDATE SET
                     confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence)
             """, new_id, merged_from)
-        
+            # 事件由碎片合并而来：继承碎片证据链（回链到原始对话消息）
+            await conn.execute("""
+                INSERT INTO memory_evidence (memory_id, conversation_id, role)
+                SELECT $1, conversation_id, role
+                FROM memory_evidence WHERE memory_id = ANY($2::int[])
+                ON CONFLICT (memory_id, conversation_id) DO NOTHING
+            """, new_id, merged_from)
+
         # 向量搜索：计算并保存 embedding
         if MEMORY_VECTOR_ENABLED and new_id:
             try:
@@ -2450,7 +2512,7 @@ async def create_event_memory(title: str, content: str, importance: int,
                     await save_memory_embedding(conn, new_id, embedding)
             except Exception as e:
                 print(f"⚠️ 事件记忆embedding计算失败（id={new_id}）: {e}")
-        
+
         return new_id
 
 
@@ -2515,7 +2577,14 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
                 ON CONFLICT (memory_id, entity_id) DO UPDATE SET
                     confidence = GREATEST(memory_entities.confidence, EXCLUDED.confidence)
             """, new_id, memory_ids)
-        
+            # 合并事件继承碎片证据链（回链到原始对话消息）
+            await conn.execute("""
+                INSERT INTO memory_evidence (memory_id, conversation_id, role)
+                SELECT $1, conversation_id, role
+                FROM memory_evidence WHERE memory_id = ANY($2::int[])
+                ON CONFLICT (memory_id, conversation_id) DO NOTHING
+            """, new_id, memory_ids)
+
         # 向量搜索：计算并保存 embedding
         if MEMORY_VECTOR_ENABLED and new_id:
             try:
@@ -3135,6 +3204,7 @@ async def list_entities():
         rows = await conn.fetch("""
             SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
+                   e.entity_card_json, e.entity_card_updated_at,
                    e.evidence_count, e.status_override, e.created_at, e.updated_at,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
@@ -3290,6 +3360,7 @@ async def get_entity_detail(entity_id: int):
         row = await conn.fetchrow("""
             SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
+                   e.entity_card_json, e.entity_card_updated_at,
                    e.evidence_count, e.status_override,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e
@@ -3412,6 +3483,277 @@ async def save_entity_profile(entity_id: int, profile: dict, evidence_ids: list,
     return {"status": "ok", "entity_id": entity_id}
 
 
+# ============================================================
+# 轻量实体卡：人工说明 + 状态快照演化
+# ============================================================
+
+ENTITY_CARD_SNAPSHOT_CAP = 6
+ENTITY_CARD_STATE_LIMIT = 200
+
+
+def _parse_entity_card(card_json) -> dict:
+    """Parse an entity card payload into {'description', 'snapshots'}.
+
+    Never raises: malformed or missing JSON becomes an empty card. Snapshots are
+    re-sorted and capped so the card is always a consistent projection.
+    """
+    card = {"description": "", "snapshots": []}
+    if isinstance(card_json, str):
+        try:
+            card_json = json.loads(card_json)
+        except (json.JSONDecodeError, TypeError):
+            card_json = None
+    if not isinstance(card_json, dict):
+        return card
+    card["description"] = str(card_json.get("description") or "").strip()
+    raw_snapshots = card_json.get("snapshots")
+    if isinstance(raw_snapshots, list):
+        snapshots = []
+        for raw in raw_snapshots:
+            if not isinstance(raw, dict):
+                continue
+            snapshots.append({
+                "fact_date": str(raw.get("fact_date") or "").strip(),
+                "recorded_at": str(raw.get("recorded_at") or "").strip(),
+                "state": re.sub(r"\s+", " ", str(raw.get("state") or "")).strip(),
+                "evidence_memory_id": raw.get("evidence_memory_id"),
+                "evidence_message_id": raw.get("evidence_message_id"),
+                "source": str(raw.get("source") or "direct").strip(),
+            })
+        card["snapshots"] = _sort_and_cap_snapshots(snapshots)
+    return card
+
+
+def _sort_and_cap_snapshots(snapshots: list, cap: int = ENTITY_CARD_SNAPSHOT_CAP) -> list:
+    """Sort snapshots by (fact_date, recorded_at) ascending and keep the newest `cap`.
+
+    The final element is therefore always the current/last-known state. This is a
+    pure helper: no DB access, no current_state field is ever materialized.
+    """
+    ordered = sorted(
+        (item for item in snapshots if isinstance(item, dict) and item.get("state")),
+        key=lambda item: (
+            str(item.get("fact_date") or ""),
+            str(item.get("recorded_at") or ""),
+        ),
+    )
+    if cap and cap > 0 and len(ordered) > cap:
+        return ordered[-cap:]
+    return ordered
+
+
+def _snapshot_conflicts_with_tail(snapshots: list, state: str, fact_date: str) -> bool:
+    """True when a snapshot sharing the tail's fact_date has a different state.
+
+    Backdated inserts (older than the tail) never replace the newer node; only a
+    same-date-as-tail override is treated as a conflict for the auto-accept path.
+    """
+    ordered = _sort_and_cap_snapshots(snapshots)
+    if not ordered:
+        return False
+    tail = ordered[-1]
+    tail_date = str(tail.get("fact_date") or "")
+    if not fact_date or tail_date != fact_date:
+        return False
+    return str(tail.get("state") or "").strip() != str(state or "").strip()
+
+
+async def get_entity_card(entity_id: int) -> Optional[dict]:
+    """Return the entity card (empty defaults when the card has no content)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT entity_card_json, entity_card_updated_at FROM entities WHERE id = $1",
+            entity_id,
+        )
+    if not row:
+        return None
+    card = _parse_entity_card(row["entity_card_json"])
+    card["updated_at"] = row["entity_card_updated_at"]
+    return card
+
+
+async def apply_entity_snapshot(
+    entity_id: int,
+    state: str,
+    fact_date,
+    evidence_memory_id=None,
+    evidence_message_id=None,
+    source: str = "confirmed",
+    force: bool = False,
+) -> dict:
+    """Append a state snapshot to the entity card, re-sort, and cap to 6.
+
+    `force=True` (human confirmation: manual add or proposal accept) overrides the
+    same-date-as-tail conflict guard; `force=False` (Harness auto-accept) escalates
+    such conflicts to the caller so it can create a pending proposal.
+
+    Returns {"status": "ok" | "duplicate" | "conflict" | "not_found" | "error"}.
+    """
+    state = re.sub(r"\s+", " ", str(state or "")).strip()
+    if not state:
+        return {"status": "error", "error": "快照状态不能为空"}
+    if not state[:ENTITY_CARD_STATE_LIMIT]:
+        return {"status": "error", "error": "快照状态无效"}
+    state = state[:ENTITY_CARD_STATE_LIMIT]
+    fact_date = str(fact_date or "").strip()
+    if not fact_date:
+        return {"status": "error", "error": "快照日期不能为空"}
+    recorded_at = datetime.now(dt_timezone.utc).isoformat()
+    new_snapshot = {
+        "fact_date": fact_date,
+        "recorded_at": recorded_at,
+        "state": state,
+        "evidence_memory_id": evidence_memory_id,
+        "evidence_message_id": evidence_message_id,
+        "source": source if source in ("direct", "confirmed") else "confirmed",
+    }
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT entity_card_json FROM entities WHERE id = $1", entity_id,
+        )
+        if not row:
+            return {"status": "not_found"}
+        card = _parse_entity_card(row["entity_card_json"])
+        for existing in card["snapshots"]:
+            if (str(existing.get("fact_date") or "") == fact_date
+                    and str(existing.get("state") or "") == state):
+                return {"status": "duplicate"}
+        if not force and _snapshot_conflicts_with_tail(card["snapshots"], state, fact_date):
+            return {"status": "conflict"}
+        card["snapshots"].append(new_snapshot)
+        card["snapshots"] = _sort_and_cap_snapshots(card["snapshots"])
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok"}
+
+
+async def update_entity_card_description(entity_id: int, description: str) -> dict:
+    """Manually set the entity card's short description (human-only)."""
+    description = re.sub(r"\s+", " ", str(description or "")).strip()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT entity_card_json FROM entities WHERE id = $1", entity_id,
+        )
+        if not row:
+            return {"error": "实体不存在"}
+        card = _parse_entity_card(row["entity_card_json"])
+        card["description"] = description
+        await conn.execute("""
+            UPDATE entities SET entity_card_json = $2::jsonb,
+                   entity_card_updated_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+        """, entity_id, json.dumps(card, ensure_ascii=False))
+    return {"status": "ok", "description": description}
+
+
+async def create_entity_card_proposal(
+    entity_id: int,
+    state: str,
+    fact_date=None,
+    evidence_memory_id=None,
+    evidence_message_id=None,
+    source_role=None,
+    reason: str = "",
+) -> dict:
+    """Record a model-inferred or not-verbatim-provable snapshot as a pending proposal."""
+    state = re.sub(r"\s+", " ", str(state or "")).strip()
+    if not state:
+        return {"error": "提案快照不能为空"}
+    fact_date = str(fact_date or "").strip() or None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM entities WHERE id = $1", entity_id)
+        if not row:
+            return {"error": "实体不存在"}
+        await conn.execute("""
+            INSERT INTO entity_card_proposals
+                (entity_id, state, fact_date, evidence_memory_id, evidence_message_id, source_role, reason)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """, entity_id, state[:ENTITY_CARD_STATE_LIMIT], fact_date,
+            evidence_memory_id, evidence_message_id, source_role, str(reason or ""))
+    return {"status": "ok"}
+
+
+async def list_entity_card_proposals(entity_id: int) -> List[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, state, fact_date, evidence_memory_id, evidence_message_id,
+                   source_role, reason, status, created_at, decided_at
+            FROM entity_card_proposals
+            WHERE entity_id = $1
+            ORDER BY (status = 'pending') DESC, created_at DESC
+        """, entity_id)
+        return [dict(row) for row in rows]
+
+
+async def accept_entity_card_proposal(proposal_id: int) -> dict:
+    """Accept a proposal: re-validate evidence, apply the snapshot as confirmed."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT id, entity_id, state, fact_date, evidence_memory_id,
+                       evidence_message_id, status
+                FROM entity_card_proposals WHERE id = $1 FOR UPDATE
+            """, proposal_id)
+            if not row:
+                return {"error": "提案不存在"}
+            if row["status"] != "pending":
+                return {"error": "提案已处理"}
+            if row["evidence_memory_id"]:
+                valid = await conn.fetchrow(
+                    "SELECT 1 FROM memory_entities WHERE entity_id = $1 AND memory_id = $2",
+                    row["entity_id"], row["evidence_memory_id"],
+                )
+                if not valid:
+                    return {"error": "提案证据记忆不属于该实体"}
+            result = await apply_entity_snapshot(
+                row["entity_id"], row["state"], row["fact_date"],
+                row["evidence_memory_id"], row["evidence_message_id"],
+                source="confirmed", force=True,
+            )
+            if result.get("status") in ("not_found", "error"):
+                return {"error": result.get("error", "实体不存在")}
+            await conn.execute(
+                "UPDATE entity_card_proposals SET status = 'accepted', decided_at = NOW() WHERE id = $1",
+                proposal_id,
+            )
+    return {"status": "ok", "proposal_id": proposal_id}
+
+
+async def reject_entity_card_proposal(proposal_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE entity_card_proposals SET status = 'rejected', decided_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+        """, proposal_id)
+    if result == "UPDATE 0":
+        return {"error": "提案不存在或已处理"}
+    return {"status": "ok", "proposal_id": proposal_id}
+
+
+async def record_memory_evidence(memory_id: int, conversation_ids: list, role: str = "user"):
+    """Link a saved memory back to its source conversation message ids."""
+    ids = [int(cid) for cid in (conversation_ids or []) if cid]
+    if not ids or not memory_id:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """INSERT INTO memory_evidence (memory_id, conversation_id, role)
+               VALUES ($1, $2, $3) ON CONFLICT (memory_id, conversation_id) DO NOTHING""",
+            [(memory_id, cid, role) for cid in ids],
+        )
+
+
 async def get_entity_memories(entity_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -3507,6 +3849,37 @@ async def merge_entities(source_id: int, target_id: int):
                 INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
                 VALUES ($1, $2, $3) ON CONFLICT (normalized_alias) DO NOTHING
             """, target_id, source["name"], source["normalized_name"])
+            # 合并实体卡：合并快照（按事实日期去重/重排/封顶），并把源实体待确认提案移交给目标实体
+            source_card = await conn.fetchval(
+                "SELECT entity_card_json FROM entities WHERE id = $1", source_id,
+            )
+            target_card = await conn.fetchval(
+                "SELECT entity_card_json FROM entities WHERE id = $1", target_id,
+            )
+            source_card = _parse_entity_card(source_card)
+            target_card = _parse_entity_card(target_card)
+            combined_description = target_card["description"] or source_card["description"]
+            seen_keys = set()
+            merged_snapshots = []
+            for snapshot in target_card["snapshots"] + source_card["snapshots"]:
+                key = (str(snapshot.get("fact_date") or ""), str(snapshot.get("state") or ""))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged_snapshots.append(snapshot)
+            merged_snapshots = _sort_and_cap_snapshots(merged_snapshots)
+            await conn.execute("""
+                UPDATE entities SET entity_card_json = $2::jsonb,
+                       entity_card_updated_at = NOW(), updated_at = NOW()
+                WHERE id = $1
+            """, target_id, json.dumps(
+                {"description": combined_description, "snapshots": merged_snapshots},
+                ensure_ascii=False,
+            ))
+            await conn.execute("""
+                UPDATE entity_card_proposals SET entity_id = $2
+                WHERE entity_id = $1 AND status = 'pending'
+            """, source_id, target_id)
             await conn.execute("DELETE FROM entities WHERE id = $1", source_id)
     return {"status": "ok", "source_id": source_id, "target_id": target_id}
 

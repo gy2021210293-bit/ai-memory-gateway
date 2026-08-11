@@ -31,16 +31,27 @@ class EntityLifecycleFrontendTests(unittest.TestCase):
     def test_prompt_overview_excludes_candidate_entities(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        function = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_format_matched_entity_overview"
-        )
+        wanted = {
+            "_format_matched_entity_overview",
+            "_classify_entity_query",
+            "ENTITY_SPECIFIC_QUERY_KEYWORDS",
+            "ENTITY_HISTORY_QUERY_KEYWORDS",
+        }
+        nodes = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                nodes.append(node)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in wanted:
+                        nodes.append(node)
         namespace = {"json": json}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), namespace)
         rendered = namespace["_format_matched_entity_overview"]([{
             "matched_entities": [
                 {"id": 1, "name": "Candidate", "type": "person", "retrieval_status": "candidate"},
-                {"id": 2, "name": "Active", "type": "person", "retrieval_status": "active"},
+                {"id": 2, "name": "Active", "type": "person", "retrieval_status": "active",
+                 "entity_card_json": None, "description": "", "aliases": [], "exact_name_match": True},
             ]
         }])
         self.assertNotIn("Candidate", rendered)
