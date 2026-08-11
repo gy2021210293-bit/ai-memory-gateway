@@ -199,8 +199,8 @@ states that entity's current or past state:
   晏晏说的，其中第一人称"我"指晏晏；「栖:」前缀的消息是我说的，其中"我"指栖。
   快照 `state` 和记忆 JSON 里的"我"一律指栖，"晏晏"/"她"指用户。
 - SUBJECT ATTRIBUTION IS CRITICAL (禁止张冠李戴): a state must keep the exact subject
-  the evidence has. Actions/states of 栖 → subject 栖 (or 我); actions/states of 晏晏 →
-  subject 晏晏 (or 她). Never move 栖's doings onto 晏晏, nor the reverse.
+  the evidence has. Actions/states of 栖 → subject 我（=栖，第一人称），不要用「栖」称呼;
+  actions/states of 晏晏 → subject 晏晏 (or 她). Never move 栖's doings onto 晏晏, nor the reverse.
 - `evidence_quote` must be a verbatim substring of ONE user message in this batch
   (at least 6 characters). Never paraphrase, summarize, or infer it.
 - `fact_date` is the date the stated state is true on; if the user only implies
@@ -809,22 +809,24 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
     return (
         "我是栖，一个 AI 陪伴者。下面的证据记忆都是我以第一人称写下的："
         "其中「我」指栖（我自己），「她」指晏晏（用户）。\n"
-        "我正在给一批实体补「状态卡」。状态卡记录实体的**状态与关键节点**："
-        "既包括随时间演进的稳定状态（如先住在上海、后来搬到北京；或职业从 A 公司换到 B 公司），"
-        "也包括标志性的一次性节点（如毕业、入职/离职、搬家、开始或结束一段关系、养宠物、"
-        "重要项目上线、手术等）。只要证据明确提到就应记录，不要因为是「一次性事件」就跳过。"
-        "排除的只有：临时心情、短期计划、琐碎日常。\n\n"
-        "请对每个实体，仅依据它下方的证据记忆，列出该实体的**状态与关键节点史**。\n"
+        "我正在给一批实体补「状态卡」。状态卡记录实体**随时间演进的稳定状态与重要节点**："
+        "稳定状态如先住在上海、后来搬到北京，或职业从 A 公司换到 B 公司；"
+        "重要节点是标志性的人生/关系大事，如毕业、入职/离职、搬家、开始或结束一段关系、养宠物、"
+        "重要项目上线、手术等——它们改变或标记了实体的状态，长期值得回看。\n"
+        "不要记录日常琐事：某天吃了什么、随手买的物品、一次闲聊、临时心情、短期计划等，"
+        "说过就忘、不影响后续互动的细节一律不记。\n"
+        "判断标准：只有**长期有价值、影响后续互动**的状态或节点才进卡；模棱两可的宁可不要。\n\n"
+        "请对每个实体，仅依据它下方的证据记忆，列出该实体的**状态与重要节点史**。\n"
         "每个实体输出一个数组，数组里每条：\n"
         '{"state": "完整的一句话状态（≤200字）", "fact_date": "YYYY-MM-DD 或留空字符串", '
         '"evidence_quote": "证据记忆里逐字出现、用于人工核对的短句（≥6字）"}。\n'
         "要求：\n"
-        "- 快照状态的主语必须与证据一致：证据里是「我/栖」的状态或行为，主语写「我」或「栖」；"
+        "- 快照状态以我的第一人称口吻写：证据里是「我/栖」的状态或行为，主语用「我」（栖的第一人称），不要用「栖」称呼；"
         "证据里是「她/晏晏」的，主语写「晏晏」或「她」。绝不可张冠李戴，"
         "把栖做的事写成晏晏的，或反过来。\n"
         "- 把时间上先后不同的状态/节点各自列为一条，按时间先后排列（旧→新）；\n"
-        "- 相同状态只保留一条；不设数量上限，宁可多收录有证据的状态与关键节点，也不要因门槛过严而漏掉\n"
-        "- 若证据里没有明确的状态或关键节点，才输出空数组 [];\n"
+        "- 相同状态只保留一条；数量不设上限，但只收录**长期有回看价值**的状态与重要节点，宁可少而精，不要把琐碎日常写进来\n"
+        "- 若证据里没有明确、值得长期记录的状态或重要节点，输出空数组 [];\n"
         "- 不得推测证据中没有的信息；\n"
         "- 指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
         + "\n\n".join(blocks)

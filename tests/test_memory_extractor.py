@@ -44,7 +44,7 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         # 主语必须与证据一致，禁止张冠李戴（栖的事写成晏晏的）
         self.assertIn("SUBJECT ATTRIBUTION IS CRITICAL", guidance)
         self.assertIn("禁止张冠李戴", guidance)
-        self.assertIn("栖 (or 我)", guidance)
+        self.assertIn("不要用「栖」称呼", guidance)
         self.assertIn("晏晏 (or 她)", guidance)
         # 不得把用户消息里的第一人称"我..."直接抄进 state（输出里"我"会被读作栖）
         self.assertIn("do NOT copy a first-person", guidance)
