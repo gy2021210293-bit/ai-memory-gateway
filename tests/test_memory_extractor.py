@@ -35,6 +35,25 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"mood":', prompt)
         self.assertNotIn('"topics":', prompt)
 
+    def test_entity_snapshot_guidance_pins_subject_identity(self):
+        guidance = memory_extractor.ENTITY_OUTPUT_GUIDANCE
+        # 栖 = AI/第一人称；晏晏 = 用户
+        self.assertIn("WHO IS WHO: 我是栖", guidance)
+        self.assertIn("「用户:」前缀的消息是", guidance)
+        self.assertIn("快照 `state` 和记忆 JSON 里的\"我\"一律指栖", guidance)
+        # 主语必须与证据一致，禁止张冠李戴（栖的事写成晏晏的）
+        self.assertIn("SUBJECT ATTRIBUTION IS CRITICAL", guidance)
+        self.assertIn("禁止张冠李戴", guidance)
+        self.assertIn("栖 (or 我)", guidance)
+        self.assertIn("晏晏 (or 她)", guidance)
+        # 不得把用户消息里的第一人称"我..."直接抄进 state（输出里"我"会被读作栖）
+        self.assertIn("do NOT copy a first-person", guidance)
+        self.assertIn('"我" would mean 栖', guidance)
+        # 快照不只是一次性事件也收录关键节点，门槛不能过严
+        self.assertIn("landmark milestone", guidance)
+        self.assertIn("毕业、入职、搬家", guidance)
+        self.assertIn("do not skip a milestone", guidance)
+
     def test_tool_call_response_defers_extraction_until_final_answer(self):
         tool_calls = [{
             "id": "call_1",

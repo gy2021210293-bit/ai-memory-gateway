@@ -94,15 +94,16 @@ class EntityCardTests(unittest.TestCase):
         card2 = database._parse_entity_card(payload)
         self.assertEqual(card2["snapshots"][-1]["state"], "B")
 
-    def test_sort_and_cap_snapshots_keeps_newest_six(self):
+    def test_sort_snapshots_preserves_full_history(self):
         snapshots = [
             {"fact_date": f"2026-01-{day:02d}", "recorded_at": "", "state": f"state-{day}", "source": "direct"}
             for day in range(1, 9)
         ]
-        ordered = database._sort_and_cap_snapshots(snapshots)
-        self.assertEqual(len(ordered), 6)
+        ordered = database._sort_snapshots(snapshots)
+        # 不设数量上限：全部保留，按日期升序，最后一条永远是最新状态
+        self.assertEqual(len(ordered), 8)
         self.assertEqual(ordered[-1]["state"], "state-8")
-        self.assertEqual(ordered[0]["state"], "state-3")
+        self.assertEqual(ordered[0]["state"], "state-1")
 
     def test_snapshot_conflicts_only_with_tail_same_date(self):
         snapshots = [

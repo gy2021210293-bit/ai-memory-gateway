@@ -3556,7 +3556,6 @@ async def save_entity_profile(entity_id: int, profile: dict, evidence_ids: list,
 # 轻量实体卡：人工说明 + 状态快照演化
 # ============================================================
 
-ENTITY_CARD_SNAPSHOT_CAP = 6
 ENTITY_CARD_STATE_LIMIT = 200
 
 
@@ -3564,7 +3563,8 @@ def _parse_entity_card(card_json) -> dict:
     """Parse an entity card payload into {'description', 'snapshots'}.
 
     Never raises: malformed or missing JSON becomes an empty card. Snapshots are
-    re-sorted and capped so the card is always a consistent projection.
+    re-sorted (not capped) so the card preserves the full evolution history; the
+    newest snapshot is always last.
     """
     card = {"description": "", "snapshots": []}
     if isinstance(card_json, str):
@@ -3589,7 +3589,7 @@ def _parse_entity_card(card_json) -> dict:
                 "evidence_message_id": raw.get("evidence_message_id"),
                 "source": str(raw.get("source") or "direct").strip(),
             })
-        card["snapshots"] = _sort_and_cap_snapshots(snapshots)
+        card["snapshots"] = _sort_snapshots(snapshots)
     return card
 
 
@@ -3605,22 +3605,20 @@ def _entity_card_summary(card_json) -> tuple:
     return True, snapshots[-1].get("fact_date") or None
 
 
-def _sort_and_cap_snapshots(snapshots: list, cap: int = ENTITY_CARD_SNAPSHOT_CAP) -> list:
-    """Sort snapshots by (fact_date, recorded_at) ascending and keep the newest `cap`.
+def _sort_snapshots(snapshots: list) -> list:
+    """Sort snapshots by (fact_date, recorded_at) ascending.
 
-    The final element is therefore always the current/last-known state. This is a
-    pure helper: no DB access, no current_state field is ever materialized.
+    The final element is therefore always the current/last-known state. Snapshots
+    are never capped: the card keeps the full evolution history. This is a pure
+    helper: no DB access, no current_state field is ever materialized.
     """
-    ordered = sorted(
+    return sorted(
         (item for item in snapshots if isinstance(item, dict) and item.get("state")),
         key=lambda item: (
             str(item.get("fact_date") or ""),
             str(item.get("recorded_at") or ""),
         ),
     )
-    if cap and cap > 0 and len(ordered) > cap:
-        return ordered[-cap:]
-    return ordered
 
 
 def _snapshot_conflicts_with_tail(snapshots: list, state: str, fact_date: str) -> bool:
@@ -3629,7 +3627,7 @@ def _snapshot_conflicts_with_tail(snapshots: list, state: str, fact_date: str) -
     Backdated inserts (older than the tail) never replace the newer node; only a
     same-date-as-tail override is treated as a conflict for the auto-accept path.
     """
-    ordered = _sort_and_cap_snapshots(snapshots)
+    ordered = _sort_snapshots(snapshots)
     if not ordered:
         return False
     tail = ordered[-1]
@@ -3663,7 +3661,7 @@ async def apply_entity_snapshot(
     source: str = "confirmed",
     force: bool = False,
 ) -> dict:
-    """Append a state snapshot to the entity card, re-sort, and cap to 6.
+    """Append a state snapshot to the entity card and re-sort (never capped).
 
     `force=True` (human confirmation: manual add or proposal accept) overrides the
     same-date-as-tail conflict guard; `force=False` (Harness auto-accept) escalates
@@ -3704,7 +3702,7 @@ async def apply_entity_snapshot(
         if not force and _snapshot_conflicts_with_tail(card["snapshots"], state, fact_date):
             return {"status": "conflict"}
         card["snapshots"].append(new_snapshot)
-        card["snapshots"] = _sort_and_cap_snapshots(card["snapshots"])
+        card["snapshots"] = _sort_snapshots(card["snapshots"])
         await conn.execute("""
             UPDATE entities SET entity_card_json = $2::jsonb,
                    entity_card_updated_at = NOW(), updated_at = NOW()
@@ -3761,7 +3759,7 @@ async def update_entity_card_snapshot(entity_id: int, recorded_at: str, state: s
             return {"error": "未找到该快照"}
         target["state"] = state
         target["fact_date"] = fact_date_str
-        card["snapshots"] = _sort_and_cap_snapshots(card["snapshots"])
+        card["snapshots"] = _sort_snapshots(card["snapshots"])
         await conn.execute("""
             UPDATE entities SET entity_card_json = $2::jsonb,
                    entity_card_updated_at = NOW(), updated_at = NOW()
@@ -3787,7 +3785,7 @@ async def delete_entity_card_snapshot(entity_id: int, recorded_at: str) -> dict:
         ]
         if len(card["snapshots"]) == before:
             return {"error": "未找到该快照"}
-        card["snapshots"] = _sort_and_cap_snapshots(card["snapshots"])
+        card["snapshots"] = _sort_snapshots(card["snapshots"])
         await conn.execute("""
             UPDATE entities SET entity_card_json = $2::jsonb,
                    entity_card_updated_at = NOW(), updated_at = NOW()
@@ -4027,7 +4025,7 @@ async def merge_entities(source_id: int, target_id: int):
                     continue
                 seen_keys.add(key)
                 merged_snapshots.append(snapshot)
-            merged_snapshots = _sort_and_cap_snapshots(merged_snapshots)
+            merged_snapshots = _sort_snapshots(merged_snapshots)
             await conn.execute("""
                 UPDATE entities SET entity_card_json = $2::jsonb,
                        entity_card_updated_at = NOW(), updated_at = NOW()

@@ -196,6 +196,36 @@ class EntityCardHarnessTests(unittest.TestCase):
         self.assertNotIn("长" * 300, prompt)  # 超长记忆被截断
         self.assertIn('"226": []', prompt)  # 新格式示例：无稳定状态输出空数组
 
+    def test_build_snapshot_backfill_prompt_pins_subject_identity(self):
+        entities = [{
+            "id": 9, "name": "上海", "entity_type": "place",
+            "aliases": [], "memories": [{"id": 1, "content": "我搬到上海了"}],
+        }]
+        prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
+        # 证据记忆是栖的第一人称："我"=栖，"她"=晏晏
+        self.assertIn("「我」指栖（我自己），「她」指晏晏（用户）", prompt)
+        # 主语必须与证据一致，栖的事不能写成晏晏的
+        self.assertIn("证据里是「我/栖」的状态或行为，主语写「我」或「栖」", prompt)
+        self.assertIn("证据里是「她/晏晏」的，主语写「晏晏」或「她」", prompt)
+        self.assertIn("绝不可张冠李戴", prompt)
+        # 指代用户时仍必须用晏晏/她，禁止"用户"
+        self.assertIn("禁止出现「用户」「user」字样", prompt)
+
+    def test_build_snapshot_backfill_prompt_includes_milestones(self):
+        entities = [{
+            "id": 9, "name": "小明", "entity_type": "person",
+            "aliases": [], "memories": [{"id": 1, "content": "小明毕业了"}],
+        }]
+        prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
+        # 门槛放宽：一次性但标志性的节点（毕业、入职、搬家等）也要收录，不再跳过
+        self.assertIn("状态与关键节点", prompt)
+        self.assertIn("毕业、入职/离职、搬家", prompt)
+        self.assertIn("不要因为是「一次性事件」就跳过", prompt)
+        self.assertIn("宁可多收录有证据的状态与关键节点，也不要因门槛过严而漏掉", prompt)
+        self.assertNotIn("最多 6 条", prompt)  # 数量不再设上限
+        # 仍排除噪音：临时心情/短期计划/琐碎日常
+        self.assertIn("临时心情、短期计划、琐碎日常", prompt)
+
 
 class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_proposal_inserts(self):

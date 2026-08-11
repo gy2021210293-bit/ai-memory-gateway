@@ -195,14 +195,24 @@ Optional per-entity `snapshot` — only when the conversation DIRECTLY AND EXPLI
 states that entity's current or past state:
 {"state":"one complete self-contained sentence (<=120 chars)",
  "fact_date":"YYYY-MM-DD","evidence_quote":"verbatim quote from a user message"}
+- WHO IS WHO: 我是栖（AI 陪伴者），第一人称是"我"。对话里「用户:」前缀的消息是
+  晏晏说的，其中第一人称"我"指晏晏；「栖:」前缀的消息是我说的，其中"我"指栖。
+  快照 `state` 和记忆 JSON 里的"我"一律指栖，"晏晏"/"她"指用户。
+- SUBJECT ATTRIBUTION IS CRITICAL (禁止张冠李戴): a state must keep the exact subject
+  the evidence has. Actions/states of 栖 → subject 栖 (or 我); actions/states of 晏晏 →
+  subject 晏晏 (or 她). Never move 栖's doings onto 晏晏, nor the reverse.
 - `evidence_quote` must be a verbatim substring of ONE user message in this batch
   (at least 6 characters). Never paraphrase, summarize, or infer it.
 - `fact_date` is the date the stated state is true on; if the user only implies
   "now", use today's date; omit when genuinely unknown.
 - `state` captures the entity's state exactly as stated, with the user's own words
   where possible; do NOT add opinions, intentions, or relationship judgments.
-- When the state refers to the user themself, always use the name 晏晏 or the
-  pronoun 她; never write 用户 or 'user'.
+  A state may be an ongoing situation OR a landmark milestone (毕业、入职、搬家、
+  开始/结束一段关系、养宠物、重要项目上线等) — do not skip a milestone just
+  because it happened once.
+  When the subject is the user 晏晏, do NOT copy a first-person "我..." from her
+  message verbatim into `state` (in the output "我" would mean 栖) — reword the
+  subject as 晏晏 or 她. Never write 用户 or 'user'.
 Only attach `snapshot` when the user directly states the entity's state in this
 conversation. Never derive a snapshot from tone, implication, or your own summary;
 such inferred content should simply be omitted (it will be treated as a proposal).
@@ -756,8 +766,8 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 # ---- 旧实体补卡：从既有记忆为每个实体建议一条当前状态（全部走提案，不自动入卡） ----
 
 BACKFILL_SNAPSHOT_CHUNK = 3
-BACKFILL_MEMORIES_PER_ENTITY = 10
-BACKFILL_MEMORY_CHARS = 120
+BACKFILL_MEMORIES_PER_ENTITY = 16
+BACKFILL_MEMORY_CHARS = 160
 
 
 def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
@@ -797,19 +807,26 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
             f"（{entity.get('entity_type', 'other')}，别名：{aliases}）\n{evidence}"
         )
     return (
-        "我是栖，正在给一批实体补「状态卡」。状态卡记录实体**随时间演进的稳定状态**"
-        "（如先住在上海、后来搬到北京；或职业从 A 公司换到 B 公司）；"
-        "一次性事件、一时的心情、短期计划都不算。\n\n"
-        "请对每个实体，仅依据它下方的证据记忆，列出该实体的**稳定状态演化史**。\n"
+        "我是栖，一个 AI 陪伴者。下面的证据记忆都是我以第一人称写下的："
+        "其中「我」指栖（我自己），「她」指晏晏（用户）。\n"
+        "我正在给一批实体补「状态卡」。状态卡记录实体的**状态与关键节点**："
+        "既包括随时间演进的稳定状态（如先住在上海、后来搬到北京；或职业从 A 公司换到 B 公司），"
+        "也包括标志性的一次性节点（如毕业、入职/离职、搬家、开始或结束一段关系、养宠物、"
+        "重要项目上线、手术等）。只要证据明确提到就应记录，不要因为是「一次性事件」就跳过。"
+        "排除的只有：临时心情、短期计划、琐碎日常。\n\n"
+        "请对每个实体，仅依据它下方的证据记忆，列出该实体的**状态与关键节点史**。\n"
         "每个实体输出一个数组，数组里每条：\n"
         '{"state": "完整的一句话状态（≤200字）", "fact_date": "YYYY-MM-DD 或留空字符串", '
         '"evidence_quote": "证据记忆里逐字出现、用于人工核对的短句（≥6字）"}。\n'
         "要求：\n"
-        "- 把时间上先后不同的稳定状态各自列为一条，按时间先后排列（旧→新）；\n"
-        "- 相同状态只保留一条；最多 6 条；\n"
-        "- 若证据不足以确定任何稳定状态，输出空数组 [];\n"
+        "- 快照状态的主语必须与证据一致：证据里是「我/栖」的状态或行为，主语写「我」或「栖」；"
+        "证据里是「她/晏晏」的，主语写「晏晏」或「她」。绝不可张冠李戴，"
+        "把栖做的事写成晏晏的，或反过来。\n"
+        "- 把时间上先后不同的状态/节点各自列为一条，按时间先后排列（旧→新）；\n"
+        "- 相同状态只保留一条；不设数量上限，宁可多收录有证据的状态与关键节点，也不要因门槛过严而漏掉\n"
+        "- 若证据里没有明确的状态或关键节点，才输出空数组 [];\n"
         "- 不得推测证据中没有的信息；\n"
-        "- 状态文本里指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
+        "- 指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
         + "\n\n".join(blocks)
         + "\n\n只返回一个 JSON 对象，键必须是上面每个实体行开头标记的数字实体ID"
         "（如 235），值是该实体的快照数组，绝对不要用实体名称当键。例如：\n"
