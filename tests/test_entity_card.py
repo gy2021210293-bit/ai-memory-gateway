@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import sys
@@ -142,6 +143,23 @@ class EntityCardTests(unittest.TestCase):
             "snapshots": [{"fact_date": "2026-07-10", "recorded_at": "", "state": "s", "source": "direct"}],
         })
         self.assertNotIn("current_state", card)
+
+    def test_list_entities_without_card_filters_empty_cards(self):
+        calls = []
+
+        async def fake_fetch(sql, *args):
+            calls.append((sql, args))
+            return []
+
+        conn = types.SimpleNamespace(fetch=fake_fetch)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            asyncio.run(database.list_entities_without_card(5))
+        self.assertEqual(len(calls), 1)
+        sql = calls[0][0]
+        self.assertIn("entity_card_json->'snapshots'", sql)
+        self.assertIn("HAVING COUNT(DISTINCT me.memory_id) > 0", sql)
+        self.assertIn("LIMIT $1", sql)
+        self.assertEqual(calls[0][1], (5,))
 
 
 class EntityCardAsyncTests(unittest.IsolatedAsyncioTestCase):

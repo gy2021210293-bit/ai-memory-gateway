@@ -156,6 +156,27 @@ class EntityCardHarnessTests(unittest.TestCase):
             "proposal",
         )
 
+    def test_resolve_evidence_memory_prefers_verbatim_then_newest(self):
+        memories = [{"id": 6, "content": "小明在备考"}, {"id": 7, "content": "我搬到上海了，现在住上海"}]
+        self.assertEqual(memory_extractor._resolve_evidence_memory("我搬到上海了", memories), 7)
+        self.assertEqual(memory_extractor._resolve_evidence_memory("没有这句", memories), 7)
+        self.assertIsNone(memory_extractor._resolve_evidence_memory("", []))
+        self.assertIsNone(memory_extractor._resolve_evidence_memory("引文", []))
+
+    def test_build_snapshot_backfill_prompt_is_bounded(self):
+        long_content = "长" * 300
+        entities = [{
+            "id": 9, "name": "小文", "entity_type": "person",
+            "aliases": ["文文", "小W"],
+            "memories": [{"id": 1, "content": long_content}, {"id": 2, "content": "住在杭州"}],
+        }]
+        prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
+        self.assertIn("实体 9", prompt)
+        self.assertIn("小文（person，别名：文文、小W）", prompt)
+        self.assertIn("[ID=2] 住在杭州", prompt)
+        self.assertNotIn("长" * 300, prompt)  # 超长记忆被截断
+        self.assertIn('"state": null', prompt)
+
 
 class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_proposal_inserts(self):
@@ -223,6 +244,75 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
             result = await database.reject_entity_card_proposal(3)
         self.assertIn("error", result)
+
+
+class _FakeCardResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
+class _FakeCardClient:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self._status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def post(self, *_args, **_kwargs):
+        return _FakeCardResponse(self._payload, status=self._status)
+
+
+SNAPSHOT_BACKFILL_OK = {
+    "choices": [{"message": {"content": (
+        '{"1":{"state":" 住在上海 ","fact_date":"2026-07-20","evidence_quote":"我搬到上海了"},'
+        '"2":{"state":null},'
+        '"3":{"state":"二期进行中","fact_date":"2026-08-01","evidence_quote":"不存在的引文"},'
+        '"999":{"state":"无关","fact_date":"2026-07-01","evidence_quote":"x"}}'
+    )}}]
+}
+
+
+class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_suggest_snapshots_batch_parses_and_resolves_evidence(self):
+        entities = [
+            {"id": 1, "name": "小明", "entity_type": "person", "aliases": ["阿明"], "memories": [
+                {"id": 6, "content": "小明正在准备考试"},
+                {"id": 7, "content": "小明说：我搬到上海了，现在住上海"},
+            ]},
+            {"id": 2, "name": "小猫", "entity_type": "pet", "aliases": [], "memories": []},
+            {"id": 3, "name": "项目A", "entity_type": "project", "aliases": [], "memories": [
+                {"id": 10, "content": "项目A 一期已交付"},
+                {"id": 11, "content": "项目A 二期进行中"},
+            ]},
+        ]
+        with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient(SNAPSHOT_BACKFILL_OK)), \
+             patch("memory_extractor.get_memory_api_key", return_value="key"), \
+             patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
+            results = await memory_extractor.suggest_entity_snapshots_batch(entities)
+        self.assertEqual(results[1]["state"], "住在上海")
+        self.assertEqual(results[1]["fact_date"], "2026-07-20")
+        self.assertEqual(results[1]["evidence_memory_id"], 7)   # 逐字引文命中记忆 7
+        self.assertNotIn(2, results)                              # state: null → 无建议
+        self.assertNotIn(999, results)                            # 批次外实体 → 丢弃
+        self.assertEqual(results[3]["evidence_memory_id"], 11)    # 引文未命中 → 取最新记忆
+
+    async def test_suggest_snapshots_batch_request_failure_returns_none(self):
+        with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient({}, status=500)), \
+             patch("memory_extractor.get_memory_api_key", return_value="key"), \
+             patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
+            results = await memory_extractor.suggest_entity_snapshots_batch(
+                [{"id": 1, "name": "x", "entity_type": "person", "aliases": [], "memories": []}]
+            )
+        self.assertIsNone(results)
 
 
 if __name__ == "__main__":

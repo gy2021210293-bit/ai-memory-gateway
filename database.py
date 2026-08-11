@@ -3224,6 +3224,32 @@ async def list_entities():
         return entities
 
 
+async def list_entities_without_card(limit: int = 20):
+    """Legacy entities with no card snapshots yet, used by the card backfill.
+
+    Only entities that already have at least one linked memory qualify, so the
+    backfill never spends LLM calls on empty seed entities. Card = has at least
+    one snapshot; a NULL card or an empty snapshots array both count as missing.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.name, e.entity_type, e.evidence_count,
+                   COUNT(DISTINCT me.memory_id)::int AS memory_count,
+                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+            FROM entities e
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            LEFT JOIN memory_entities me ON me.entity_id = e.id
+            WHERE e.entity_card_json IS NULL
+               OR COALESCE(jsonb_array_length(e.entity_card_json->'snapshots'), 0) = 0
+            GROUP BY e.id
+            HAVING COUNT(DISTINCT me.memory_id) > 0
+            ORDER BY memory_count DESC, e.name
+            LIMIT $1
+        """, max(1, int(limit)))
+        return [dict(row) for row in rows]
+
+
 async def list_entity_roster(limit: int = 150):
     """Lightweight entity roster for the extraction prompt (no profile payloads).
 

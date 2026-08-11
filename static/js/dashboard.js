@@ -683,6 +683,21 @@ async function backfillEntities() {
     if (response.ok) loadEntities();
 }
 
+async function backfillEntityCards() {
+    const status = document.getElementById('entity-status');
+    if (!confirm('将调用记忆模型，为最多 20 个没有状态卡的旧实体提取「当前状态」建议。\n\n生成的是待确认提案，不会自动进卡——你在下方确认后才写入。是否继续？')) return;
+    status.textContent = '正在补全实体状态卡，请稍候…';
+    const response = await fetch('/api/entities/backfill-cards', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 20 }),
+    });
+    const data = await response.json();
+    status.textContent = data.error || `处理 ${data.processed} 个实体，生成 ${data.proposed} 条待确认提案（跳过 ${data.skipped}，失败 ${data.errors}）。`;
+    if (response.ok) {
+        await loadEntities();
+        if (selectedEntity) await loadEntityCard(selectedEntity.id);
+    }
+}
+
 // ============================================
 // 三元一场认知模型（手动、可审计）
 // ============================================

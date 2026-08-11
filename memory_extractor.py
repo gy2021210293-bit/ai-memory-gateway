@@ -736,6 +736,140 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
         return None
 
 
+# ---- 旧实体补卡：从既有记忆为每个实体建议一条当前状态（全部走提案，不自动入卡） ----
+
+BACKFILL_SNAPSHOT_CHUNK = 10
+BACKFILL_MEMORIES_PER_ENTITY = 8
+BACKFILL_MEMORY_CHARS = 150
+
+
+def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
+    """Map an evidence quote to the memory that contains it (verbatim), else the newest."""
+    if quote:
+        for memory in reversed(memories or []):
+            if quote in str(memory.get("content") or ""):
+                return memory.get("id")
+    if memories:
+        return memories[-1].get("id")
+    return None
+
+
+def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
+    """Build the per-batch prompt: one block per entity with its recent memories."""
+    blocks = []
+    for entity in entities:
+        aliases = "、".join(entity.get("aliases") or []) or "无"
+        memory_lines = []
+        for memory in (entity.get("memories") or [])[-BACKFILL_MEMORIES_PER_ENTITY:]:
+            content = str(memory.get("content") or "").strip()
+            if not content:
+                continue
+            if len(content) > BACKFILL_MEMORY_CHARS:
+                content = content[:BACKFILL_MEMORY_CHARS] + "…"
+            memory_lines.append(f"[ID={memory.get('id')}] {content}")
+        evidence = "\n".join(memory_lines) or "（无证据记忆）"
+        blocks.append(
+            f"### 实体 {entity.get('id')}：{entity.get('name')}"
+            f"（{entity.get('entity_type', 'other')}，别名：{aliases}）\n{evidence}"
+        )
+    return (
+        "我是栖，正在给一批实体补「状态卡」。状态卡只记录实体**当前仍然成立的稳定状态**"
+        "（如住在某地、从事某职业、负责某个项目、处于某个关系阶段）；"
+        "一次性事件、一时的心情、短期计划都不算。\n\n"
+        "请对每个实体，仅依据它下方的证据记忆，判断当前是否存在一个可表述的稳定状态。\n"
+        "为每个实体输出一条：\n"
+        '{"state": "完整的一句话状态（≤200字）", "fact_date": "YYYY-MM-DD 或留空字符串", '
+        '"evidence_quote": "证据记忆里逐字出现、用于人工核对的短句（≥6字）"}。\n'
+        '若证据不足以确定稳定状态，输出 {"state": null}。\n'
+        "不得推测证据中没有的信息。\n\n"
+        + "\n\n".join(blocks)
+        + '\n\n只返回一个 JSON 对象，键为实体ID，例如：\n'
+        '{"1": {"state": "住在上海", "fact_date": "2026-07-20", '
+        '"evidence_quote": "我搬到上海了"}, "2": {"state": null}}'
+    )
+
+
+async def suggest_entity_snapshots_batch(entities: List[Dict]) -> Optional[Dict[int, Dict]]:
+    """One LLM call to propose current-state snapshots for a batch of legacy entities.
+
+    每个实体只生成「待确认提案」，永远不会直接进卡：老数据没有逐字消息回链，
+    一律需要人工在 Dashboard 接受。返回 {entity_id: {"state","fact_date",
+    "evidence_memory_id","evidence_quote"}}（没有稳定状态的实体不出现）；
+    请求或解析失败返回 None，供调用方统计报错。
+    """
+    entities = [entity for entity in entities or [] if entity and entity.get("id")]
+    if not entities or not get_memory_api_key():
+        return {}
+    prompt = _build_snapshot_backfill_prompt(entities)
+    request_messages = [{"role": "user", "content": prompt}]
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
+            )
+            if response.status_code != 200:
+                print(f"⚠️ 实体状态卡补全请求失败: {response.status_code} {response.text[:200]}")
+                return None
+            text = _extract_response_content(response.json()).strip()
+            try:
+                raw = parse_json_object(text)
+            except ValueError as first_error:
+                print(f"⚠️ 实体状态卡补全解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages + [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": "上一次输出没有给出可解析的最终结果。请重新检查证据，只返回最终 JSON 对象，不要分析、解释或使用 Markdown。",
+                        },
+                    ]},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️ 实体状态卡补全重试失败: {retry_response.status_code} {retry_response.text[:200]}")
+                    return None
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                if not retry_text:
+                    print("⚠️ 实体状态卡补全重试返回空内容")
+                    return None
+                try:
+                    raw = parse_json_object(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️ 实体状态卡补全重试结果仍无法解析: {retry_error}")
+                    return None
+        if not isinstance(raw, dict):
+            return {}
+        by_id = {int(entity["id"]): entity for entity in entities}
+        results = {}
+        for key, value in raw.items():
+            try:
+                entity_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if entity_id not in by_id or not isinstance(value, dict):
+                continue
+            snapshot = normalize_entity_snapshot({
+                "state": value.get("state"),
+                "fact_date": value.get("fact_date"),
+                "evidence_quote": value.get("evidence_quote"),
+            })
+            if not snapshot or not snapshot.get("state"):
+                continue
+            snapshot["evidence_memory_id"] = _resolve_evidence_memory(
+                snapshot.get("evidence_quote", ""),
+                by_id[entity_id].get("memories") or [],
+            )
+            results[entity_id] = snapshot
+        return results
+    except Exception as exc:
+        print(f"⚠️ 实体状态卡补全失败: {exc}")
+        return None
+
+
 COGNITIVE_DRAFT_RULES = {
     "user_core": (
         "user",

@@ -29,12 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, get_entities_for_memory_ids, list_entities, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
+from database import link_memory_entities, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, BACKFILL_SNAPSHOT_CHUNK
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -2751,6 +2751,66 @@ async def api_backfill_entities(request: Request):
         "processed": len(memories),
         "memories_with_entities": memories_with_entities,
         "links_created": linked,
+    }
+
+
+@app.post("/api/entities/backfill-cards")
+async def api_backfill_entity_cards(request: Request):
+    """Legacy entities with empty cards: one LLM call per batch, all results as pending proposals.
+
+    老实体没有逐字消息回链，因此这里只生成「待确认提案」，由人工在 Dashboard 接受后才进卡。
+    每批 BACKFILL_SNAPSHOT_CHUNK 个实体一次 LLM 调用；同状态待确认提案已存在则跳过。
+    """
+    data = await request.json()
+    try:
+        limit = max(1, min(50, int(data.get("limit", 20))))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
+    entities = await list_entities_without_card(limit)
+    if not entities:
+        return {"status": "ok", "processed": 0, "proposed": 0, "skipped": 0, "errors": 0}
+    proposed = 0
+    skipped = 0
+    errors = 0
+    for i in range(0, len(entities), BACKFILL_SNAPSHOT_CHUNK):
+        chunk = entities[i:i + BACKFILL_SNAPSHOT_CHUNK]
+        for entity in chunk:
+            entity["memories"] = await get_entity_memories(entity["id"])
+        suggestions = await suggest_entity_snapshots_batch(chunk)
+        if suggestions is None:
+            errors += len(chunk)
+            continue
+        for entity in chunk:
+            suggestion = suggestions.get(entity["id"])
+            if not suggestion:
+                skipped += 1
+                continue
+            existing = await list_entity_card_proposals(entity["id"])
+            if any(
+                p["status"] == "pending" and p["state"] == suggestion["state"]
+                for p in existing
+            ):
+                skipped += 1
+                continue
+            reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
+            if suggestion.get("evidence_quote"):
+                reason += f"；证据引文：{suggestion['evidence_quote']}"
+            await create_entity_card_proposal(
+                entity["id"],
+                suggestion["state"],
+                suggestion.get("fact_date"),
+                evidence_memory_id=suggestion.get("evidence_memory_id"),
+                evidence_message_id=None,
+                source_role="backfill",
+                reason=reason,
+            )
+            proposed += 1
+    return {
+        "status": "ok",
+        "processed": len(entities),
+        "proposed": proposed,
+        "skipped": skipped,
+        "errors": errors,
     }
 
 

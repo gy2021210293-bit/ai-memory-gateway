@@ -47,12 +47,18 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
         self.assertIn('id="entity-profile-current"', self.html)
         self.assertIn("function formatEntityProfile(", self.javascript)
 
+    def test_backfill_cards_button_and_action_exist(self):
+        self.assertIn("补全实体状态卡", self.html)
+        self.assertIn("function backfillEntityCards(", self.javascript)
+        self.assertIn("/api/entities/backfill-cards", self.javascript)
+        self.assertIn("待确认提案", self.javascript)
+
     def test_card_styles_exist(self):
         self.assertIn(".entity-card-snapshot", self.css)
         self.assertIn(".entity-card-proposal", self.css)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=6.0", self.html)
+        self.assertIn("/static/js/dashboard.js?v=6.1", self.html)
         self.assertIn("/static/css/dashboard.css?v=7.0", self.html)
 
     def test_conversation_detail_uses_query_parameter_session_id(self):
