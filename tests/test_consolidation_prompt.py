@@ -19,7 +19,10 @@ class ConsolidationPromptTests(unittest.TestCase):
         )
 
     def test_prompt_preserves_event_storage_contract(self):
-        formatted = self.prompt.format(fragments="[ID=1] 示例")
+        formatted = self.prompt.format(
+            fragments="[ID=1] 示例",
+            entities_roster="（暂无已知实体）",
+        )
 
         self.assertIn("按事件主题拆分，不按日期硬塞", formatted)
         self.assertIn("content不超过200个汉字", formatted)

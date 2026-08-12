@@ -35,24 +35,24 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"mood":', prompt)
         self.assertNotIn('"topics":', prompt)
 
-    def test_entity_snapshot_guidance_pins_subject_identity(self):
+    def test_fragment_guidance_keeps_identity_and_drops_state(self):
+        # 碎片只提取实体身份：实体数组/别名/置信度保留，状态快照指引移除（状态由事件层提取）
         guidance = memory_extractor.ENTITY_OUTPUT_GUIDANCE
-        # 栖 = AI/第一人称；晏晏 = 用户
-        self.assertIn("WHO IS WHO: 我是栖", guidance)
-        self.assertIn("「用户:」前缀的消息是", guidance)
-        self.assertIn("快照 `state` 和记忆 JSON 里的\"我\"一律指栖", guidance)
-        # 主语必须与证据一致，禁止张冠李戴（栖的事写成晏晏的）
-        self.assertIn("SUBJECT ATTRIBUTION IS CRITICAL", guidance)
-        self.assertIn("禁止张冠李戴", guidance)
-        self.assertIn("不要用「栖」称呼", guidance)
-        self.assertIn("晏晏 (or 她)", guidance)
-        # 不得把用户消息里的第一人称"我..."直接抄进 state（输出里"我"会被读作栖）
-        self.assertIn("do NOT copy a first-person", guidance)
-        self.assertIn('"我" would mean 栖', guidance)
-        # 快照不只是一次性事件也收录关键节点，门槛不能过严
-        self.assertIn("landmark milestone", guidance)
-        self.assertIn("毕业、入职、搬家", guidance)
-        self.assertIn("do not skip a milestone", guidance)
+        self.assertIn("For each returned memory, include an `entities` array", guidance)
+        self.assertIn('"name":"display name"', guidance)
+        self.assertIn("aliases", guidance)
+        self.assertNotIn("snapshot", guidance)
+        self.assertNotIn("WHO IS WHO", guidance)
+
+    def test_state_subject_attribution_lives_in_snapshot_backfill_prompt(self):
+        # 状态/主语归属规则仍在实体卡回填 prompt（Dashboard 手动补卡 → 提案）
+        prompt = memory_extractor._build_snapshot_backfill_prompt([
+            {"id": 1, "name": "小明", "entity_type": "person", "aliases": [], "memories": []}
+        ])
+        self.assertIn("「我」指栖（我自己）", prompt)
+        self.assertIn("「她」指晏晏（用户）", prompt)
+        self.assertIn("绝不可张冠李戴", prompt)
+        self.assertIn("禁止出现「用户」", prompt)
 
     def test_tool_call_response_defers_extraction_until_final_answer(self):
         tool_calls = [{

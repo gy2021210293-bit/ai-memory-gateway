@@ -13,6 +13,7 @@ import json
 import uuid
 import unicodedata
 import difflib
+import time
 from typing import Optional, List
 from datetime import date, datetime, timedelta, timezone as dt_timezone
 
@@ -3234,6 +3235,80 @@ async def link_memory_entities(memory_id: int, entities: list, source: str = "ex
                     """, entity_id)
                 linked += 1
     return linked
+
+
+# ---- 规则式自动补关联（零 LLM） ----
+# 与主项目 entityResolver.matchByKeyword 同思路：扫记忆文本，命中已有实体的
+# 规范化名/别名（≥2 字）就补挂关联，不依赖 LLM 每次都能标出实体。
+_AUTO_LINK_NAMES: Optional[dict] = None
+_AUTO_LINK_NAMES_AT: float = 0.0
+_AUTO_LINK_NAMES_TTL = 300  # 5 分钟，与主项目 entityResolver 的别名缓存一致
+
+
+async def _load_auto_link_names(conn):
+    """Load (normalized name|alias -> entity_id) for rule-based matching, TTL-cached."""
+    global _AUTO_LINK_NAMES, _AUTO_LINK_NAMES_AT
+    now = time.monotonic()
+    if _AUTO_LINK_NAMES is not None and (now - _AUTO_LINK_NAMES_AT) < _AUTO_LINK_NAMES_TTL:
+        return _AUTO_LINK_NAMES
+    rows = await conn.fetch("""
+        SELECT e.id AS entity_id, e.normalized_name AS name
+        FROM entities e
+        UNION ALL
+        SELECT ea.entity_id, ea.normalized_alias AS name
+        FROM entity_aliases ea
+    """)
+    index = {}
+    for row in rows:
+        key = str(row["name"] or "").strip()
+        if not key:
+            continue
+        if len(key.replace(" ", "")) < 2:
+            continue
+        index[key] = row["entity_id"]
+    _AUTO_LINK_NAMES = index
+    _AUTO_LINK_NAMES_AT = now
+    return index
+
+
+async def auto_link_entities_by_name(memory_id: int, content: str) -> int:
+    """Rule-based, zero-LLM entity linking for one memory.
+
+    Scans the memory text for known entity canonical names / aliases (>=2 chars)
+    and links each hit. Links are recorded with source='auto_name' and count
+    toward evidence_count (balanced by delete_memory / delete_memories_batch).
+    """
+    if not memory_id or not content:
+        return 0
+    text = normalize_entity_name(content)
+    if not text:
+        return 0
+    pool = await get_pool()
+    linked_ids = set()
+    async with pool.acquire() as conn:
+        index = await _load_auto_link_names(conn)
+        for key, entity_id in index.items():
+            if entity_id in linked_ids or key not in text:
+                continue
+            inserted = await conn.fetchval("""
+                WITH ins AS (
+                    INSERT INTO memory_entities (memory_id, entity_id, confidence, source)
+                    VALUES ($1, $2, 1.0, 'auto_name')
+                    ON CONFLICT (memory_id, entity_id) DO NOTHING
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM ins
+            """, memory_id, entity_id)
+            if inserted:
+                await conn.execute("""
+                    UPDATE entities
+                    SET evidence_count = evidence_count + 1, updated_at = NOW()
+                    WHERE id = $1
+                """, entity_id)
+                linked_ids.add(entity_id)
+    if linked_ids:
+        print(f"🔗 规则匹配补关联: 记忆 {memory_id} 命中 {len(linked_ids)} 个实体")
+    return len(linked_ids)
 
 
 async def get_entities_for_memory_ids(memory_ids: list) -> dict:

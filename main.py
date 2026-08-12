@@ -29,12 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
+from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, BACKFILL_SNAPSHOT_CHUNK
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, BACKFILL_SNAPSHOT_CHUNK
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -1357,6 +1357,78 @@ async def apply_entity_card_suggestions(memory_id: int, entities: list, messages
         print(f"📇 实体卡更新: {accepted} 条已直接入卡，{proposals} 条转为待确认提案")
     return {"accepted": accepted, "proposals": proposals}
 
+
+async def apply_event_state_changes(memory_id: int, state_changes: list, default_date: str = "") -> dict:
+    """Write event-extracted entity state changes to entity card snapshots.
+
+    事件层取代碎片层成为实体状态的来源：合并事件时模型提炼的 state_changes，
+    在这里映射到已关联的实体并写入实体卡快照。fact_date 缺省时用事件日期；
+    与既有快照同日冲突时转待确认提案（与手动添加走同一 Harness 语义）。
+    """
+    if not memory_id or not state_changes:
+        return {"accepted": 0, "proposals": 0, "skipped": 0}
+    try:
+        linked = await get_entities_for_memory_ids([memory_id])
+    except Exception as exc:
+        print(f"⚠️ 事件状态写卡：读取记忆 {memory_id} 的关联实体失败: {exc}")
+        return {"accepted": 0, "proposals": 0, "skipped": 0}
+    entity_ids = {}
+    for linked_entity in linked.get(memory_id, []):
+        key = _db_module.normalize_entity_name(linked_entity.get("name") or "")
+        if key:
+            entity_ids.setdefault(key, linked_entity["id"])
+    accepted = 0
+    proposals = 0
+    skipped = 0
+    for change in state_changes:
+        if not isinstance(change, dict):
+            skipped += 1
+            continue
+        raw_name = str(change.get("entity") or "").strip()
+        state = " ".join(str(change.get("state") or "").split()).strip()
+        entity_key = _db_module.normalize_entity_name(raw_name)
+        entity_id = entity_ids.get(entity_key)
+        if entity_id is None and len(entity_key.replace(" ", "")) >= 2:
+            # 模型可能只在状态里提到实体、忘了放进 entities：自动挂一个身份再写卡
+            try:
+                await link_memory_entities(memory_id, [{"name": raw_name, "type": "other"}])
+                refreshed = await get_entities_for_memory_ids([memory_id])
+                for linked_entity in refreshed.get(memory_id, []):
+                    key = _db_module.normalize_entity_name(linked_entity.get("name") or "")
+                    if key:
+                        entity_ids.setdefault(key, linked_entity["id"])
+                entity_id = entity_ids.get(entity_key)
+            except Exception as exc:
+                print(f"⚠️ 事件状态写卡：自动挂接实体失败: {exc}")
+        if entity_id is None or not state:
+            skipped += 1
+            continue
+        fact_date = str(change.get("fact_date") or "").strip() or default_date
+        try:
+            result = await apply_entity_snapshot(
+                entity_id, state, fact_date,
+                memory_id, None, source="confirmed", force=False,
+            )
+        except Exception as exc:
+            print(f"⚠️ 事件状态快照写入失败: {exc}")
+            skipped += 1
+            continue
+        if result.get("status") == "conflict":
+            proposals += 1
+            try:
+                await create_entity_card_proposal(
+                    entity_id, state, fact_date,
+                    memory_id, None, "event", "与既有快照同日冲突，需人工确认",
+                )
+            except Exception as exc:
+                print(f"⚠️ 事件状态冲突提案创建失败: {exc}")
+        elif result.get("status") == "ok":
+            accepted += 1
+        # duplicate → 已存在相同快照，无需操作
+    if accepted or proposals:
+        print(f"📇 事件实体状态写卡: {accepted} 条已入卡，{proposals} 条转待确认提案，{skipped} 条跳过")
+    return {"accepted": accepted, "proposals": proposals, "skipped": skipped}
+
 async def process_memories_background(
     session_id: str,
     user_msg: str,
@@ -1554,13 +1626,11 @@ async def process_memories_background(
             except Exception as exc:
                 print(f"⚠️ 记忆证据回链失败（记忆 {memory_id}）: {exc}")
             await mark_memories_entity_scanned([memory_id])
-            # 实体卡：复用同一提取结果中的状态快照建议，Harness 判定直接入卡或转提案。
+            # 规则式自动补关联：扫描碎片文本，命中已有实体名/别名（≥2字）就补挂关联（零 LLM）
             try:
-                await apply_entity_card_suggestions(
-                    memory_id, mem.get("entities", []), messages_for_extraction,
-                )
+                await auto_link_entities_by_name(memory_id, mem["content"])
             except Exception as exc:
-                print(f"⚠️ 实体卡建议应用失败（记忆 {memory_id}）: {exc}")
+                print(f"⚠️ 碎片规则补关联失败（记忆 {memory_id}）: {exc}")
 
         progress_completed = await complete_memory_extraction(
             session_id,
@@ -3171,6 +3241,16 @@ CONSOLIDATION_PROMPT = """
 碎片记忆：
 {fragments}
 
+# 实体标注（重要）
+为合并后的事件标注涉及的关键实体，并识别事件里体现的实体状态变化：
+
+- entities：数组，每个元素 {{"name": "实体名", "type": "person|place|organization|project|object|pet|activity|event|other"}}。事件正文里明确出现、且作为长期记忆锚点值得追踪的命名实体才标；下方「已知实体名册」里已有的实体必须用其规范名，不要新建同名实体；名册里没有的新实体（需是稳定命名实体，排除代词、泛指名词、代码/文件名/路径/URL 等）可以新建。没有就返回空数组。
+- state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。
+
+<已知实体名册>
+{entities_roster}
+</已知实体名册>
+
 # 输出格式
 只输出JSON数组，不要解释或使用Markdown：
 [
@@ -3179,7 +3259,9 @@ CONSOLIDATION_PROMPT = """
     "content": "2026年7月25日，晏晏到酒店说房间有烟味。我有点心疼她累了一天还要受这个，劝她先通风，不行就换房，不想她委屈自己。",
     "event_date": "2026-07-25",
     "importance": 3,
-    "merged_ids": [1, 2]
+    "merged_ids": [1, 2],
+    "entities": [],
+    "state_changes": []
   }}
 ]
 
@@ -3235,8 +3317,17 @@ async def consolidate_memories_for_date_range(start_date, end_date):
         )
     fragments_text = "\n".join(fragment_lines)
     
-    # 调用 AI 进行整理
-    prompt = CONSOLIDATION_PROMPT.format(fragments=fragments_text)
+    # 调用 AI 进行整理（注入实体名册，让合并模型复用规范名避免重复建实体）
+    try:
+        entity_roster = await list_entity_roster()
+    except Exception:
+        entity_roster = None
+        print("⚠️ 合并事件实体名册拉取失败，本次不带 roster")
+    roster_text = _render_entity_roster(entity_roster) if entity_roster else "（暂无已知实体）"
+    prompt = CONSOLIDATION_PROMPT.format(
+        fragments=fragments_text,
+        entities_roster=roster_text,
+    )
     
     # 使用环境变量配置的模型，默认 haiku 节省成本
     consolidation_model = os.getenv("MEMORY_MODEL", "") or os.getenv("DEFAULT_MODEL", "anthropic/claude-haiku-4.5")
@@ -3356,6 +3447,28 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     if event_memory_id:
                         merged_fragment_ids.update(merged_ids)
                         created_count += 1
+                        # 事件实体：合并时模型标注的实体 → 挂关联（与继承的碎片实体合并，不冲突）
+                        event_entities = event.get("entities") or []
+                        if event_entities:
+                            try:
+                                await link_memory_entities(event_memory_id, event_entities)
+                            except Exception as exc:
+                                print(f"⚠️ 事件 {event_memory_id} 实体挂接失败: {exc}")
+                        # 规则式自动补关联：事件正文里命中已有实体名/别名也补挂（零 LLM）
+                        try:
+                            await auto_link_entities_by_name(event_memory_id, event_content)
+                        except Exception as exc:
+                            print(f"⚠️ 事件 {event_memory_id} 规则补关联失败: {exc}")
+                        # 事件状态变化 → 实体卡快照（事件层取代碎片层成为实体状态来源）
+                        event_state_changes = event.get("state_changes") or []
+                        if event_state_changes:
+                            try:
+                                await apply_event_state_changes(
+                                    event_memory_id, event_state_changes,
+                                    default_date=str(event_date),
+                                )
+                            except Exception as exc:
+                                print(f"⚠️ 事件 {event_memory_id} 状态写卡失败: {exc}")
             
             # 只停用已经被成功落库事件引用的碎片；未合并碎片保持活跃
             await deactivate_memories(sorted(merged_fragment_ids))

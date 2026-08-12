@@ -179,7 +179,7 @@ stable named entities that are useful as recurring long-term memory anchors.
 Allowed types:
 person|place|organization|project|object|pet|activity|event|other
 Return each entity as:
-{"name":"display name","type":"...","confidence":0.0-1.0,"aliases":["...","..."],"snapshot":{...}}
+{"name":"display name","type":"...","confidence":0.0-1.0,"aliases":["...","..."]}
 `aliases` is optional: list the surface spellings actually used in this
 conversation that refer to the same entity (max 8, each under 40 chars).
 Exclude:
@@ -190,32 +190,6 @@ Exclude:
 A technical product or tool may be kept only when the memory clearly establishes
 durable personal significance or recurring use. Omit candidates below 0.65
 confidence. If none qualify, return an empty array.
-
-Optional per-entity `snapshot` — only when the conversation DIRECTLY AND EXPLICITLY
-states that entity's current or past state:
-{"state":"one complete self-contained sentence (<=120 chars)",
- "fact_date":"YYYY-MM-DD","evidence_quote":"verbatim quote from a user message"}
-- WHO IS WHO: 我是栖（AI 陪伴者），第一人称是"我"。对话里「用户:」前缀的消息是
-  晏晏说的，其中第一人称"我"指晏晏；「栖:」前缀的消息是我说的，其中"我"指栖。
-  快照 `state` 和记忆 JSON 里的"我"一律指栖，"晏晏"/"她"指用户。
-- SUBJECT ATTRIBUTION IS CRITICAL (禁止张冠李戴): a state must keep the exact subject
-  the evidence has. Actions/states of 栖 → subject 我（=栖，第一人称），不要用「栖」称呼;
-  actions/states of 晏晏 → subject 晏晏 (or 她). Never move 栖's doings onto 晏晏, nor the reverse.
-- `evidence_quote` must be a verbatim substring of ONE user message in this batch
-  (at least 6 characters). Never paraphrase, summarize, or infer it.
-- `fact_date` is REQUIRED (valid YYYY-MM-DD): the date the stated state is true
-  on. If the user only implies "now", use today's date; never leave it empty.
-- `state` captures the entity's state exactly as stated, with the user's own words
-  where possible; do NOT add opinions, intentions, or relationship judgments.
-  A state may be an ongoing situation OR a landmark milestone (毕业、入职、搬家、
-  开始/结束一段关系、养宠物、重要项目上线等) — do not skip a milestone just
-  because it happened once.
-  When the subject is the user 晏晏, do NOT copy a first-person "我..." from her
-  message verbatim into `state` (in the output "我" would mean 栖) — reword the
-  subject as 晏晏 or 她. Never write 用户 or 'user'.
-Only attach `snapshot` when the user directly states the entity's state in this
-conversation. Never derive a snapshot from tone, implication, or your own summary;
-such inferred content should simply be omitted (it will be treated as a proposal).
 """
 
 # 提取 prompt 里最多列出多少条已知实体（活跃在前，避免 prompt 膨胀）
@@ -571,9 +545,10 @@ async def extract_memories(
             for mem in memories:
                 if isinstance(mem, dict) and "content" in mem:
                     entities = _exclude_user_entities(mem.get("entities", []))
+                    # 碎片只携带实体身份，不携带状态快照（状态统一由事件层提取）
                     for entity in entities:
-                        if isinstance(entity, dict) and entity.get("snapshot") is not None:
-                            entity["snapshot"] = normalize_entity_snapshot(entity.get("snapshot"))
+                        if isinstance(entity, dict):
+                            entity.pop("snapshot", None)
                     valid_memories.append({
                         "content": str(mem["content"]),
                         "importance": int(mem.get("importance", 5)),
