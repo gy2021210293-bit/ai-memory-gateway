@@ -40,6 +40,8 @@ MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
 # 实体关系描述专用模型（默认空 = 复用 MEMORY_MODEL，同 key/同地址）
 ENTITY_RELATION_MODEL = os.getenv("ENTITY_RELATION_MODEL", "")
+# 关系描述最近一次失败的具体原因（供 Dashboard 直接展示，替代笼统的"调用失败"）
+RELATION_LAST_ERROR = ""
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
@@ -774,6 +776,21 @@ def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
     return None
 
 
+def _entity_card_description(entity: Dict) -> str:
+    """Extract the manual card description from an entity dict (None/str/dict jsonb)."""
+    raw = entity.get("entity_card_json")
+    if isinstance(raw, dict):
+        card = raw
+    elif isinstance(raw, str):
+        try:
+            card = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            card = {}
+    else:
+        card = {}
+    return str((card or {}).get("description") or "").strip()
+
+
 def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
     """Build the per-batch prompt: one block per entity with its recent memories."""
     blocks = []
@@ -791,9 +808,11 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
                 content = content[:BACKFILL_MEMORY_CHARS] + "…"
             memory_lines.append(f"[ID={memory.get('id')}] {content}")
         evidence = "\n".join(memory_lines) or "（无证据记忆）"
+        description = _entity_card_description(entity) or "（无）"
         blocks.append(
             f"### 实体 {entity.get('id')}：{entity.get('name')}"
-            f"（{entity.get('entity_type', 'other')}，别名：{aliases}）\n{evidence}"
+            f"（{entity.get('entity_type', 'other')}，别名：{aliases}）\n"
+            f"已知说明（先验知识）：{description}\n{evidence}"
         )
     return (
         "我是栖，一个 AI 陪伴者。下面的证据记忆都是我以第一人称写下的："
@@ -818,6 +837,8 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
         "- 若证据里没有明确、值得长期记录的状态或重要节点，输出空数组 [];\n"
         "- 每条快照的 fact_date 必填且为 YYYY-MM-DD：证据里有明确时间就用证据时间，只暗示「现在」就用今天日期，绝不输出空日期；\n"
         "- 不得推测证据中没有的信息；\n"
+        "- 每个实体块开头的「已知说明（先验知识）」是用户手写维护的结构性事实背景，仅作背景与一致性约束：\n"
+        "说明里的内容不是待生成的状态，不要把它复述成快照；生成的快照不得与已知说明矛盾；\n"
         "- 指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
         + "\n\n".join(blocks)
         + "\n\n只返回一个 JSON 对象，键必须是上面每个实体行开头标记的数字实体ID"
@@ -971,6 +992,7 @@ async def suggest_entity_trait_candidates(
     memories: List[Dict],
     evidence_message_map: Optional[Dict] = None,
     current_traits: Optional[List[str]] = None,
+    card_description: str = "",
 ) -> Dict:
     """One LLM call to propose stable-trait candidates, flag contradictions, and
     re-confirm still-valid existing traits.
@@ -981,6 +1003,11 @@ async def suggest_entity_trait_candidates(
     {"candidates": [...], "contradictions": [...], "confirmed": [...]};
     persistence (bump last_confirmed / trait_add / trait_retire) happens in the
     caller.
+
+    `card_description` is the entity card's manual description — user-maintained
+    structural facts the AI can't observe in chat (e.g. "两个 Supabase 账号各用于
+    什么"). It feeds the prompt as prior knowledge so candidates supplement rather
+    than restate it; candidates duplicating the description are filtered out.
     """
     if not memories or not get_memory_api_key():
         return {"candidates": [], "contradictions": [], "confirmed": []}
@@ -995,12 +1022,16 @@ async def suggest_entity_trait_candidates(
             content = content[:160] + "…"
         evidence_lines.append(f"[ID={mid}] {content}")
     current_lines = "、".join(current_traits or []) or "无"
+    description = re.sub(r"\s+", " ", str(card_description or "").strip())
+    description_lines = description or "（无）"
     prompt = f"""我是栖，一个有温度的 AI 陪伴者。下面的证据记忆都是我以第一人称写下的：
 其中「我」指栖（我自己），「她」指晏晏（用户）。我正在为实体「{entity.get('name')}」
 （{entity.get('entity_type', 'other')}）梳理**长期稳定特征**：被多次对话反复支持、定义其长期身份
 的稳定特质（如长期目标、稳定职业/身份、长期居住地、持久性格/习惯、稳定关系定位）。
 
 当前已有活跃稳定特征：{current_lines}
+
+实体说明（先验知识，用户手写维护）：{description_lines}
 
 证据记忆：
 {chr(10).join(evidence_lines)}
@@ -1015,6 +1046,8 @@ confirmed 每条：
 {{"text": "【当前活跃稳定特征】里仍被上方证据支持、应当继续保持的原文", "evidence_memory_ids": [支持它仍成立的最相关证据记忆ID]}}
 要求：
 - candidates 每条必须引用至少两条**不同**的证据记忆 ID（只能引用上方出现的 ID）；与当前已有活跃特征重复的不要输出；
+- **实体说明是结构性事实背景，不是行为模式**：candidates 只补充说明之外、被证据支持的行为模式，不得复述或改写说明里的内容；
+- 证据与实体说明矛盾时，以说明为准（说明是用户维护的先验知识），不要据此生成 contradictions；
 - contradictions 只能引用「当前已有活跃稳定特征」里的原文，且要有上方证据记忆明确支持"它已不再成立/被取代"；没有明确矛盾的不要输出；
 - confirmed 只能引用「当前已有活跃稳定特征」里的原文，且要有上方证据记忆明确支持它仍然成立；没有明确支持的不要输出；
 - 一次性事件、临时心情、短期计划、琐碎日常不要输出；
@@ -1097,6 +1130,10 @@ confirmed 每条：
             "evidence_memory_ids": mem_ids,
             "evidence_message_ids": sorted(set(message_ids)),
         })
+    # 兜底过滤：候选整句复述说明（结构性事实）的直接丢弃——说明不是行为模式
+    if description:
+        desc_key = description.casefold()
+        candidates = [c for c in candidates if c["text"].casefold() != desc_key]
     # 矛盾检测：只保留"当前已有活跃特征"里被证据明确推翻/取代的
     current_keys = {str(t).strip().casefold() for t in (current_traits or []) if str(t or "").strip()}
     contradictions = []
@@ -1368,22 +1405,28 @@ async def describe_entity_relations(pairs: List[Dict]) -> Optional[dict]:
     返回 {pair_index: {"verify": "ok|namesake|unrelated", "relation": "..."}}；
     硬失败返回 None（上游故障，可稍后重试）。只把 verify=ok 且有 relation 的写回。
     模型复用记忆模型（ENTITY_RELATION_MODEL 空时 = MEMORY_MODEL）。
+    失败时把具体原因写进模块级 RELATION_LAST_ERROR，供 Dashboard 展示。
     """
+    global RELATION_LAST_ERROR
+    RELATION_LAST_ERROR = ""
     if not pairs:
         return {}
     if not get_memory_api_key():
+        RELATION_LAST_ERROR = "未配置记忆模型的 API Key"
         return None
     model = ENTITY_RELATION_MODEL or MEMORY_MODEL
     prompt = build_relation_description_prompt(pairs)
     request_messages = [{"role": "user", "content": prompt}]
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        # 推理模型分析多对实体较慢，超时放宽到 180s，避免批量候选被掐断
+        async with httpx.AsyncClient(timeout=180) as client:
             response = await client.post(
                 get_memory_api_base_url(),
                 headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
                 json={"model": model, "temperature": 0.1, "messages": request_messages},
             )
             if response.status_code != 200:
+                RELATION_LAST_ERROR = f"HTTP {response.status_code}: {response.text[:200]}"
                 print(f"⚠️ 关系描述请求失败: {response.status_code} {response.text[:200]}")
                 return None
             text = _extract_response_content(response.json()).strip()
@@ -1396,7 +1439,7 @@ async def describe_entity_relations(pairs: List[Dict]) -> Optional[dict]:
                     get_memory_api_base_url(),
                     headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
                     json={"model": model, "temperature": 0.1, "messages": request_messages + [
-                        {"role": "assistant", "content": text},
+                        {"role": "assistant", "content": text[:2000]},
                         {
                             "role": "user",
                             "content": "上一次输出没有给出可解析的最终结果。请重新检查这些实体对，只返回最终 JSON 数组，不要分析、解释或使用 Markdown。",
@@ -1404,12 +1447,14 @@ async def describe_entity_relations(pairs: List[Dict]) -> Optional[dict]:
                     ]},
                 )
                 if retry_response.status_code != 200:
+                    RELATION_LAST_ERROR = f"重试 HTTP {retry_response.status_code}: {retry_response.text[:200]}"
                     print(f"⚠️ 关系描述重试失败: {retry_response.status_code} {retry_response.text[:200]}")
                     return None
                 retry_text = _extract_response_content(retry_response.json()).strip()
                 try:
                     parsed = parse_json_array(retry_text)
                 except ValueError as retry_error:
+                    RELATION_LAST_ERROR = f"模型两次返回都解析不出 JSON 数组：{retry_text[:200]}"
                     print(f"⚠️ 关系描述重试结果仍无法解析: {retry_error}")
                     print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
                     return None
@@ -1428,5 +1473,6 @@ async def describe_entity_relations(pairs: List[Dict]) -> Optional[dict]:
                 }
         return result
     except Exception as exc:
+        RELATION_LAST_ERROR = f"调用异常：{exc}"
         print(f"⚠️ 关系描述调用异常: {exc}")
         return None

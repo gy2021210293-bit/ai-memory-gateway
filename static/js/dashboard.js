@@ -1024,7 +1024,7 @@ async function discoverEntityRelations() {
             return;
         }
         if (data.status === 'llm_failed') {
-            setStatus('候选已找到，但关系描述模型调用失败，请稍后重试。', 'error');
+            setStatus(data.reason ? `关系描述模型调用失败：${data.reason}` : '候选已找到，但关系描述模型调用失败，请稍后重试。', 'error');
             return;
         }
         setStatus(`发现完成：候选 ${data.candidates} · 判定 ${data.judged || 0} · 写入 ${data.described} 条关系。`, 'success');

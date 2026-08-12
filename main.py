@@ -3099,6 +3099,7 @@ async def api_generate_entity_trait_candidates(entity_id: int, request: Request)
     ]
     suggestion = await suggest_entity_trait_candidates(
         entity, memories, evidence_message_map, current_traits,
+        card_description=card.get("description") or "",
     )
     result = await route_trait_suggestions(entity_id, suggestion, card)
     return {
@@ -3146,6 +3147,7 @@ async def run_trait_requalify_once() -> dict:
                 ]
                 suggestion = await suggest_entity_trait_candidates(
                     entity, memories, evidence_message_map, current_traits,
+                    card_description=card.get("description") or "",
                 )
                 result = await route_trait_suggestions(ent["id"], suggestion, card)
                 done += 1
@@ -3238,7 +3240,12 @@ async def run_entity_relation_discovery_once() -> dict:
 
         verdicts = await describe_entity_relations(batch)
         if verdicts is None:
-            return {"status": "llm_failed", "candidates": len(candidates), "described": 0}
+            return {
+                "status": "llm_failed",
+                "candidates": len(candidates),
+                "described": 0,
+                "reason": _memory_extractor_module.RELATION_LAST_ERROR,
+            }
 
         described = 0
         for index, pair_row in enumerate(fresh):
