@@ -55,6 +55,11 @@ ENTITY_ACTIVE_EVIDENCE_THRESHOLD = 3
 TRAIT_STALE_DAYS = int(os.getenv("TRAIT_STALE_DAYS", "180"))       # 稳定特征 last_confirmed 超过即触发重查/提醒
 SNAPSHOT_STALE_DAYS = int(os.getenv("SNAPSHOT_STALE_DAYS", "45"))   # 卡片最后一条快照 fact_date 超过即提醒过时
 ENTITY_DORMANT_DAYS = int(os.getenv("ENTITY_DORMANT_DAYS", "90"))   # 最近一次被提到超过即休眠（无豁免）
+# 实体间关系发现阈值（P7），env 可覆盖
+ENTITY_RELATION_MIN_SHARED_FRAGMENTS = int(os.getenv("ENTITY_RELATION_MIN_SHARED_FRAGMENTS", "2"))
+ENTITY_RELATION_MIN_SHARED_EVENTS = int(os.getenv("ENTITY_RELATION_MIN_SHARED_EVENTS", "1"))
+RELATION_SHARED_GROWTH = float(os.getenv("RELATION_SHARED_GROWTH", "1.5"))  # 共享数增长≥该倍数才重判
+RELATION_DAYS = int(os.getenv("RELATION_DAYS", "7"))                        # 同一对 LLM 重判最小间隔（天）
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
     for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
@@ -590,6 +595,24 @@ async def init_tables():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_entity_card_proposals_entity
             ON entity_card_proposals (entity_id, status);
+        """)
+        # ---- 实体间关系：星图桥线 + 对话注入共用（无向，小 id 在前）----
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS entity_relations (
+                id            SERIAL PRIMARY KEY,
+                entity_id_a   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                entity_id_b   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                relation      TEXT NOT NULL DEFAULT '',
+                shared_count  INTEGER NOT NULL DEFAULT 0,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (entity_id_a, entity_id_b)
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entity_relations_entity_a ON entity_relations (entity_id_a);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entity_relations_entity_b ON entity_relations (entity_id_b);
         """)
         # 记忆证据链：新保存的记忆回链到原始对话消息；碎片合并成事件时继承该链。
         await conn.execute("""
@@ -3370,6 +3393,193 @@ async def auto_link_entities_by_name(memory_id: int, content: str) -> int:
     if linked_ids:
         print(f"🔗 规则匹配补关联: 记忆 {memory_id} 命中 {len(linked_ids)} 个实体")
     return len(linked_ids)
+
+
+# ============================================================
+# 实体间关系（P7）：星图桥线 + 对话注入共用
+# ============================================================
+
+def _norm_pair_ids(a_id, b_id) -> tuple:
+    """归一化无向实体对（小 id 在前），保证唯一约束与查询方向一致。"""
+    a = int(a_id)
+    b = int(b_id)
+    return (a, b) if a <= b else (b, a)
+
+
+async def upsert_entity_relation(a_id: int, b_id: int, relation: str, shared_count: int) -> None:
+    """写入或更新一条实体关系。无向：调用方无需关心 id 顺序。"""
+    a, b = _norm_pair_ids(a_id, b_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO entity_relations (entity_id_a, entity_id_b, relation, shared_count, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (entity_id_a, entity_id_b) DO UPDATE SET
+                relation = EXCLUDED.relation,
+                shared_count = EXCLUDED.shared_count,
+                updated_at = NOW()
+        """, a, b, relation or "", max(0, int(shared_count or 0)))
+
+
+async def delete_entity_relation(a_id: int, b_id: int) -> None:
+    """删除一条实体关系（用于手动纠错）。"""
+    a, b = _norm_pair_ids(a_id, b_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM entity_relations WHERE entity_id_a = $1 AND entity_id_b = $2",
+            a, b,
+        )
+
+
+async def list_entity_relations() -> list:
+    """全部实体关系（带两端名称/类型），供星图桥线与 Dashboard 展示。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT r.id, r.entity_id_a, r.entity_id_b, r.relation, r.shared_count, r.updated_at,
+                   ea.name AS a_name, ea.entity_type AS a_type,
+                   eb.name AS b_name, eb.entity_type AS b_type
+            FROM entity_relations r
+            JOIN entities ea ON ea.id = r.entity_id_a
+            JOIN entities eb ON eb.id = r.entity_id_b
+            ORDER BY r.shared_count DESC, r.updated_at DESC
+        """)
+    return [dict(row) for row in rows]
+
+
+async def relations_of_entity(entity_ids: list) -> dict:
+    """给定一组实体 id，返回每个实体的关联清单。
+
+    Result: {entity_id: [{"entity_id": other, "name", "type", "relation", "shared_count",
+                          "retrieval_status": other的活跃状态}]}
+    无向关系在两端各出现一次（另一端视角）。注入侧用 retrieval_status 过滤关联端。
+    """
+    if not entity_ids:
+        return {}
+    ids = [int(eid) for eid in entity_ids]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT r.entity_id_a, r.entity_id_b, r.relation, r.shared_count,
+                   ea.id AS a_id, ea.name AS a_name, ea.entity_type AS a_type,
+                   ea.evidence_count AS a_evidence, ea.status_override AS a_override,
+                   eb.id AS b_id, eb.name AS b_name, eb.entity_type AS b_type,
+                   eb.evidence_count AS b_evidence, eb.status_override AS b_override,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = ea.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS a_last_evidence,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = eb.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS b_last_evidence
+            FROM entity_relations r
+            JOIN entities ea ON ea.id = r.entity_id_a
+            JOIN entities eb ON eb.id = r.entity_id_b
+            WHERE r.entity_id_a = ANY($1::int[]) OR r.entity_id_b = ANY($1::int[])
+            ORDER BY r.shared_count DESC, r.updated_at DESC
+        """, ids)
+    result = {}
+    for row in rows:
+        a_id = int(row["entity_id_a"])
+        b_id = int(row["entity_id_b"])
+        a_life = attach_entity_lifecycle({
+            "id": a_id, "evidence_count": row["a_evidence"],
+            "status_override": row["a_override"], "last_evidence_at": row["a_last_evidence"],
+        })
+        b_life = attach_entity_lifecycle({
+            "id": b_id, "evidence_count": row["b_evidence"],
+            "status_override": row["b_override"], "last_evidence_at": row["b_last_evidence"],
+        })
+        entry_a = {"entity_id": b_id, "name": row["b_name"], "type": row["b_type"],
+                   "relation": row["relation"] or "", "shared_count": row["shared_count"],
+                   "retrieval_status": b_life["retrieval_status"]}
+        entry_b = {"entity_id": a_id, "name": row["a_name"], "type": row["a_type"],
+                   "relation": row["relation"] or "", "shared_count": row["shared_count"],
+                   "retrieval_status": a_life["retrieval_status"]}
+        result.setdefault(a_id, []).append(entry_a)
+        result.setdefault(b_id, []).append(entry_b)
+    return result
+
+
+async def find_entity_relation_candidates(limit: int = 50) -> list:
+    """规则扫描：共享事件≥1 或 共享碎片≥2 的活跃实体对（零 LLM 候选）。
+
+    只统计活跃记忆（is_active=TRUE）——碎片合并成事件后原碎片停用、事件继承实体会员，
+    共享计数随 is_active 自动"迁移"，不丢关系、不重复计数。两端实体须过 active 判定
+    （与 recall 同一子句）且未休眠；排除用户/AI 名。候选含两端名称/类型/共享数。
+    """
+    limit = max(1, int(limit))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            WITH pair_counts AS (
+                SELECT me1.entity_id AS a_id, me2.entity_id AS b_id,
+                       COUNT(DISTINCT m.id) AS shared_total,
+                       COUNT(DISTINCT CASE WHEN m.layer = 2 THEN m.id END) AS shared_events,
+                       COUNT(DISTINCT CASE WHEN m.layer = 1 THEN m.id END) AS shared_fragments
+                FROM memory_entities me1
+                JOIN memory_entities me2 ON me1.memory_id = me2.memory_id AND me1.entity_id < me2.entity_id
+                JOIN memories m ON m.id = me1.memory_id
+                WHERE m.is_active = TRUE
+                GROUP BY me1.entity_id, me2.entity_id
+                HAVING COUNT(DISTINCT CASE WHEN m.layer = 2 THEN m.id END) >= $1
+                    OR COUNT(DISTINCT CASE WHEN m.layer = 1 THEN m.id END) >= $2
+            )
+            SELECT pc.a_id, pc.b_id, pc.shared_total, pc.shared_events, pc.shared_fragments,
+                   ea.name AS a_name, ea.entity_type AS a_type, ea.evidence_count AS a_evidence,
+                   eb.name AS b_name, eb.entity_type AS b_type, eb.evidence_count AS b_evidence,
+                   ea.status_override AS a_override, eb.status_override AS b_override,
+                   ea.profile_json IS NOT NULL AS a_has_profile, eb.profile_json IS NOT NULL AS b_has_profile,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = pc.a_id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS a_last_evidence,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = pc.b_id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS b_last_evidence
+            FROM pair_counts pc
+            JOIN entities ea ON ea.id = pc.a_id
+            JOIN entities eb ON eb.id = pc.b_id
+            WHERE ea.normalized_name <> ALL($3::text[])
+              AND eb.normalized_name <> ALL($3::text[])
+              AND (
+                  ea.status_override = 'active'
+                  OR (ea.status_override IS NULL AND (ea.profile_json IS NOT NULL OR ea.evidence_count >= $4))
+              )
+              AND (
+                  eb.status_override = 'active'
+                  OR (eb.status_override IS NULL AND (eb.profile_json IS NOT NULL OR eb.evidence_count >= $4))
+              )
+            ORDER BY pc.shared_total DESC, pc.a_id, pc.b_id
+            LIMIT $5
+        """, ENTITY_RELATION_MIN_SHARED_EVENTS, ENTITY_RELATION_MIN_SHARED_FRAGMENTS,
+            sorted(EXCLUDED_ENTITY_NAMES), ENTITY_ACTIVE_EVIDENCE_THRESHOLD, limit)
+    candidates = []
+    for row in rows:
+        # 休眠闸门：任一实体最近证据过旧则本轮跳过（与 recall 的 dormancy 一致）
+        if not _entity_is_recent({"last_evidence_at": row["a_last_evidence"]}):
+            continue
+        if not _entity_is_recent({"last_evidence_at": row["b_last_evidence"]}):
+            continue
+        candidates.append(dict(row))
+    return candidates
+
+
+async def fetch_shared_memory_evidence(a_id: int, b_id: int, limit: int = 2) -> list:
+    """一对实体的共享记忆文本（供 LLM 写关系描述做依据），最多 limit 条。"""
+    limit = max(1, int(limit))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT m.id, m.content, m.layer, m.created_at
+            FROM memory_entities me1
+            JOIN memory_entities me2 ON me1.memory_id = me2.memory_id
+            JOIN memories m ON m.id = me1.memory_id
+            WHERE m.is_active = TRUE
+              AND me1.entity_id = $1 AND me2.entity_id = $2
+            ORDER BY m.created_at DESC
+            LIMIT $3
+        """, int(a_id), int(b_id), limit)
+    return [dict(row) for row in rows]
 
 
 async def get_entities_for_memory_ids(memory_ids: list) -> dict:

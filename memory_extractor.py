@@ -38,6 +38,8 @@ MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
 
 # 用来提取记忆的模型（便宜的就行）
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+# 实体关系描述专用模型（默认空 = 复用 MEMORY_MODEL，同 key/同地址）
+ENTITY_RELATION_MODEL = os.getenv("ENTITY_RELATION_MODEL", "")
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
@@ -1313,3 +1315,118 @@ async def score_memories(texts: List[str]) -> List[Dict]:
     except Exception as e:
         print(f"⚠️  记忆评分出错: {e}")
         return [{"content": t, "importance": 5} for t in texts]
+
+
+# ============================================================
+# P7 实体关系描述：读共享记忆，写一句话关系（复用记忆模型）
+# ============================================================
+
+def build_relation_description_prompt(pairs: List[Dict]) -> str:
+    """构造批量实体对的关系描述 prompt。
+
+    pairs 每项含 a_name / a_type / b_name / b_type / shared_total / evidence（共享记忆文本列表）。
+    短名是长名子串的 pair 会被标记，提示模型重点审查同名异物。
+    """
+    blocks = []
+    for i, pair in enumerate(pairs):
+        evidence_lines = "".join(
+            f"  · {str(text).strip()[:100]}\n" for text in (pair.get("evidence") or [])
+        ).rstrip("\n")
+        blocks.append(
+            f'[{i}] "{pair.get("a_name")}"({pair.get("a_type", "other")}) ↔ '
+            f'"{pair.get("b_name")}"({pair.get("b_type", "other")}) 共享{pair.get("shared_total", 0)}条记忆:\n'
+            f"{evidence_lines}"
+        )
+    pair_blocks = "\n\n".join(blocks)
+    suspicious = []
+    for i, pair in enumerate(pairs):
+        a = str(pair.get("a_name") or "")
+        b = str(pair.get("b_name") or "")
+        if len(a) <= 3 and len(b) > len(a) and b.find(a) >= 0:
+            suspicious.append(str(i))
+        elif len(b) <= 3 and len(a) > len(b) and a.find(b) >= 0:
+            suspicious.append(str(i))
+    suspicious_hint = (
+        f"\n特别注意第 {', '.join(suspicious)} 对：一个名字可能是另一个名字的一部分（如「肉肉」 vs 「肉肉大米」），"
+        f"务必先确认共享记忆里是否真的是同一个实体。"
+        if suspicious else ""
+    )
+    return f"""以下实体对在我的记忆里共同出现过。对每对，先判断共享记忆里的名字是否真的指同一个实体
+（警惕同名异物——短名字可能是更长名字的一部分）。{suspicious_hint}
+
+确认是同一实体后，写一句话关系描述（≤30字，陈述事实，如"常去的地方"、"家人"、"最近一起去过的地方"）。
+看不出实质关系、或判定为同名异物，填 null。
+
+{pair_blocks}
+
+只输出JSON数组: [{{"pair":0,"verify":"ok|namesake|unrelated","relation":"一句话描述或null"}}, ...]"""
+
+
+async def describe_entity_relations(pairs: List[Dict]) -> Optional[dict]:
+    """LLM 为一批候选实体对写一句话关系描述。
+
+    返回 {pair_index: {"verify": "ok|namesake|unrelated", "relation": "..."}}；
+    硬失败返回 None（上游故障，可稍后重试）。只把 verify=ok 且有 relation 的写回。
+    模型复用记忆模型（ENTITY_RELATION_MODEL 空时 = MEMORY_MODEL）。
+    """
+    if not pairs:
+        return {}
+    if not get_memory_api_key():
+        return None
+    model = ENTITY_RELATION_MODEL or MEMORY_MODEL
+    prompt = build_relation_description_prompt(pairs)
+    request_messages = [{"role": "user", "content": prompt}]
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                json={"model": model, "temperature": 0.1, "messages": request_messages},
+            )
+            if response.status_code != 200:
+                print(f"⚠️ 关系描述请求失败: {response.status_code} {response.text[:200]}")
+                return None
+            text = _extract_response_content(response.json()).strip()
+            try:
+                parsed = parse_json_array(text)
+            except ValueError as first_error:
+                print(f"⚠️ 关系描述解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
+                    json={"model": model, "temperature": 0.1, "messages": request_messages + [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": "上一次输出没有给出可解析的最终结果。请重新检查这些实体对，只返回最终 JSON 数组，不要分析、解释或使用 Markdown。",
+                        },
+                    ]},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️ 关系描述重试失败: {retry_response.status_code} {retry_response.text[:200]}")
+                    return None
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                try:
+                    parsed = parse_json_array(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️ 关系描述重试结果仍无法解析: {retry_error}")
+                    print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
+                    return None
+        result = {}
+        for item in parsed if isinstance(parsed, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pair_index = int(item.get("pair", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= pair_index < len(pairs):
+                result[pair_index] = {
+                    "verify": str(item.get("verify") or "unrelated").strip().lower(),
+                    "relation": str(item.get("relation") or "").strip(),
+                }
+        return result
+    except Exception as exc:
+        print(f"⚠️ 关系描述调用异常: {exc}")
+        return None

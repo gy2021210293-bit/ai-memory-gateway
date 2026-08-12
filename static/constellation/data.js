@@ -57,9 +57,12 @@ function galaxyForType(type) {
 }
 
 export async function loadUniverse() {
-    const response = await fetch('/api/memories?active_only=true', AUTH());
-    const payload = await response.json();
-    if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+    const [memResponse, relResponse] = await Promise.all([
+        fetch('/api/memories?active_only=true', AUTH()),
+        fetch('/api/entities/relations', AUTH()),
+    ]);
+    const payload = await memResponse.json();
+    if (!memResponse.ok || payload.error) throw new Error(payload.error || `HTTP ${memResponse.status}`);
     const memories = payload.memories || [];
     const fragments = memories.filter(m => Number(m.layer) === 1);
     const events = memories.filter(m => Number(m.layer) === 2);
@@ -86,7 +89,27 @@ export async function loadUniverse() {
         { name: ui.user.name, content: events.length ? `${events.length} 段共同事件记忆` : '共同经历仍在形成' },
         { name: ui.ai.name, content: cores.length ? cores.map(titleOf).join('\n') : '核心记忆仍在形成' },
     ];
+    // 实体间关系 → 桥线：只画两端都是活跃星座的桥（dormant 实体消失后桥自动不画）
     universe.bridges = [];
+    if (relResponse.ok) {
+        try {
+            const relPayload = await relResponse.json();
+            const conIds = new Set(cons.map(c => c.id));
+            (relPayload.relations || []).forEach(rel => {
+                const a = `n${rel.entity_id_a}`;
+                const b = `n${rel.entity_id_b}`;
+                if (!conIds.has(a) || !conIds.has(b)) return;
+                universe.bridges.push({
+                    a,
+                    b,
+                    weight: Math.max(0.4, Math.min(3, Number(rel.shared_count || 1))),
+                    relation: (rel.relation || '').trim(),
+                });
+            });
+        } catch (e) {
+            console.warn('实体关系加载失败，桥线为空:', e);
+        }
+    }
     universe.galaxyBridges = [];
     universe.totalFragments = fragments.length;
     universe.loaded = true;

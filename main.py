@@ -31,10 +31,11 @@ from fastapi.templating import Jinja2Templates
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
+from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, BACKFILL_SNAPSHOT_CHUNK
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -86,6 +87,10 @@ MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 # 特征定时重确认（P3 后台任务）
 TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
 TRAIT_RECHECK_BATCH = int(os.getenv("TRAIT_RECHECK_BATCH", "10"))                   # 每轮最多处理实体数
+
+# 实体间关系发现（P7 后台任务）
+RELATION_RECHECK_INTERVAL_HOURS = int(os.getenv("RELATION_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
+RELATION_BATCH = int(os.getenv("RELATION_BATCH", "10"))                                    # 每轮最多判定的实体对数
 
 # 记忆提取+注入总开关（false时数据库仍连接、消息仍存储，但不提取也不注入记忆）
 MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == "true"
@@ -326,10 +331,21 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"⚠️ 特征定时重确认启动失败: {exc}")
 
+    # P7 实体关系发现（后台调度；仅当记忆系统可用时启动）
+    relation_timer_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            relation_timer_task = asyncio.create_task(_entity_relation_discovery_loop())
+            print(f"🔗 实体关系发现已启动（间隔 {RELATION_RECHECK_INTERVAL_HOURS}h，批量 {RELATION_BATCH}）")
+        except Exception as exc:
+            print(f"⚠️ 实体关系发现启动失败: {exc}")
+
     yield
 
     if trait_timer_task is not None:
         trait_timer_task.cancel()
+    if relation_timer_task is not None:
+        relation_timer_task.cancel()
     await close_pool()
 
 
@@ -443,7 +459,7 @@ def _card_date_is_stale(date_str: str, days: int) -> bool:
     return (datetime.now() - d).days > days
 
 
-def _format_matched_entity_overview(memories: list, user_message: str = "") -> str:
+def _format_matched_entity_overview(memories: list, user_message: str = "", relation_map: dict = None) -> str:
     """Render the matched-entity block from entity cards.
 
     The legacy profile_json (summary / relationship / stable_facts / recent_updates
@@ -456,6 +472,11 @@ def _format_matched_entity_overview(memories: list, user_message: str = "") -> s
     (current-state) snapshot whose fact_date is older than SNAPSHOT_STALE_DAYS is
     labelled "（最后更新于 X，可能已过时）"; ambiguous (non-exact-name) matches
     still label the tail "（不确定是否仍为最新）".
+
+    Entity relationships (P7) render as a `↳ 关联` line right after the card
+    description — only relations whose other end is still active, at most 3, so
+    the AI can follow the thread without the block bloating. `relation_map` comes
+    from the async caller (`relations_of_entity`); None renders no relation lines.
     """
     entities = {}
     for memory in memories:
@@ -487,6 +508,22 @@ def _format_matched_entity_overview(memories: list, user_message: str = "") -> s
         if description:
             header += f"—— {description}"
         lines.append(header)
+        # 注入顺序：实体说明 → 关联实体（仅关联端活跃，≤3 条）→ 长期稳定特征 → 最近状态快照
+        related = []
+        if relation_map:
+            related = [
+                rel for rel in relation_map.get(int(entity["id"]), [])
+                if rel.get("retrieval_status") == "active"
+            ]
+        for rel in related[:3]:
+            rel_name = str(rel.get("name") or "").strip()
+            rel_text = str(rel.get("relation") or "").strip()
+            if not rel_name:
+                continue
+            if rel_text:
+                lines.append(f"  ↳ 关联：{rel_name}（{rel_text}）")
+            else:
+                lines.append(f"  ↳ 关联：{rel_name}")
         # 注入顺序：实体说明 → 长期稳定特征（仅 active，retired/pending/rejected 一律不注入）→ 最近状态快照
         for trait in (card.get("stable_traits") or []):
             if not isinstance(trait, dict) or trait.get("status") != "active":
@@ -559,7 +596,16 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
             memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         memory_text = "\n".join(memory_lines)
-        entity_overview = _format_matched_entity_overview(memories, user_message)
+        # 命中的活跃实体 → 拉取其关联实体（星图桥线同一份数据）注入 "↳ 关联"
+        relation_map = {}
+        try:
+            matched_ids = {entity["id"] for mem in memories for entity in mem.get("matched_entities", [])
+                           if entity.get("retrieval_status") == "active"}
+            if matched_ids:
+                relation_map = await relations_of_entity(list(matched_ids))
+        except Exception as exc:
+            print(f"⚠️ 实体关联读取失败: {exc}")
+        entity_overview = _format_matched_entity_overview(memories, user_message, relation_map)
         entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
         
         cognitive_section = f"\n{cognitive_text}\n" if cognitive_text else ""
@@ -1306,7 +1352,16 @@ async def build_memory_text(user_message: str) -> str:
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
             memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         
-        entity_overview = _format_matched_entity_overview(memories, user_message)
+        # 命中的活跃实体 → 拉取其关联实体（星图桥线同一份数据）注入 "↳ 关联"
+        relation_map = {}
+        try:
+            matched_ids = {entity["id"] for mem in memories for entity in mem.get("matched_entities", [])
+                           if entity.get("retrieval_status") == "active"}
+            if matched_ids:
+                relation_map = await relations_of_entity(list(matched_ids))
+        except Exception as exc:
+            print(f"⚠️ 实体关联读取失败: {exc}")
+        entity_overview = _format_matched_entity_overview(memories, user_message, relation_map)
         entity_block = f"<matched_entities>\n{entity_overview}\n</matched_entities>\n" if entity_overview else ""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
@@ -3110,6 +3165,143 @@ async def _trait_requalify_loop():
             break
         except Exception as exc:
             print(f"⚠️ 特征重确认任务异常: {exc}")
+
+
+# ---- P7 实体间关系发现（后台调度 + 手动触发共用 run_entity_relation_discovery_once）----
+_entity_relation_discovery_lock = asyncio.Lock()
+# 同一实体对最近一次 LLM 判定时间（RELATION_DAYS 冷却用；重启后丢失可接受）
+_relation_judged_at: dict = {}
+
+
+def _relation_key(a_id: int, b_id: int) -> tuple:
+    return (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+
+
+async def run_entity_relation_discovery_once() -> dict:
+    """One entity-relation discovery sweep (P7).
+
+    规则候选（共享事件≥1 或 共享碎片≥2，零 LLM）→ 过滤新增/显著增长的对 →
+    批量 LLM 一句话描述 → 写回。无新对时零 LLM 成本。
+    """
+    if _entity_relation_discovery_lock.locked():
+        return {"status": "already_running", "candidates": 0, "described": 0}
+    async with _entity_relation_discovery_lock:
+        try:
+            candidates = await find_entity_relation_candidates(RELATION_BATCH * 5)
+        except Exception as exc:
+            print(f"⚠️ 实体关系候选扫描失败: {exc}")
+            return {"status": "error", "candidates": 0, "described": 0}
+        if not candidates:
+            return {"status": "noop", "candidates": 0, "described": 0}
+
+        try:
+            existing_rows = await list_entity_relations()
+        except Exception as exc:
+            print(f"⚠️ 读取既有实体关系失败: {exc}")
+            existing_rows = []
+        existing_map = {
+            (row["entity_id_a"], row["entity_id_b"]): row for row in existing_rows
+        }
+
+        now = datetime.now(timezone.utc)
+        fresh = []
+        for row in candidates:
+            a_id, b_id = int(row["a_id"]), int(row["b_id"])
+            key = _relation_key(a_id, b_id)
+            existing = existing_map.get(key)
+            if existing:
+                if row["shared_total"] < (existing["shared_count"] or 0) * _db_module.RELATION_SHARED_GROWTH:
+                    continue  # 共享数没显著增长，不重判
+                last = _relation_judged_at.get(key)
+                if last and (now - last).days < _db_module.RELATION_DAYS:
+                    continue  # 冷却期内不重判
+            fresh.append(row)
+            if len(fresh) >= RELATION_BATCH:
+                break
+
+        if not fresh:
+            return {"status": "noop", "candidates": len(candidates), "described": 0}
+
+        batch = []
+        for row in fresh:
+            try:
+                evidence = await fetch_shared_memory_evidence(int(row["a_id"]), int(row["b_id"]), 2)
+                evidence_texts = [m["content"] for m in evidence]
+            except Exception as exc:
+                print(f"⚠️ 共享记忆读取失败 ({row['a_id']}↔{row['b_id']}): {exc}")
+                evidence_texts = []
+            batch.append({
+                "a_name": row["a_name"], "a_type": row["a_type"],
+                "b_name": row["b_name"], "b_type": row["b_type"],
+                "shared_total": row["shared_total"], "evidence": evidence_texts,
+            })
+
+        verdicts = await describe_entity_relations(batch)
+        if verdicts is None:
+            return {"status": "llm_failed", "candidates": len(candidates), "described": 0}
+
+        described = 0
+        for index, pair_row in enumerate(fresh):
+            verdict = verdicts.get(index)
+            if not verdict or verdict.get("verify") != "ok" or not verdict.get("relation"):
+                continue
+            try:
+                await upsert_entity_relation(
+                    int(pair_row["a_id"]), int(pair_row["b_id"]),
+                    verdict["relation"], int(pair_row["shared_total"]),
+                )
+                described += 1
+            except Exception as exc:
+                print(f"⚠️ 实体关系写库失败 ({pair_row['a_name']}↔{pair_row['b_name']}): {exc}")
+        for pair_row in fresh:
+            _relation_judged_at[_relation_key(int(pair_row["a_id"]), int(pair_row["b_id"]))] = now
+
+        print(f"🔗 实体关系发现: 候选 {len(candidates)} · 判定 {len(fresh)} · 写入 {described}")
+        return {"status": "ok", "candidates": len(candidates), "judged": len(fresh), "described": described}
+
+
+async def _entity_relation_discovery_loop():
+    """Background scheduler: periodically discover entity relationships (P7)."""
+    while True:
+        try:
+            await asyncio.sleep(RELATION_RECHECK_INTERVAL_HOURS * 3600)
+            await run_entity_relation_discovery_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 实体关系发现任务异常: {exc}")
+
+
+@app.get("/api/entities/relations")
+async def api_list_entity_relations():
+    """全部实体关系，供星图桥线与 Dashboard 展示。"""
+    try:
+        relations = await list_entity_relations()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"读取实体关系失败: {exc}"})
+    return {"relations": relations}
+
+
+@app.post("/api/entities/relations/discover")
+async def api_discover_entity_relations():
+    """手动触发一轮实体关系发现（Dashboard 兜底按钮）。"""
+    result = await run_entity_relation_discovery_once()
+    return result
+
+
+@app.delete("/api/entities/relations")
+async def api_delete_entity_relation(request: Request):
+    """手动删除一条实体关系（纠错）。"""
+    params = request.query_params
+    try:
+        a_id = int(params.get("entity_id_a", 0))
+        b_id = int(params.get("entity_id_b", 0))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "entity_id_a/entity_id_b 必须是整数"})
+    if a_id <= 0 or b_id <= 0:
+        return JSONResponse(status_code=400, content={"error": "缺少 entity_id_a/entity_id_b"})
+    await delete_entity_relation(a_id, b_id)
+    return {"status": "ok"}
 
 
 @app.post("/api/entities/merge")
