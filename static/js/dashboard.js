@@ -998,30 +998,40 @@ async function backfillEntities() {
 
 async function discoverEntityRelations() {
     const status = document.getElementById('entity-status');
+    const btn = document.querySelector('button[onclick="discoverEntityRelations()"]');
     if (!confirm('扫描实体间共同出现的记忆（共享事件≥1 或 共享碎片≥2），由记忆模型写一句话关系描述。\n\n无新对时不调用模型，不会有额外消耗。是否继续？')) return;
-    status.textContent = '正在扫描实体关系…';
+    const setStatus = (text, level) => {
+        status.textContent = text;
+        if (level) status.dataset.level = level;
+        else delete status.dataset.level;
+    };
+    setStatus('正在扫描实体关系…');
+    if (btn) btn.disabled = true;
     try {
         const response = await fetch('/api/entities/relations/discover', { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok || data.status === 'error') {
-            status.textContent = (data && data.error) || `请求失败（HTTP ${response.status}）`;
+        const data = await response.json().catch(() => null);
+        console.log('发现实体关系 →', response.status, data);
+        if (!response.ok || !data || data.status === 'error') {
+            setStatus((data && (data.error || data.detail)) || `请求失败（HTTP ${response.status}），请查看后端控制台。`, 'error');
             return;
         }
         if (data.status === 'noop') {
-            status.textContent = data.candidates ? `找到 ${data.candidates} 个候选，但都没有新进展，跳过模型调用。` : '没有新的实体关系候选。';
+            setStatus(data.candidates ? `找到 ${data.candidates} 个候选，但都没有新进展，跳过模型调用。` : '没有新的实体关系候选。');
             return;
         }
         if (data.status === 'already_running') {
-            status.textContent = '已有实体关系发现任务在运行中，请稍候。';
+            setStatus('已有实体关系发现任务在运行中，请稍候。');
             return;
         }
         if (data.status === 'llm_failed') {
-            status.textContent = '候选已找到，但关系描述模型调用失败，请稍后重试。';
+            setStatus('候选已找到，但关系描述模型调用失败，请稍后重试。', 'error');
             return;
         }
-        status.textContent = `发现完成：候选 ${data.candidates} · 判定 ${data.judged || 0} · 写入 ${data.described} 条关系。`;
+        setStatus(`发现完成：候选 ${data.candidates} · 判定 ${data.judged || 0} · 写入 ${data.described} 条关系。`, 'success');
     } catch (e) {
-        status.textContent = `请求异常：${e.message}`;
+        setStatus(`请求异常：${e.message}`, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 

@@ -1616,6 +1616,32 @@ body::after {
     line-height: 1.7;
 }
 
+/* 实体管理区状态栏：独占一行、带底色，避免按钮点了"没反应"的错觉 */
+#entity-status {
+    display: block;
+    flex-basis: 100%;
+    padding: 10px 14px;
+    margin-top: 10px;
+    border-radius: 8px;
+    background: var(--info-bg);
+    color: var(--info);
+    font-size: 0.92em;
+    font-weight: 500;
+    line-height: 1.6;
+    box-shadow: var(--shadow-sm);
+}
+#entity-status:empty {
+    display: none;
+}
+#entity-status[data-level="error"] {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+#entity-status[data-level="success"] {
+    background: var(--success-bg);
+    color: var(--success);
+}
+
 .card,
 .stats-bar,
 .modal-content,
