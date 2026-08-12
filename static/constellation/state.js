@@ -4,7 +4,7 @@
 // 所有转换走本模块函数，渲染层只读 view
 // ========================================
 
-import { conById } from './data.js';
+import { conById } from './data.js?v=6';
 
 export const view = {
     level: 'universe',     // universe | galaxy | constellation | star

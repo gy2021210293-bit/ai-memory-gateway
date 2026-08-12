@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Memory Constellations</title>
-  <link rel="stylesheet" href="/static/constellation/memory.css?v=4">
+  <link rel="stylesheet" href="/static/constellation/memory.css?v=6">
 </head>
 <body>
   <canvas id="bg"></canvas><canvas id="mc"></canvas>
   <div id="breadcrumb"></div>
   <div id="topbar"><span class="tb-title">Memory Universe</span><nav class="galaxy-pills" id="galaxy-pills"></nav><div class="tb-sep"></div><a class="settings-link" href="/dashboard">Dashboard</a><span class="tb-count" id="tb-count">Loading memories…</span></div>
-  <aside id="panel"><button id="panel-close" aria-label="Close">×</button><div class="p-accent"></div><div class="p-cat" id="p-cat"></div><div class="p-title" id="p-title"></div><div class="p-body" id="p-body"></div><div id="p-meta"></div><div class="p-date" id="p-date"></div></aside>
+  <aside id="panel"><button id="panel-close" aria-label="Close">×</button><div class="p-accent"></div><div class="p-cat" id="p-cat"></div><div class="p-title" id="p-title"></div><div class="p-body" id="p-body"></div><div id="p-meta"></div><div class="p-date" id="p-date"></div><div class="p-bridges" id="p-bridges"></div></aside>
   <div id="tt"></div><div id="hint">Scroll to zoom · drag to pan<br>click to dive in · Esc to go back</div>
   <script>
     window.MEMORY_UI_CONFIG = {
@@ -19,6 +19,6 @@
     };
     document.querySelector('.settings-link').href = `/dashboard${window.location.search}`;
   </script>
-  <script type="module" src="/static/constellation/main.js?v=5"></script>
+  <script type="module" src="/static/constellation/main.js?v=7"></script>
 </body>
 </html>

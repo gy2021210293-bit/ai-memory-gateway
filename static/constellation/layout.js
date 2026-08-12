@@ -4,7 +4,7 @@
 // 所有随机量来自 mulberry32(seed)，刷新零抖动
 // ========================================
 
-import { GALAXIES, GALAXY_BY_ID, strHash, mulberry32, consOfGalaxy, universe } from './data.js';
+import { GALAXIES, GALAXY_BY_ID, strHash, mulberry32, consOfGalaxy, universe } from './data.js?v=6';
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 

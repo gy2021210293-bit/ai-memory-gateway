@@ -4,10 +4,10 @@
 // 星云离屏缓存、双星核心、星点/星芒、桥线、相机（pan/zoom/视差）
 // ========================================
 
-import { GALAXIES, universe, hslToRgbStr, GALAXY_BY_ID, strHash, mulberry32 } from './data.js';
-import { layoutUniverse, layoutGalaxy, layoutConstellation, universeBridgeSegments, galaxyBridgeSegments } from './layout.js';
-import { view } from './state.js';
-import { conById } from './data.js';
+import { GALAXIES, universe, hslToRgbStr, GALAXY_BY_ID, strHash, mulberry32 } from './data.js?v=6';
+import { layoutUniverse, layoutGalaxy, layoutConstellation, universeBridgeSegments, galaxyBridgeSegments } from './layout.js?v=6';
+import { view } from './state.js?v=6';
+import { conById } from './data.js?v=6';
 
 let W = 0, H = 0, dpr = 1;
 let bgC, mc, bx, ctx;

@@ -107,8 +107,10 @@ canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
 #panel-close:hover { color: rgba(190, 210, 255, 0.65); }
 
 /* 跨星系桥链接 */
-.p-bridges { margin: 8px 0 4px; }
+.p-bridges { margin: 8px 0 4px; max-height: 150px; overflow-y: auto; scrollbar-width: none; }
+.p-bridges::-webkit-scrollbar { display: none; }
 .p-bridges-label { font-size: 9px; color: rgba(110, 130, 180, 0.38); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 5px; }
+.p-bridge-empty { font-size: 10px; color: rgba(130, 150, 210, 0.3); padding: 2px 4px; }
 .p-bridge-link {
     display: block; width: 100%; text-align: left;
     background: rgba(255, 255, 255, 0.025); border: 1px solid rgba(100, 120, 255, 0.08);
