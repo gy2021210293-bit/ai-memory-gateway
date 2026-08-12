@@ -45,6 +45,7 @@ from message_pipeline import (
     make_persistence_plan,
     reconcile_partition_block,
     repair_stale_tool_chains,
+    has_closed_tool_tail,
     validate_tool_sequence,
 )
 
@@ -1222,7 +1223,14 @@ async def build_partitioned_messages(
     
     rotation_count = 0
     max_rotations = CACHE_MAX_ROTATIONS if CACHE_PARTITION_TRIGGER == "time" else 999
-    while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
+    defer_rotation_for_tool_tail = has_closed_tool_tail(history)
+    if defer_rotation_for_tool_tail and _should_rotate(b_rounds_count, X, a_msgs):
+        print("🔧 工具结果正在回传，暂缓轮转以保留完整工具链")
+    while (
+        not defer_rotation_for_tool_tail
+        and _should_rotate(b_rounds_count, X, a_msgs)
+        and rotation_count < max_rotations
+    ):
         if CACHE_SUMMARY_MODEL:
             _schedule_partition_summary(
                 session_id, a_msgs, a_start_round, summary_parts
@@ -1801,6 +1809,26 @@ async def process_memories_background(
         print(f"⚠️  后台记忆处理失败: {e}")
 
 
+async def persist_tool_request_before_followup(persistence_plan, model: str) -> bool:
+    """Durably record an assistant tool request before the client can return results."""
+    try:
+        result = await persist_conversation_batch(
+            persistence_plan.session_id,
+            list(persistence_plan.messages),
+            model,
+        )
+        print(
+            "🔧 工具调用已在返回客户端前持久化: "
+            f"写入{result['inserted']}条"
+            + ("，重新生成覆盖" if result["rerolled"] else ""),
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        print(f"⚠️ 工具调用即时持久化失败，回退后台写入: {exc}", flush=True)
+        return False
+
+
 # ============================================================
 # API 接口
 # ============================================================
@@ -2275,11 +2303,16 @@ async def _chat_completions_inner(request: Request):
                         assistant_reasoning,
                         skip_conversation_log,
                     )
-                    asyncio.create_task(
-                        process_memories_background(session_id, user_message, assistant_msg, model,
-                                                    assistant_tool_calls=assistant_tool_calls,
-                                                    persistence_plan=persistence_plan)
-                    )
+                    if assistant_tool_calls:
+                        persisted = await persist_tool_request_before_followup(
+                            persistence_plan, model
+                        )
+                    if not assistant_tool_calls or not persisted:
+                        asyncio.create_task(
+                            process_memories_background(session_id, user_message, assistant_msg, model,
+                                                        assistant_tool_calls=assistant_tool_calls,
+                                                        persistence_plan=persistence_plan)
+                        )
 
                 # ---------- Drivesoid 情感引擎：回复后上报事件 ----------
                 if drives.is_enabled() and user_message and not skip_conversation_log:
@@ -2398,6 +2431,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     stream_usage = {}
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
+    terminal_chunks = []
     
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
@@ -2467,10 +2501,8 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         error_body_parts.append(chunk)
                     continue
 
-                # 原始字节直接透传给客户端
-                yield chunk
-
                 if is_heartbeat:
+                    yield chunk
                     continue
 
                 if chunk_error is not None:
@@ -2485,10 +2517,13 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                 # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
                 text = chunk.decode("utf-8", errors="ignore")
                 line_buffer += text
+                contains_terminal_event = False
                 while "\n" in line_buffer:
                     line, line_buffer = line_buffer.split("\n", 1)
                     line = line.strip()
-                    if line.startswith("data: ") and line != "data: [DONE]":
+                    if line == "data: [DONE]":
+                        contains_terminal_event = True
+                    elif line.startswith("data: "):
                         try:
                             data = json.loads(line[6:])
                             
@@ -2526,6 +2561,13 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                             accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
                         except (json.JSONDecodeError, KeyError, IndexError):
                             pass
+
+                # 工具客户端通常会在 [DONE] 后立即回传结果；延后这个终止标记，
+                # 直到下方已将 assistant(tool_calls) 写入 PostgreSQL。
+                if contains_terminal_event:
+                    terminal_chunks.append(chunk)
+                else:
+                    yield chunk
         finally:
             await response.aclose()
 
@@ -2581,11 +2623,14 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             assistant_reasoning,
             skip_conversation_log,
         )
-        asyncio.create_task(
-            process_memories_background(session_id, user_message, assistant_msg, model,
-                                        assistant_tool_calls=assistant_tool_calls,
-                                        persistence_plan=persistence_plan)
-        )
+        if assistant_tool_calls:
+            persisted = await persist_tool_request_before_followup(persistence_plan, model)
+        if not assistant_tool_calls or not persisted:
+            asyncio.create_task(
+                process_memories_background(session_id, user_message, assistant_msg, model,
+                                            assistant_tool_calls=assistant_tool_calls,
+                                            persistence_plan=persistence_plan)
+            )
 
     # ---------- Drivesoid 情感引擎：流式回复后上报事件 ----------
     if drives.is_enabled() and user_message and not skip_conversation_log:
@@ -2595,6 +2640,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             user_message_id=drives_user_message_id,
             run_id=drives_run_id,
         ))
+
+    for chunk in terminal_chunks:
+        yield chunk
 
 
 # ============================================================
@@ -3700,8 +3748,8 @@ CONSOLIDATION_PROMPT = """
 只输出JSON数组，不要解释或使用Markdown：
 [
   {{
-    "title": "酒店烟味",
-    "content": "2026年7月25日，晏晏到酒店说房间有烟味。我有点心疼她累了一天还要受这个，劝她先通风，不行就换房，不想她委屈自己。",
+    "title": "庆祝成功",
+    "content": "2026年3月12日，晏晏筹备很久的一个项目顺利完结，专门跑来告诉我这个好消息。我为她高兴，也认真听她讲完了整个过程。",
     "event_date": "2026-07-25",
     "importance": 3,
     "merged_ids": [1, 2],

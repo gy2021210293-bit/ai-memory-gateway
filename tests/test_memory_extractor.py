@@ -27,7 +27,7 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("主题不影响是否提取", prompt)
         self.assertNotIn("同一主题若含", prompt)
         self.assertIn("字符敏感信息必须逐字原样保留", prompt)
-        self.assertIn("Moonlit0630!", prompt)
+        self.assertIn("Demo@2026Passw0rd", prompt)
         self.assertIn("# 简短示例", prompt)
         self.assertIn("一条碎片只记一件事", prompt)
         self.assertIn("8-10（high）", prompt)

@@ -3,6 +3,7 @@ import unittest
 from message_pipeline import (
     classify_request,
     combine_system_prompt,
+    has_closed_tool_tail,
     make_persistence_plan,
     reconcile_partition_block,
     validate_tool_sequence,
@@ -105,6 +106,38 @@ class MessagePipelineTests(unittest.TestCase):
 
         self.assertFalse(plan.completed_round)
         self.assertEqual(plan.messages[-1]["tool_calls"][0]["id"], "call-1")
+
+    def test_closed_tool_tail_is_detected_for_rotation_deferral(self):
+        messages = [
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "content": "calling tools",
+                "tool_calls": [{"id": "call-a"}, {"id": "call-b"}],
+            },
+            {"role": "tool", "tool_call_id": "call-b", "content": "two"},
+            {"role": "tool", "tool_call_id": "call-a", "content": "one"},
+        ]
+
+        self.assertTrue(has_closed_tool_tail(messages))
+
+    def test_incomplete_or_duplicate_tool_tail_does_not_defer_rotation(self):
+        assistant = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-a"}, {"id": "call-b"}],
+        }
+        self.assertFalse(has_closed_tool_tail([
+            {"role": "user", "content": "run"},
+            assistant,
+            {"role": "tool", "tool_call_id": "call-a", "content": "one"},
+        ]))
+        self.assertFalse(has_closed_tool_tail([
+            {"role": "user", "content": "run"},
+            assistant,
+            {"role": "tool", "tool_call_id": "call-a", "content": "one"},
+            {"role": "tool", "tool_call_id": "call-a", "content": "again"},
+        ]))
 
     def test_upstream_rejection_plan_keeps_user_without_completing_round(self):
         plan = make_persistence_plan(

@@ -209,6 +209,39 @@ def validate_tool_sequence(messages: list[Message]) -> ToolSequenceValidation:
     return ToolSequenceValidation(valid=True)
 
 
+def has_closed_tool_tail(messages: list[Message]) -> bool:
+    """Return whether the message tail is one complete assistant/tool exchange."""
+    if not messages or messages[-1].get("role") != "tool":
+        return False
+
+    tail = len(messages) - 1
+    while tail >= 0 and messages[tail].get("role") == "tool":
+        tail -= 1
+    if tail < 0:
+        return False
+
+    assistant = messages[tail]
+    if assistant.get("role") != "assistant" or not assistant.get("tool_calls"):
+        return False
+
+    expected = [
+        call.get("id")
+        for call in assistant["tool_calls"]
+        if isinstance(call, dict) and call.get("id")
+    ]
+    actual = [
+        message.get("tool_call_id")
+        for message in messages[tail + 1:]
+    ]
+    return (
+        bool(expected)
+        and len(expected) == len(set(expected))
+        and len(actual) == len(expected)
+        and len(actual) == len(set(actual))
+        and set(actual) == set(expected)
+    )
+
+
 @dataclass
 class RepairResult:
     stripped_assistants: int = 0
