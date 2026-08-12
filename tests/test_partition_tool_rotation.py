@@ -147,6 +147,24 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.httpx.AsyncClient = original_client
 
+    async def test_stream_ignores_empty_choices_statistic_event(self):
+        original_client = main.httpx.AsyncClient
+        _FakeAsyncClient.response = _FakeResponse([
+            b'data: {"id":"stats","choices":[],"cost":"0"}\n\n',
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        main.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            stream = main.stream_and_capture({}, {"stream": True}, "session", "", "model")
+            self.assertEqual(await anext(stream), b": keep-alive\n\n")
+            self.assertIn(b'"choices":[]', await anext(stream))
+            self.assertIn(b'"content":"ok"', await anext(stream))
+            self.assertEqual(await anext(stream), b"data: [DONE]\n\n")
+            await stream.aclose()
+        finally:
+            main.httpx.AsyncClient = original_client
+
 
 if __name__ == "__main__":
     unittest.main()

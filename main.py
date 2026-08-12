@@ -2607,7 +2607,17 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         if "usage" in data:
                             stream_usage = data["usage"]
 
-                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        choices = data.get("choices")
+                        first_choice = (
+                            choices[0]
+                            if isinstance(choices, list) and choices
+                            else {}
+                        )
+                        delta = (
+                            first_choice.get("delta", {})
+                            if isinstance(first_choice, dict)
+                            else {}
+                        )
                         content = delta.get("content", "")
                         if content:
                             full_response.append(content)
