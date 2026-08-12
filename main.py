@@ -2399,6 +2399,83 @@ def _upstream_http_error_event(status_code: int, raw_body: str) -> bytes:
     return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
 
 
+class UpstreamSSEFormatError(ValueError):
+    """The upstream did not produce one valid OpenAI-style SSE event."""
+
+
+def _pop_sse_event(buffer: bytearray) -> bytes | None:
+    """Remove one complete SSE event from a raw byte buffer."""
+    delimiters = [
+        (index, 2)
+        for index in (buffer.find(b"\n\n"),)
+        if index >= 0
+    ] + [
+        (index, 4)
+        for index in (buffer.find(b"\r\n\r\n"),)
+        if index >= 0
+    ]
+    if not delimiters:
+        return None
+    index, length = min(delimiters)
+    event = bytes(buffer[:index])
+    del buffer[:index + length]
+    return event
+
+
+def _normalize_upstream_sse_event(event: bytes) -> tuple[bytes, dict | None]:
+    """Validate and canonicalize one SSE event before it reaches the client."""
+    try:
+        lines = event.decode("utf-8").replace("\r\n", "\n").split("\n")
+    except UnicodeDecodeError as exc:
+        raise UpstreamSSEFormatError("non_utf8_event") from exc
+
+    headers = []
+    data_lines = []
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith(":"):
+            headers.append(line)
+            continue
+        if ":" not in line:
+            raise UpstreamSSEFormatError("invalid_sse_line")
+        field, value = line.split(":", 1)
+        value = value[1:] if value.startswith(" ") else value
+        if field == "data":
+            data_lines.append(value)
+        else:
+            headers.append(line)
+
+    if not data_lines:
+        return ("\n".join(headers) + "\n\n").encode("utf-8"), None
+
+    payload = "\n".join(data_lines)
+    if payload == "[DONE]":
+        return b"data: [DONE]\n\n", None
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise UpstreamSSEFormatError("invalid_json_data") from exc
+    if not isinstance(decoded, dict):
+        raise UpstreamSSEFormatError("non_object_json_data")
+
+    prefix = "\n".join(headers)
+    if prefix:
+        prefix += "\n"
+    return f"{prefix}data: {payload}\n\n".encode("utf-8"), decoded
+
+
+def _upstream_malformed_sse_event(reason: str) -> bytes:
+    error_payload = {
+        "error": {
+            "message": "Upstream emitted a malformed SSE event",
+            "type": "upstream_malformed_sse",
+            "code": reason,
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
 async def safe_stream_and_capture(*args, **kwargs):
     """Keep transport failures inside the already-started SSE response."""
     session_id = args[2] if len(args) > 2 else kwargs.get("session_id", "")
@@ -2429,9 +2506,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     full_response = []
     full_reasoning = []
     stream_usage = {}
-    line_buffer = ""
+    upstream_sse_buffer = bytearray()
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
-    terminal_chunks = []
+    deferred_tool_events = []
     
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
@@ -2514,60 +2591,56 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                     )
                     continue
                 
-                # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
-                text = chunk.decode("utf-8", errors="ignore")
-                line_buffer += text
-                contains_terminal_event = False
-                while "\n" in line_buffer:
-                    line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if line == "data: [DONE]":
-                        contains_terminal_event = True
-                    elif line.startswith("data: "):
-                        try:
-                            data = json.loads(line[6:])
-                            
-                            if "usage" in data:
-                                stream_usage = data["usage"]
-                            
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_response.append(content)
-                            
-                            # 收集reasoning_content（deepseek thinking mode）
-                            reasoning = delta.get("reasoning_content", "")
-                            if reasoning:
-                                full_reasoning.append(reasoning)
-                            
-                            # 累积tool_calls
-                            if "tool_calls" in delta:
-                                for tc in delta["tool_calls"]:
-                                    idx = tc.get("index", 0)
-                                    if idx not in accumulated_tool_calls:
-                                        accumulated_tool_calls[idx] = {
-                                            "index": idx,
-                                            "id": tc.get("id", ""),
-                                            "type": tc.get("type", "function"),
-                                            "function": {"name": "", "arguments": ""}
-                                        }
-                                    if tc.get("id"):
-                                        accumulated_tool_calls[idx]["id"] = tc["id"]
-                                    if "function" in tc:
-                                        fn = tc["function"]
-                                        if fn.get("name"):
-                                            accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
-                                        if "arguments" in fn:
-                                            accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
+                upstream_sse_buffer.extend(chunk)
+                while (event := _pop_sse_event(upstream_sse_buffer)) is not None:
+                    try:
+                        forwarded_event, data = _normalize_upstream_sse_event(event)
+                    except UpstreamSSEFormatError as exc:
+                        print(
+                            f"❌ 上游 SSE 格式错误: session={session_id}, reason={exc}",
+                            flush=True,
+                        )
+                        yield _upstream_malformed_sse_event(str(exc))
+                        return
 
-                # 工具客户端通常会在 [DONE] 后立即回传结果；延后这个终止标记，
-                # 直到下方已将 assistant(tool_calls) 写入 PostgreSQL。
-                if contains_terminal_event:
-                    terminal_chunks.append(chunk)
-                else:
-                    yield chunk
+                    if data is not None:
+                        if "usage" in data:
+                            stream_usage = data["usage"]
+
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            full_response.append(content)
+
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning:
+                            full_reasoning.append(reasoning)
+
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index", 0)
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {
+                                        "index": idx,
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {"name": "", "arguments": ""}
+                                    }
+                                if tc.get("id"):
+                                    accumulated_tool_calls[idx]["id"] = tc["id"]
+                                if "function" in tc:
+                                    fn = tc["function"]
+                                    if fn.get("name"):
+                                        accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
+                                    if "arguments" in fn:
+                                        accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+                    # 工具客户端可能在 tool_calls / finish_reason=tool_calls 时立即回传。
+                    # 因此从第一个工具调用事件起，等 PostgreSQL 持久化完成再交付。
+                    if accumulated_tool_calls:
+                        deferred_tool_events.append(forwarded_event)
+                    else:
+                        yield forwarded_event
         finally:
             await response.aclose()
 
@@ -2641,8 +2714,13 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             run_id=drives_run_id,
         ))
 
-    for chunk in terminal_chunks:
-        yield chunk
+    if upstream_sse_buffer.strip():
+        print(f"❌ 上游 SSE 在事件边界前结束: session={session_id}", flush=True)
+        yield _upstream_malformed_sse_event("truncated_event")
+        return
+
+    for event in deferred_tool_events:
+        yield event
 
 
 # ============================================================
