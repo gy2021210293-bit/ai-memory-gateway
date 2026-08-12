@@ -431,6 +431,7 @@ async def init_tables():
                 normalized_name TEXT NOT NULL UNIQUE,
                 entity_type     TEXT NOT NULL DEFAULT 'other',
                 description     TEXT DEFAULT '',
+                last_referenced_at TIMESTAMPTZ DEFAULT NULL,
                 created_at      TIMESTAMPTZ DEFAULT NOW(),
                 updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
@@ -500,8 +501,15 @@ async def init_tables():
                     ALTER TABLE entities ADD COLUMN status_override TEXT DEFAULT NULL
                         CHECK (status_override IN ('active', 'candidate'));
                 END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entities' AND column_name = 'last_referenced_at'
+                ) THEN
+                    ALTER TABLE entities ADD COLUMN last_referenced_at TIMESTAMPTZ DEFAULT NULL;
+                END IF;
             END $$;
         """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_last_referenced_at ON entities (last_referenced_at);")
 
         # ---- 轻量实体卡：人工说明 + 状态快照演化 ----
         await conn.execute("""
@@ -604,9 +612,25 @@ async def init_tables():
                 entity_id_b   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
                 relation      TEXT NOT NULL DEFAULT '',
                 shared_count  INTEGER NOT NULL DEFAULT 0,
+                relation_source TEXT NOT NULL DEFAULT 'discovered',
+                is_suppressed BOOLEAN NOT NULL DEFAULT FALSE,
                 updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE (entity_id_a, entity_id_b)
             );
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name = 'entity_relations' AND column_name = 'relation_source') THEN
+                    ALTER TABLE entity_relations
+                    ADD COLUMN relation_source TEXT NOT NULL DEFAULT 'discovered';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name = 'entity_relations' AND column_name = 'is_suppressed') THEN
+                    ALTER TABLE entity_relations
+                    ADD COLUMN is_suppressed BOOLEAN NOT NULL DEFAULT FALSE;
+                END IF;
+            END $$;
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_entity_relations_entity_a ON entity_relations (entity_id_a);
@@ -1293,7 +1317,7 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
             SELECT m.id, m.content, m.importance, m.created_at, m.layer, m.title,
                    e.id AS entity_id, e.name AS entity_name, e.normalized_name,
                    e.entity_type, e.description, e.profile_json, e.entity_card_json,
-                   e.evidence_count, e.status_override, me.confidence,
+                   e.evidence_count, e.status_override, e.last_referenced_at, me.confidence,
                    (SELECT MAX(m2.created_at) FROM memory_entities me2
                     JOIN memories m2 ON m2.id = me2.memory_id
                     WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
@@ -1358,7 +1382,9 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
         )
         SELECT * FROM ranked
         WHERE entity_rank <= 3
-          AND (last_evidence_at IS NULL OR last_evidence_at >= now() - make_interval(days => $5::int))
+          AND (last_evidence_at IS NULL
+               OR last_evidence_at >= now() - make_interval(days => $5::int)
+               OR last_referenced_at >= now() - make_interval(days => $5::int))
         ORDER BY importance DESC, created_at DESC
         LIMIT $4
     """, terms, normalized_query, ENTITY_ACTIVE_EVIDENCE_THRESHOLD, max(limit * 10, 30), ENTITY_DORMANT_DAYS)
@@ -1380,6 +1406,7 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
             "evidence_count": row.get("evidence_count", 0),
             "status_override": row.get("status_override"),
             "last_evidence_at": row.get("last_evidence_at"),
+            "last_referenced_at": row.get("last_referenced_at"),
             "exact_name_match": bool(exact),
         })
         item = candidates.setdefault(row["id"], {
@@ -1393,6 +1420,81 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
     return candidates
 
 
+async def find_directly_mentioned_entities(query: str) -> list:
+    """Return every eligible entity explicitly named in ``query`` and refresh its activity window.
+
+    This is deliberately independent of memory ranking: entity cards are context
+    anchors, while ``search_memories`` remains responsible for choosing evidence.
+    Candidate entities stay excluded; dormant eligible entities are revived by the
+    direct reference without creating a new memory or increasing evidence.
+    """
+    normalized_query = normalize_entity_name(query)
+    if not normalized_query:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.name, e.normalized_name, e.entity_type, e.description,
+                   e.profile_json, e.entity_card_json, e.evidence_count,
+                   e.status_override, e.last_referenced_at,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = e.id AND m2.is_active = TRUE
+                      AND me2.source <> 'inherited') AS last_evidence_at,
+                   COALESCE(array_agg(DISTINCT ea.alias)
+                       FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
+                   COALESCE(array_agg(DISTINCT ea.normalized_alias)
+                       FILTER (WHERE ea.normalized_alias IS NOT NULL), ARRAY[]::text[]) AS normalized_aliases
+            FROM entities e
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            WHERE (
+                e.status_override = 'active'
+                OR (e.status_override IS NULL
+                    AND (e.profile_json IS NOT NULL OR e.evidence_count >= $2))
+            )
+              AND (
+                  (char_length(replace(e.normalized_name, ' ', '')) >=
+                       CASE WHEN octet_length(e.normalized_name) > char_length(e.normalized_name) THEN 2 ELSE 3 END
+                   AND position(e.normalized_name IN $1) > 0)
+                  OR
+                  (char_length(replace(ea.normalized_alias, ' ', '')) >=
+                       CASE WHEN octet_length(ea.normalized_alias) > char_length(ea.normalized_alias) THEN 2 ELSE 3 END
+                   AND position(ea.normalized_alias IN $1) > 0)
+              )
+            GROUP BY e.id
+            ORDER BY e.name
+        """, normalized_query, ENTITY_ACTIVE_EVIDENCE_THRESHOLD)
+
+        entities = []
+        for row in rows:
+            names = [row["normalized_name"], *(row["normalized_aliases"] or [])]
+            exact, phrase = False, False
+            for name in names:
+                name_exact, name_phrase = _entity_name_matches_query(name, normalized_query, [normalized_query])
+                exact = exact or name_exact
+                phrase = phrase or name_phrase
+            if not exact and not phrase:
+                continue
+            if attach_entity_lifecycle(dict(row)).get("retrieval_status") == "candidate":
+                continue
+            entities.append(dict(row))
+
+        if not entities:
+            return []
+        ids = [int(entity["id"]) for entity in entities]
+        await conn.execute(
+            "UPDATE entities SET last_referenced_at = NOW(), updated_at = NOW() WHERE id = ANY($1::int[])",
+            ids,
+        )
+
+    referenced_at = datetime.now(dt_timezone.utc)
+    return [attach_entity_lifecycle({
+        **entity,
+        "last_referenced_at": referenced_at,
+        "exact_name_match": True,
+    }) for entity in entities]
+
+
 async def _attach_entity_context(conn, results: list):
     """Attach all linked entities while preserving which entities caused recall."""
     if not results:
@@ -1400,7 +1502,7 @@ async def _attach_entity_context(conn, results: list):
     ids = [int(result["id"]) for result in results]
     rows = await conn.fetch("""
         SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description, e.profile_json,
-               e.entity_card_json, e.evidence_count, e.status_override,
+               e.entity_card_json, e.evidence_count, e.status_override, e.last_referenced_at,
                (SELECT MAX(m2.created_at) FROM memory_entities me2
                 JOIN memories m2 ON m2.id = me2.memory_id
                 WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
@@ -1423,6 +1525,7 @@ async def _attach_entity_context(conn, results: list):
             "evidence_count": row["evidence_count"],
             "status_override": row["status_override"],
             "last_evidence_at": row.get("last_evidence_at"),
+            "last_referenced_at": row.get("last_referenced_at"),
             "confidence": row["confidence"],
         }))
     for result in results:
@@ -3022,34 +3125,38 @@ ENTITY_TYPES = {"person", "place", "organization", "project", "object", "pet", "
 
 
 def _entity_is_recent(value: dict) -> bool:
-    """True when the entity's last evidence falls within ENTITY_DORMANT_DAYS.
+    """True when evidence or a direct reference falls within ENTITY_DORMANT_DAYS.
 
     No usable recency signal (NULL / unparseable / missing field) counts as
     recent so we never mis-sleep an entity we simply lack timing for. This is the
     single recency predicate that MUST stay in sync with the recall SQL in
     `_fetch_entity_search_candidates` (both gate entity recall identically).
     """
-    last = value.get("last_evidence_at")
-    if not last:
+    timestamps = []
+    for raw in (value.get("last_evidence_at"), value.get("last_referenced_at")):
+        if not raw:
+            continue
+        try:
+            last = datetime.fromisoformat(str(raw).replace("Z", "+00:00")) if isinstance(raw, str) else raw
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=dt_timezone.utc)
+            timestamps.append(last)
+        except Exception:
+            continue
+    if not timestamps:
         return True
-    try:
-        if isinstance(last, str):
-            last = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=dt_timezone.utc)
-        age_days = (datetime.now(dt_timezone.utc) - last).total_seconds() / 86400.0
-        return age_days <= ENTITY_DORMANT_DAYS
-    except Exception:
-        return True
+    last = max(timestamps)
+    age_days = (datetime.now(dt_timezone.utc) - last).total_seconds() / 86400.0
+    return age_days <= ENTITY_DORMANT_DAYS
 
 
 def attach_entity_lifecycle(entity: dict) -> dict:
     """Attach the effective retrieval status to one entity row.
 
     Dormancy applies to every eligible entity with no exemption (manual override
-    and legacy profile included): once `last_evidence_at` is older than
-    ENTITY_DORMANT_DAYS the entity is derived `dormant` and excluded from recall
-    until a new memory links it again.
+    and legacy profile included): once both the last evidence and direct reference
+    are older than ENTITY_DORMANT_DAYS the entity is derived `dormant` and excluded
+    from recall until a new memory links it or the user names it again.
     """
     value = dict(entity)
     evidence_count = max(0, int(value.get("evidence_count") or 0))
@@ -3407,17 +3514,20 @@ def _norm_pair_ids(a_id, b_id) -> tuple:
 
 
 async def upsert_entity_relation(a_id: int, b_id: int, relation: str, shared_count: int) -> None:
-    """写入或更新一条实体关系。无向：调用方无需关心 id 顺序。"""
+    """写入自动发现的实体关系，不覆盖人工修改或已忽略项。"""
     a, b = _norm_pair_ids(a_id, b_id)
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO entity_relations (entity_id_a, entity_id_b, relation, shared_count, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO entity_relations
+                (entity_id_a, entity_id_b, relation, shared_count, relation_source, is_suppressed, updated_at)
+            VALUES ($1, $2, $3, $4, 'discovered', FALSE, NOW())
             ON CONFLICT (entity_id_a, entity_id_b) DO UPDATE SET
                 relation = EXCLUDED.relation,
                 shared_count = EXCLUDED.shared_count,
                 updated_at = NOW()
+            WHERE entity_relations.relation_source = 'discovered'
+              AND entity_relations.is_suppressed = FALSE
         """, a, b, relation or "", max(0, int(shared_count or 0)))
 
 
@@ -3432,23 +3542,25 @@ async def delete_entity_relation(a_id: int, b_id: int) -> None:
         )
 
 
-async def list_entity_relations() -> list:
-    """全部实体关系（带两端名称/类型），供星图桥线与 Dashboard 展示。"""
+async def list_entity_relations(include_suppressed: bool = False) -> list:
+    """全部实体关系；普通展示默认隐藏人工忽略的关系。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT r.id, r.entity_id_a, r.entity_id_b, r.relation, r.shared_count, r.updated_at,
+            SELECT r.id, r.entity_id_a, r.entity_id_b, r.relation, r.shared_count,
+                   r.relation_source, r.is_suppressed, r.updated_at,
                    ea.name AS a_name, ea.entity_type AS a_type,
                    eb.name AS b_name, eb.entity_type AS b_type
             FROM entity_relations r
             JOIN entities ea ON ea.id = r.entity_id_a
             JOIN entities eb ON eb.id = r.entity_id_b
+            WHERE NOT r.is_suppressed OR $1
             ORDER BY r.shared_count DESC, r.updated_at DESC
-        """)
+        """, bool(include_suppressed))
     return [dict(row) for row in rows]
 
 
-async def relations_of_entity(entity_ids: list) -> dict:
+async def relations_of_entity(entity_ids: list, include_suppressed: bool = False) -> dict:
     """给定一组实体 id，返回每个实体的关联清单。
 
     Result: {entity_id: [{"entity_id": other, "name", "type", "relation", "shared_count",
@@ -3462,10 +3574,15 @@ async def relations_of_entity(entity_ids: list) -> dict:
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT r.entity_id_a, r.entity_id_b, r.relation, r.shared_count,
+                   r.relation_source, r.is_suppressed,
                    ea.id AS a_id, ea.name AS a_name, ea.entity_type AS a_type,
+                   ea.description AS a_description, ea.entity_card_json AS a_card,
                    ea.evidence_count AS a_evidence, ea.status_override AS a_override,
+                   ea.last_referenced_at AS a_last_referenced,
                    eb.id AS b_id, eb.name AS b_name, eb.entity_type AS b_type,
+                   eb.description AS b_description, eb.entity_card_json AS b_card,
                    eb.evidence_count AS b_evidence, eb.status_override AS b_override,
+                   eb.last_referenced_at AS b_last_referenced,
                    (SELECT MAX(m2.created_at) FROM memory_entities me2
                     JOIN memories m2 ON m2.id = me2.memory_id
                     WHERE me2.entity_id = ea.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS a_last_evidence,
@@ -3475,9 +3592,10 @@ async def relations_of_entity(entity_ids: list) -> dict:
             FROM entity_relations r
             JOIN entities ea ON ea.id = r.entity_id_a
             JOIN entities eb ON eb.id = r.entity_id_b
-            WHERE r.entity_id_a = ANY($1::int[]) OR r.entity_id_b = ANY($1::int[])
+            WHERE (r.entity_id_a = ANY($1::int[]) OR r.entity_id_b = ANY($1::int[]))
+              AND (NOT r.is_suppressed OR $2)
             ORDER BY r.shared_count DESC, r.updated_at DESC
-        """, ids)
+        """, ids, bool(include_suppressed))
     result = {}
     for row in rows:
         a_id = int(row["entity_id_a"])
@@ -3485,20 +3603,97 @@ async def relations_of_entity(entity_ids: list) -> dict:
         a_life = attach_entity_lifecycle({
             "id": a_id, "evidence_count": row["a_evidence"],
             "status_override": row["a_override"], "last_evidence_at": row["a_last_evidence"],
+            "last_referenced_at": row.get("a_last_referenced"),
         })
         b_life = attach_entity_lifecycle({
             "id": b_id, "evidence_count": row["b_evidence"],
             "status_override": row["b_override"], "last_evidence_at": row["b_last_evidence"],
+            "last_referenced_at": row.get("b_last_referenced"),
         })
         entry_a = {"entity_id": b_id, "name": row["b_name"], "type": row["b_type"],
-                   "relation": row["relation"] or "", "shared_count": row["shared_count"],
-                   "retrieval_status": b_life["retrieval_status"]}
+                    "relation": row["relation"] or "", "shared_count": row["shared_count"],
+                    "relation_source": row["relation_source"], "is_suppressed": row["is_suppressed"],
+                   "retrieval_status": b_life["retrieval_status"],
+                   "description": row.get("b_description") or "",
+                   "entity_card_json": row.get("b_card")}
         entry_b = {"entity_id": a_id, "name": row["a_name"], "type": row["a_type"],
-                   "relation": row["relation"] or "", "shared_count": row["shared_count"],
-                   "retrieval_status": a_life["retrieval_status"]}
+                    "relation": row["relation"] or "", "shared_count": row["shared_count"],
+                    "relation_source": row["relation_source"], "is_suppressed": row["is_suppressed"],
+                   "retrieval_status": a_life["retrieval_status"],
+                   "description": row.get("a_description") or "",
+                   "entity_card_json": row.get("a_card")}
         result.setdefault(a_id, []).append(entry_a)
         result.setdefault(b_id, []).append(entry_b)
     return result
+
+
+def normalize_entity_relation_text(value) -> str:
+    relation = re.sub(r"\s+", " ", str(value or "").strip())
+    if not relation:
+        raise ValueError("关系描述不能为空")
+    if len(relation) > 120:
+        raise ValueError("关系描述不能超过 120 个字符")
+    return relation
+
+
+async def save_manual_entity_relation(a_id: int, b_id: int, relation: str) -> dict:
+    """新增或人工修正一条无向关系，并让人工结果优先于自动发现。"""
+    a, b = _norm_pair_ids(a_id, b_id)
+    if a == b:
+        return {"error": "不能关联实体自身"}
+    relation = normalize_entity_relation_text(relation)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM entities WHERE id = ANY($1::int[])", [a, b])
+        if int(count or 0) != 2:
+            return {"error": "关联实体不存在"}
+        row = await conn.fetchrow("""
+            INSERT INTO entity_relations
+                (entity_id_a, entity_id_b, relation, shared_count, relation_source, is_suppressed, updated_at)
+            VALUES ($1, $2, $3, 0, 'manual', FALSE, NOW())
+            ON CONFLICT (entity_id_a, entity_id_b) DO UPDATE SET
+                relation = EXCLUDED.relation,
+                relation_source = 'manual',
+                is_suppressed = FALSE,
+                updated_at = NOW()
+            RETURNING id, entity_id_a, entity_id_b, relation, shared_count,
+                      relation_source, is_suppressed, updated_at
+        """, a, b, relation)
+    return {"status": "ok", "relation": dict(row)}
+
+
+async def suppress_entity_relation(a_id: int, b_id: int) -> dict:
+    """隐藏一条关系并阻止后续自动发现重新写入。"""
+    a, b = _norm_pair_ids(a_id, b_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE entity_relations
+            SET is_suppressed = TRUE, updated_at = NOW()
+            WHERE entity_id_a = $1 AND entity_id_b = $2
+            RETURNING id, entity_id_a, entity_id_b, relation, shared_count,
+                      relation_source, is_suppressed, updated_at
+        """, a, b)
+    if not row:
+        return {"error": "实体关系不存在"}
+    return {"status": "ok", "relation": dict(row)}
+
+
+async def restore_entity_relation(a_id: int, b_id: int) -> dict:
+    """恢复一个被忽略的关系，并将其视为人工确认。"""
+    a, b = _norm_pair_ids(a_id, b_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE entity_relations
+            SET is_suppressed = FALSE, relation_source = 'manual', updated_at = NOW()
+            WHERE entity_id_a = $1 AND entity_id_b = $2 AND is_suppressed = TRUE
+            RETURNING id, entity_id_a, entity_id_b, relation, shared_count,
+                      relation_source, is_suppressed, updated_at
+        """, a, b)
+    if not row:
+        return {"error": "已忽略的实体关系不存在"}
+    return {"status": "ok", "relation": dict(row)}
 
 
 async def find_entity_relation_candidates(limit: int = 50) -> list:
@@ -3528,7 +3723,8 @@ async def find_entity_relation_candidates(limit: int = 50) -> list:
             SELECT pc.a_id, pc.b_id, pc.shared_total, pc.shared_events, pc.shared_fragments,
                    ea.name AS a_name, ea.entity_type AS a_type, ea.evidence_count AS a_evidence,
                    eb.name AS b_name, eb.entity_type AS b_type, eb.evidence_count AS b_evidence,
-                   ea.status_override AS a_override, eb.status_override AS b_override,
+                   ea.status_override AS a_override, ea.last_referenced_at AS a_last_referenced,
+                   eb.status_override AS b_override, eb.last_referenced_at AS b_last_referenced,
                    ea.profile_json IS NOT NULL AS a_has_profile, eb.profile_json IS NOT NULL AS b_has_profile,
                    (SELECT MAX(m2.created_at) FROM memory_entities me2
                     JOIN memories m2 ON m2.id = me2.memory_id
@@ -3556,9 +3752,9 @@ async def find_entity_relation_candidates(limit: int = 50) -> list:
     candidates = []
     for row in rows:
         # 休眠闸门：任一实体最近证据过旧则本轮跳过（与 recall 的 dormancy 一致）
-        if not _entity_is_recent({"last_evidence_at": row["a_last_evidence"]}):
+        if not _entity_is_recent({"last_evidence_at": row["a_last_evidence"], "last_referenced_at": row.get("a_last_referenced")}):
             continue
-        if not _entity_is_recent({"last_evidence_at": row["b_last_evidence"]}):
+        if not _entity_is_recent({"last_evidence_at": row["b_last_evidence"], "last_referenced_at": row.get("b_last_referenced")}):
             continue
         candidates.append(dict(row))
     return candidates
@@ -3615,7 +3811,7 @@ async def list_entities():
             SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
                    e.entity_card_json, e.entity_card_updated_at,
-                   e.evidence_count, e.status_override, e.created_at, e.updated_at,
+                   e.evidence_count, e.status_override, e.last_referenced_at, e.created_at, e.updated_at,
                    (SELECT MAX(m2.created_at) FROM memory_entities me2
                     JOIN memories m2 ON m2.id = me2.memory_id
                     WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
@@ -3821,7 +4017,7 @@ async def get_entity_detail(entity_id: int):
             SELECT e.id, e.name, e.entity_type, e.description, e.profile_json,
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
                    e.entity_card_json, e.entity_card_updated_at,
-                   e.evidence_count, e.status_override,
+                   e.evidence_count, e.status_override, e.last_referenced_at,
                    (SELECT MAX(m2.created_at) FROM memory_entities me2
                     JOIN memories m2 ON m2.id = me2.memory_id
                     WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,

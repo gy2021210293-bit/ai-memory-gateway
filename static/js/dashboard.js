@@ -57,6 +57,7 @@ let allEntities = [];
 let selectedEntity = null;
 let pendingEntityProfile = null;
 let selectedEntityMemoryIds = new Set();
+let entityRelationEditingOtherId = null;
 
 async function loadEntities() {
     const status = document.getElementById('entity-status');
@@ -72,6 +73,187 @@ async function loadEntities() {
         status.textContent = `${allEntities.length} 个实体 · ${activeCount} 个活跃 · ${allEntities.length - activeCount} 个候选`;
     } catch (error) {
         status.textContent = error.message;
+    }
+}
+
+function populateEntityRelationOptions() {
+    const select = document.getElementById('entity-relation-other');
+    if (!select || !selectedEntity) return;
+    const selectedId = Number(select.value) || entityRelationEditingOtherId || 0;
+    select.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '选择关联实体';
+    select.appendChild(placeholder);
+    allEntities.filter(entity => entity.id !== selectedEntity.id).forEach(entity => {
+        const option = document.createElement('option');
+        option.value = entity.id;
+        option.textContent = `${entity.name}（${entity.entity_type || 'other'}）`;
+        option.selected = entity.id === selectedId;
+        select.appendChild(option);
+    });
+}
+
+function setEntityRelationFeedback(message = '') {
+    const feedback = document.getElementById('entity-relation-feedback');
+    if (feedback) feedback.textContent = message;
+}
+
+function renderEntityRelations(relations) {
+    const list = document.getElementById('entity-relations-list');
+    if (!list) return;
+    list.replaceChildren();
+    const visible = (relations || []).filter(item => !item.is_suppressed);
+    const suppressed = (relations || []).filter(item => item.is_suppressed);
+    if (!visible.length) {
+        const empty = document.createElement('p');
+        empty.className = 'section-desc';
+        empty.textContent = '暂无可见关联。可手动新增，或从自动发现结果中修正。';
+        list.appendChild(empty);
+    }
+    const appendRelation = (item, isSuppressed) => {
+        const row = document.createElement('div');
+        row.className = `entity-relation-item${isSuppressed ? ' is-suppressed' : ''}`;
+        const body = document.createElement('div');
+        const title = document.createElement('strong');
+        title.textContent = item.name;
+        const text = document.createElement('span');
+        text.className = 'entity-relation-text';
+        text.textContent = item.relation;
+        const meta = document.createElement('small');
+        const source = item.relation_source === 'manual' ? '人工确认' : '自动发现';
+        meta.textContent = `${source} · 共同记忆 ${item.shared_count || 0} 条${isSuppressed ? ' · 已忽略' : ''}`;
+        body.append(title, text, meta);
+        const actions = document.createElement('div');
+        actions.className = 'toolbar entity-relation-actions';
+        if (isSuppressed) {
+            const restore = document.createElement('button');
+            restore.className = 'btn btn-secondary';
+            restore.textContent = '恢复';
+            restore.onclick = () => restoreEntityRelation(item.entity_id);
+            actions.appendChild(restore);
+        } else {
+            const edit = document.createElement('button');
+            edit.className = 'btn btn-secondary';
+            edit.textContent = '编辑';
+            edit.onclick = () => startEntityRelationEdit(item);
+            const remove = document.createElement('button');
+            remove.className = 'btn btn-danger';
+            remove.textContent = '删除';
+            remove.onclick = () => suppressEntityRelation(item.entity_id, item.name);
+            actions.append(edit, remove);
+        }
+        row.append(body, actions);
+        list.appendChild(row);
+    };
+    visible.forEach(item => appendRelation(item, false));
+    if (suppressed.length) {
+        const ignoredTitle = document.createElement('p');
+        ignoredTitle.className = 'section-desc entity-relations-ignored-title';
+        ignoredTitle.textContent = `已忽略关联（${suppressed.length}）`;
+        list.appendChild(ignoredTitle);
+        suppressed.forEach(item => appendRelation(item, true));
+    }
+}
+
+async function loadEntityRelations(entityId) {
+    if (!entityId) return null;
+    try {
+        const response = await fetch(`/api/entities/${entityId}/relations`);
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        renderEntityRelations(data.relations || []);
+        populateEntityRelationOptions();
+        return data.relations || [];
+    } catch (error) {
+        setEntityRelationFeedback(`关联加载失败：${error.message}`);
+        return null;
+    }
+}
+
+function cancelEntityRelationEdit() {
+    entityRelationEditingOtherId = null;
+    const select = document.getElementById('entity-relation-other');
+    const input = document.getElementById('entity-relation-text');
+    const save = document.getElementById('entity-relation-save');
+    const cancel = document.getElementById('entity-relation-cancel');
+    if (select) { select.disabled = false; select.value = ''; }
+    if (input) input.value = '';
+    if (save) save.textContent = '新增关联';
+    if (cancel) cancel.style.display = 'none';
+    setEntityRelationFeedback('');
+}
+
+function startEntityRelationEdit(item) {
+    entityRelationEditingOtherId = Number(item.entity_id);
+    populateEntityRelationOptions();
+    const select = document.getElementById('entity-relation-other');
+    const input = document.getElementById('entity-relation-text');
+    const save = document.getElementById('entity-relation-save');
+    const cancel = document.getElementById('entity-relation-cancel');
+    if (select) { select.value = String(entityRelationEditingOtherId); select.disabled = true; }
+    if (input) { input.value = item.relation || ''; input.focus(); }
+    if (save) save.textContent = '保存关联';
+    if (cancel) cancel.style.display = '';
+    setEntityRelationFeedback('');
+}
+
+async function saveEntityRelation() {
+    if (!selectedEntity) return;
+    const select = document.getElementById('entity-relation-other');
+    const input = document.getElementById('entity-relation-text');
+    const save = document.getElementById('entity-relation-save');
+    const otherId = entityRelationEditingOtherId || Number(select?.value);
+    const relation = input?.value.trim();
+    if (!otherId || !relation) {
+        setEntityRelationFeedback('请选择关联实体并填写关系描述。');
+        return;
+    }
+    save.disabled = true;
+    try {
+        const editing = Boolean(entityRelationEditingOtherId);
+        const endpoint = `/api/entities/${selectedEntity.id}/relations${editing ? `/${otherId}` : ''}`;
+        const response = await fetch(endpoint, {
+            method: editing ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ other_entity_id: otherId, relation }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '保存失败');
+        cancelEntityRelationEdit();
+        await loadEntityRelations(selectedEntity.id);
+        document.getElementById('entity-status').textContent = '实体关系已保存，并会优先于自动发现结果。';
+    } catch (error) {
+        setEntityRelationFeedback(error.message);
+    } finally {
+        save.disabled = false;
+    }
+}
+
+async function suppressEntityRelation(otherId, otherName) {
+    if (!selectedEntity) return;
+    if (!confirm(`删除与“${otherName}”的关联吗？\n\n该关系会被标记为忽略，不会在下次自动发现时重新出现；你可以随后恢复。`)) return;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/relations/${otherId}`, { method: 'DELETE' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '删除失败');
+        await loadEntityRelations(selectedEntity.id);
+        document.getElementById('entity-status').textContent = '实体关系已忽略，自动发现不会重新加入。';
+    } catch (error) {
+        setEntityRelationFeedback(error.message);
+    }
+}
+
+async function restoreEntityRelation(otherId) {
+    if (!selectedEntity) return;
+    try {
+        const response = await fetch(`/api/entities/${selectedEntity.id}/relations/${otherId}/restore`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '恢复失败');
+        await loadEntityRelations(selectedEntity.id);
+        document.getElementById('entity-status').textContent = '实体关系已恢复，并标记为人工确认。';
+    } catch (error) {
+        setEntityRelationFeedback(error.message);
     }
 }
 
@@ -345,7 +527,7 @@ async function loadEntityMemories(entity) {
             list.appendChild(item);
         });
         document.getElementById('entity-memory-card').style.display = 'block';
-        await loadEntityCard(selectedEntity.id);
+        await Promise.all([loadEntityCard(selectedEntity.id), loadEntityRelations(selectedEntity.id)]);
         return selectedEntity;
     } catch (error) {
         status.textContent = `实体详情加载失败：${error.message}`;

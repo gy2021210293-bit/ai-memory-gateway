@@ -2,7 +2,8 @@ import logging
 import sys
 import types
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from unittest.mock import AsyncMock
 
 
 asyncpg = types.ModuleType("asyncpg")
@@ -177,6 +178,42 @@ class EntitySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("e.evidence_count >= $3", sql)
         self.assertNotIn("term LIKE", sql)
         self.assertIn("entity_rank <= 3", sql)
+
+    async def test_direct_mentions_refresh_dormant_entities_without_memory_ranking(self):
+        old = datetime.now(timezone.utc) - timedelta(days=100)
+        conn = FakeEntityConnection()
+        conn.fetchrows = []
+        conn.fetch = AsyncMock(return_value=[
+            {
+                "id": 7, "name": "Alice", "normalized_name": "alice", "entity_type": "person",
+                "description": "朋友", "profile_json": None, "entity_card_json": {},
+                "evidence_count": 5, "status_override": None, "last_referenced_at": None,
+                "last_evidence_at": old, "aliases": ["Ally"], "normalized_aliases": ["ally"],
+            },
+            {
+                "id": 8, "name": "Bob", "normalized_name": "bob", "entity_type": "person",
+                "description": "同事", "profile_json": None, "entity_card_json": {},
+                "evidence_count": 5, "status_override": None, "last_referenced_at": None,
+                "last_evidence_at": old, "aliases": [], "normalized_aliases": [],
+            },
+            {
+                "id": 9, "name": "Candidate", "normalized_name": "candidate", "entity_type": "person",
+                "description": "", "profile_json": None, "entity_card_json": {},
+                "evidence_count": 1, "status_override": None, "last_referenced_at": None,
+                "last_evidence_at": old, "aliases": [], "normalized_aliases": [],
+            },
+        ])
+        old_get_pool = database.get_pool
+        database.get_pool = lambda: _async_value(FakePool(conn))
+        try:
+            result = await database.find_directly_mentioned_entities("Alice 和 Bob 最近怎么样")
+        finally:
+            database.get_pool = old_get_pool
+        self.assertEqual([item["name"] for item in result], ["Alice", "Bob"])
+        self.assertTrue(all(item["retrieval_status"] == "active" for item in result))
+        execute_calls = [call for call in conn.calls if call[0] == "execute"]
+        self.assertEqual(execute_calls[0][2][0], [7, 8])
+        self.assertIn("last_referenced_at = NOW()", execute_calls[0][1])
 
     def test_profile_normalization_rejects_unknown_evidence(self):
         profile = memory_extractor.normalize_entity_profile({

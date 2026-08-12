@@ -29,9 +29,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
-from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status
+from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
-from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, find_entity_relation_candidates, fetch_shared_memory_evidence
+from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -459,7 +459,12 @@ def _card_date_is_stale(date_str: str, days: int) -> bool:
     return (datetime.now() - d).days > days
 
 
-def _format_matched_entity_overview(memories: list, user_message: str = "", relation_map: dict = None) -> str:
+def _format_matched_entity_overview(
+    memories: list,
+    user_message: str = "",
+    relation_map: dict = None,
+    direct_entities: list = None,
+) -> str:
     """Render the matched-entity block from entity cards.
 
     The legacy profile_json (summary / relationship / stable_facts / recent_updates
@@ -479,10 +484,13 @@ def _format_matched_entity_overview(memories: list, user_message: str = "", rela
     from the async caller (`relations_of_entity`); None renders no relation lines.
     """
     entities = {}
+    for entity in direct_entities or []:
+        if entity.get("retrieval_status") == "active":
+            entities[entity["id"]] = entity
     for memory in memories:
         for entity in memory.get("matched_entities", []):
             if entity.get("retrieval_status") == "active":
-                entities[entity["id"]] = entity
+                entities.setdefault(entity["id"], entity)
     skip_card = _classify_entity_query(user_message)
     lines = []
     for entity in entities.values():
@@ -515,7 +523,7 @@ def _format_matched_entity_overview(memories: list, user_message: str = "", rela
                 rel for rel in relation_map.get(int(entity["id"]), [])
                 if rel.get("retrieval_status") == "active"
             ]
-        for rel in related[:3]:
+        for relation_index, rel in enumerate(related):
             rel_name = str(rel.get("name") or "").strip()
             rel_text = str(rel.get("relation") or "").strip()
             if not rel_name:
@@ -524,6 +532,31 @@ def _format_matched_entity_overview(memories: list, user_message: str = "", rela
                 lines.append(f"  ↳ 关联：{rel_name}（{rel_text}）")
             else:
                 lines.append(f"  ↳ 关联：{rel_name}")
+            if relation_index >= 3 or rel.get("entity_id") in entities:
+                continue
+            related_card = rel.get("entity_card_json") or {}
+            if isinstance(related_card, str):
+                try:
+                    related_card = json.loads(related_card)
+                except json.JSONDecodeError:
+                    related_card = {}
+            related_description = (related_card.get("description") or rel.get("description") or "").strip()
+            related_snapshots = related_card.get("snapshots") or []
+            try:
+                related_snapshots = sorted(
+                    (snap for snap in related_snapshots if isinstance(snap, dict) and snap.get("state")),
+                    key=lambda snap: (str(snap.get("fact_date") or ""), str(snap.get("recorded_at") or "")),
+                )
+            except Exception:
+                related_snapshots = []
+            if related_description:
+                lines.append(f"    · {rel_name}（{rel.get('type', 'other')}）— {related_description}")
+            if related_snapshots:
+                snapshot = related_snapshots[-1]
+                state_text = snapshot["state"]
+                if _card_date_is_stale(str(snapshot.get("fact_date") or ""), _db_module.SNAPSHOT_STALE_DAYS):
+                    state_text += f"（最后更新于 {snapshot.get('fact_date') or '未知日期'}，可能已过时）"
+                lines.append(f"    · 最近：{snapshot.get('fact_date') or '未知日期'}：{state_text}")
         # 注入顺序：实体说明 → 长期稳定特征（仅 active，retired/pending/rejected 一律不注入）→ 最近状态快照
         for trait in (card.get("stable_traits") or []):
             if not isinstance(trait, dict) or trait.get("status") != "active":
@@ -556,6 +589,29 @@ def _format_matched_entity_overview(memories: list, user_message: str = "", rela
             lines.append(f"  · {snapshot.get('fact_date') or '未知日期'}：{state_text}")
     return "\n".join(lines)
 
+
+async def _build_entity_overview(memories: list, user_message: str, direct_entities: list) -> str:
+    """Render direct entity cards independently of memory Top-K, plus one-hop relations."""
+    relation_map = {}
+    try:
+        matched_ids = {
+            entity["id"]
+            for entity in direct_entities
+            if entity.get("retrieval_status") == "active"
+        }
+        matched_ids.update(
+            entity["id"]
+            for memory in memories
+            for entity in memory.get("matched_entities", [])
+            if entity.get("retrieval_status") == "active"
+        )
+        if matched_ids:
+            relation_map = await relations_of_entity(list(matched_ids))
+    except Exception as exc:
+        print(f"⚠️ 实体关联读取失败: {exc}")
+    return _format_matched_entity_overview(memories, user_message, relation_map, direct_entities)
+
+
 async def build_system_prompt_with_memories(user_message: str, base_system_prompt: str) -> str:
     """
     构建带记忆的 system prompt
@@ -566,10 +622,11 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
         return base_system_prompt
     
     try:
+        direct_entities = await find_directly_mentioned_entities(user_message)
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
         cognitive_text = format_cognitive_items_for_prompt(await list_cognitive_items(active_only=True))
 
-        if not memories and not cognitive_text:
+        if not memories and not cognitive_text and not direct_entities:
             return base_system_prompt
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
@@ -596,16 +653,7 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
             memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         memory_text = "\n".join(memory_lines)
-        # 命中的活跃实体 → 拉取其关联实体（星图桥线同一份数据）注入 "↳ 关联"
-        relation_map = {}
-        try:
-            matched_ids = {entity["id"] for mem in memories for entity in mem.get("matched_entities", [])
-                           if entity.get("retrieval_status") == "active"}
-            if matched_ids:
-                relation_map = await relations_of_entity(list(matched_ids))
-        except Exception as exc:
-            print(f"⚠️ 实体关联读取失败: {exc}")
-        entity_overview = _format_matched_entity_overview(memories, user_message, relation_map)
+        entity_overview = await _build_entity_overview(memories, user_message, direct_entities)
         entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
         
         cognitive_section = f"\n{cognitive_text}\n" if cognitive_text else ""
@@ -1322,11 +1370,10 @@ async def _build_basic_cached(
 
 async def build_memory_text(user_message: str) -> str:
     """搜索记忆并格式化为注入文本（分区缓存模式用）"""
-    if MAX_MEMORIES_INJECT <= 0:
-        return ""
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
-        if not memories:
+        direct_entities = await find_directly_mentioned_entities(user_message)
+        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
+        if not memories and not direct_entities:
             return ""
         
         entity_map = {
@@ -1352,16 +1399,7 @@ async def build_memory_text(user_message: str) -> str:
             entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
             memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
         
-        # 命中的活跃实体 → 拉取其关联实体（星图桥线同一份数据）注入 "↳ 关联"
-        relation_map = {}
-        try:
-            matched_ids = {entity["id"] for mem in memories for entity in mem.get("matched_entities", [])
-                           if entity.get("retrieval_status") == "active"}
-            if matched_ids:
-                relation_map = await relations_of_entity(list(matched_ids))
-        except Exception as exc:
-            print(f"⚠️ 实体关联读取失败: {exc}")
-        entity_overview = _format_matched_entity_overview(memories, user_message, relation_map)
+        entity_overview = await _build_entity_overview(memories, user_message, direct_entities)
         entity_block = f"<matched_entities>\n{entity_overview}\n</matched_entities>\n" if entity_overview else ""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
@@ -2749,6 +2787,56 @@ async def api_get_entity_memories(entity_id: int):
     return {"entity": entity, "memories": await get_entity_memories(entity_id)}
 
 
+@app.get("/api/entities/{entity_id}/relations")
+async def api_get_entity_relations(entity_id: int):
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    relations = await relations_of_entity([entity_id], include_suppressed=True)
+    return {"entity": entity, "relations": relations.get(entity_id, [])}
+
+
+@app.post("/api/entities/{entity_id}/relations")
+async def api_create_entity_relation(entity_id: int, request: Request):
+    data = await request.json()
+    try:
+        other_entity_id = int(data.get("other_entity_id"))
+        result = await save_manual_entity_relation(entity_id, other_entity_id, data.get("relation"))
+    except (TypeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc) or "关联实体参数无效"})
+    if result.get("error"):
+        return JSONResponse(status_code=404 if result["error"] == "关联实体不存在" else 400, content=result)
+    return result
+
+
+@app.put("/api/entities/{entity_id}/relations/{other_entity_id}")
+async def api_update_entity_relation(entity_id: int, other_entity_id: int, request: Request):
+    data = await request.json()
+    try:
+        result = await save_manual_entity_relation(entity_id, other_entity_id, data.get("relation"))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result.get("error"):
+        return JSONResponse(status_code=404 if result["error"] == "关联实体不存在" else 400, content=result)
+    return result
+
+
+@app.delete("/api/entities/{entity_id}/relations/{other_entity_id}")
+async def api_suppress_entity_relation(entity_id: int, other_entity_id: int):
+    result = await suppress_entity_relation(entity_id, other_entity_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/relations/{other_entity_id}/restore")
+async def api_restore_entity_relation(entity_id: int, other_entity_id: int):
+    result = await restore_entity_relation(entity_id, other_entity_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
 @app.put("/api/entities/{entity_id}")
 async def api_update_entity(entity_id: int, request: Request):
     result = await update_entity(entity_id, await request.json())
@@ -3197,7 +3285,7 @@ async def run_entity_relation_discovery_once() -> dict:
             return {"status": "noop", "candidates": 0, "described": 0}
 
         try:
-            existing_rows = await list_entity_relations()
+            existing_rows = await list_entity_relations(include_suppressed=True)
         except Exception as exc:
             print(f"⚠️ 读取既有实体关系失败: {exc}")
             existing_rows = []
@@ -3212,6 +3300,8 @@ async def run_entity_relation_discovery_once() -> dict:
             key = _relation_key(a_id, b_id)
             existing = existing_map.get(key)
             if existing:
+                if existing.get("is_suppressed") or existing.get("relation_source") == "manual":
+                    continue
                 if row["shared_total"] < (existing["shared_count"] or 0) * _db_module.RELATION_SHARED_GROWTH:
                     continue  # 共享数没显著增长，不重判
                 last = _relation_judged_at.get(key)

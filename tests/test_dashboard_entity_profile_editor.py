@@ -62,8 +62,25 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
         self.assertIn(".entity-card-proposal", self.css)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=6.8", self.html)
-        self.assertIn("/static/css/dashboard.css?v=7.3", self.html)
+        self.assertIn("/static/js/dashboard.js?v=6.9", self.html)
+        self.assertIn("/static/css/dashboard.css?v=7.4", self.html)
+
+    def test_entity_relation_editor_and_actions_exist(self):
+        for element_id in (
+            "entity-relations-list",
+            "entity-relation-other",
+            "entity-relation-text",
+            "entity-relation-save",
+        ):
+            self.assertIn(f'id="{element_id}"', self.html)
+        for function_name in (
+            "function loadEntityRelations(",
+            "function saveEntityRelation(",
+            "function suppressEntityRelation(",
+            "function restoreEntityRelation(",
+        ):
+            self.assertIn(function_name, self.javascript)
+        self.assertIn(".entity-relation-item", self.css)
 
     def test_snapshot_edit_delete_endpoints_and_ui_exist(self):
         self.assertIn("/card/snapshots", self.javascript)

@@ -268,6 +268,7 @@ class RelationStorageTests(unittest.IsolatedAsyncioTestCase):
         conn = AsyncMock()
         conn.fetch.return_value = [{
             "entity_id_a": 1, "entity_id_b": 2, "relation": "常去的地方", "shared_count": 3,
+            "relation_source": "discovered", "is_suppressed": False,
             "a_id": 1, "a_name": "陈皮", "a_type": "pet", "a_evidence": 5, "a_override": None,
             "b_id": 2, "b_name": "北京", "b_type": "place", "b_evidence": 0, "b_override": None,
             "a_last_evidence": recent, "b_last_evidence": None,
@@ -281,6 +282,33 @@ class RelationStorageTests(unittest.IsolatedAsyncioTestCase):
         # 从实体2视角 → 关联端是1（active，证据5且最近活跃）
         self.assertEqual(result[2][0]["entity_id"], 1)
         self.assertEqual(result[2][0]["retrieval_status"], "active")
+
+    async def test_manual_relation_checks_both_entities_and_marks_manual(self):
+        conn = AsyncMock()
+        conn.fetchval.return_value = 2
+        conn.fetchrow.return_value = {
+            "id": 7, "entity_id_a": 1, "entity_id_b": 2, "relation": "共同参与的项目",
+            "shared_count": 0, "relation_source": "manual", "is_suppressed": False,
+            "updated_at": None,
+        }
+        with patch.object(database, "get_pool", return_value=FakePool(conn)):
+            result = await database.save_manual_entity_relation(2, 1, "共同参与的项目")
+        self.assertEqual(result["relation"]["relation_source"], "manual")
+        self.assertFalse(result["relation"]["is_suppressed"])
+        args = conn.fetchrow.await_args.args
+        self.assertEqual((args[1], args[2]), (1, 2))
+
+    async def test_manual_relation_rejects_self_pair(self):
+        result = await database.save_manual_entity_relation(3, 3, "自身")
+        self.assertEqual(result["error"], "不能关联实体自身")
+
+    async def test_auto_upsert_does_not_overwrite_manual_or_suppressed_relation(self):
+        conn = AsyncMock()
+        with patch.object(database, "get_pool", return_value=FakePool(conn)):
+            await database.upsert_entity_relation(1, 2, "自动发现", 3)
+        sql = conn.execute.await_args.args[0]
+        self.assertIn("relation_source = 'discovered'", sql)
+        self.assertIn("is_suppressed = FALSE", sql)
 
 
 if __name__ == "__main__":

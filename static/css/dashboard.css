@@ -1720,6 +1720,68 @@ body::after {
     background: rgba(236, 226, 244, .35);
 }
 
+.entity-relations-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.entity-relation-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid rgba(126, 99, 145, .12);
+    border-radius: 12px;
+    background: rgba(249, 247, 250, .58);
+    font-size: 14px;
+}
+
+.entity-relation-item > div:first-child {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+}
+
+.entity-relation-text {
+    color: #55415f;
+}
+
+.entity-relation-item small,
+.entity-relations-ignored-title {
+    color: #7a6b86;
+}
+
+.entity-relation-item.is-suppressed {
+    opacity: .7;
+    background: rgba(239, 234, 246, .42);
+}
+
+.entity-relation-actions {
+    flex: 0 0 auto;
+    gap: 6px;
+}
+
+.entity-relation-form {
+    display: grid;
+    grid-template-columns: minmax(150px, 1fr) minmax(180px, 2fr) auto auto;
+    gap: 8px;
+    align-items: center;
+}
+
+@media (max-width: 720px) {
+    .entity-relation-item {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .entity-relation-form {
+        grid-template-columns: 1fr;
+    }
+}
+
 .entity-card-snapshot-actions {
     margin-top: 8px;
     gap: 6px;

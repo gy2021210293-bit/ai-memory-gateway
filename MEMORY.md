@@ -72,9 +72,13 @@
 
 ## Open questions
 
+- 2026-08-12 relation injection implementation: `build_system_prompt_with_memories()` and `build_memory_text()` now resolve directly mentioned eligible entities independently of memory Top-K. Direct active/dormant entities inject their cards without consuming `MAX_MEMORIES_INJECT`; candidate entities remain excluded. A direct mention updates `entities.last_referenced_at`, which refreshes the 90-day lifecycle window without adding evidence or a memory. One-hop relations retain every active, unsuppressed name/description line; the first three by shared-count/update ordering also carry a compact related card (description plus latest snapshot), with no recursive expansion. Exact quote/date/detail questions still skip all entity cards and relation lines. Local full-suite verification passed; live PostgreSQL migration and deployed behavior remain unverified.
+
 - Automatic alias discovery remains deferred until manual entity merge behavior is validated on deployed data.
 
 ## Read-only assessments
+
+- 2026-08-12 multi-entity direct-match implementation: direct A/B name or alias matches now form an independent entity-card channel, so both cards can be injected even when one entity contributes no memory within the final Top-K. This channel does not count toward `MAX_MEMORIES_INJECT`; the memory Top-K remains responsible only for event/detail evidence.
 
 - 2026-08-11 temporal/narrative-memory audit: the current gateway has fragment/event/core layers and persists `event_date`, but repository-wide search found no cross-encoder reranker. `build_system_prompt_with_memories()` injects the retrieved Top-K as parallel lines labelled with the row `created_at`, not the event's `event_date`, and relies on a prose instruction that newer information wins. Therefore a future narrative-arc feature must treat write time and event time separately, preserve evidence/version links, and resolve the current state plus only query-relevant history before injection; it must not inject an entire family/arc as a flat block. This is a read-only finding, not an approved implementation decision.
 - 2026-08-11 user-provided reference direction, not yet an approved implementation: favor temporal-evolution memory over overwriting records. Keep Event Memory append-only; derive a versioned State Memory projection with `valid_from`, `valid_to`, `recorded_at`, `status`, and directed supersession/evidence links; maintain slower-changing Semantic/Cognitive Memory separately. For current-state questions, resolve entity + attribute + valid time as a filter before ranking; retrieve history/causal events only for historical or explanatory intent. Valid time and system record time must remain distinct.

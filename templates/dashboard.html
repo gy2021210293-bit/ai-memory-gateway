@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memory Gateway</title>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=7.3">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=7.4">
 </head>
 <body>
     <div class="dashboard">
@@ -540,6 +540,20 @@
                         <button class="btn btn-danger" id="entity-delete" onclick="deleteSelectedEntity()">仅删除实体</button>
                         <span class="section-desc">删除实体不会删除原始记忆。</span>
                     </div>
+                    <div class="card entity-relations-card" style="margin:16px 0;padding:12px">
+                        <div class="toolbar" style="justify-content:space-between">
+                            <h4 style="margin:0">关联实体</h4>
+                            <span class="section-desc">人工修改优先；删除会忽略该关系，避免下次自动发现重新加入。</span>
+                        </div>
+                        <div id="entity-relations-list" class="entity-relations-list"></div>
+                        <div class="entity-relation-form">
+                            <select id="entity-relation-other" class="input" aria-label="关联的实体"></select>
+                            <input id="entity-relation-text" class="input" maxlength="120" placeholder="关系描述，例如：常去的地方">
+                            <button class="btn btn-primary" id="entity-relation-save" onclick="saveEntityRelation()">新增关联</button>
+                            <button class="btn btn-secondary" id="entity-relation-cancel" onclick="cancelEntityRelationEdit()" style="display:none">取消</button>
+                        </div>
+                        <div id="entity-relation-feedback" class="section-desc" style="margin-top:8px"></div>
+                    </div>
                     <div class="card" style="margin:16px 0;padding:12px">
                         <div class="toolbar" style="justify-content:space-between">
                             <h4 style="margin:0">实体卡</h4>
@@ -834,6 +848,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=6.8"></script>
+    <script src="/static/js/dashboard.js?v=6.9"></script>
 </body>
 </html>

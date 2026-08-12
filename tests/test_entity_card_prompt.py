@@ -89,6 +89,43 @@ class EntityCardPromptTests(unittest.TestCase):
         self.assertNotIn("Candidate", rendered)
         self.assertIn("Active", rendered)
 
+    def test_direct_entities_render_without_recalled_memories(self):
+        direct_entities = [
+            {"id": 1, "name": "Alice", "type": "person", "retrieval_status": "active",
+             "aliases": [], "description": "朋友", "exact_name_match": True,
+             "entity_card_json": {"snapshots": [{"fact_date": "2026-08-01", "state": "住在上海"}]}},
+            {"id": 2, "name": "Bob", "type": "person", "retrieval_status": "active",
+             "aliases": [], "description": "同事", "exact_name_match": True,
+             "entity_card_json": {"snapshots": [{"fact_date": "2026-08-02", "state": "在准备答辩"}]}},
+        ]
+        rendered = self.ns["_format_matched_entity_overview"](
+            [], "Alice 和 Bob 最近怎么样", direct_entities=direct_entities,
+        )
+        self.assertIn("Alice", rendered)
+        self.assertIn("Bob", rendered)
+        self.assertIn("住在上海", rendered)
+        self.assertIn("准备答辩", rendered)
+
+    def test_all_relation_names_render_but_only_first_three_get_compact_cards(self):
+        primary = {"id": 1, "name": "项目A", "type": "project", "retrieval_status": "active",
+                   "aliases": [], "description": "主项目", "exact_name_match": True, "entity_card_json": {}}
+        related = [
+            {"entity_id": index, "name": f"关联{index}", "type": "person", "relation": "相关",
+             "retrieval_status": "active", "description": f"简介{index}",
+             "entity_card_json": {"snapshots": [{"fact_date": "2026-08-01", "state": f"状态{index}"}]}}
+            for index in range(2, 6)
+        ]
+        rendered = self.ns["_format_matched_entity_overview"](
+            [], "项目A", {1: related}, direct_entities=[primary],
+        )
+        for index in range(2, 6):
+            self.assertIn(f"关联{index}", rendered)
+        for index in range(2, 5):
+            self.assertIn(f"简介{index}", rendered)
+            self.assertIn(f"状态{index}", rendered)
+        self.assertNotIn("简介5", rendered)
+        self.assertNotIn("状态5", rendered)
+
     def test_legacy_profile_fields_never_injected(self):
         entity = {
             "id": 2, "name": "Alice", "type": "person", "retrieval_status": "active",
