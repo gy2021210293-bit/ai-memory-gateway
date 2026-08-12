@@ -3596,10 +3596,15 @@ CONSOLIDATION_PROMPT = """
 
 - entities：数组，每个元素 {{"name": "实体名", "type": "person|place|organization|project|object|pet|activity|event|other"}}。事件正文里明确出现、且作为长期记忆锚点值得追踪的命名实体才标；下方「已知实体名册」里已有的实体必须用其规范名，不要新建同名实体；名册里没有的新实体（需是稳定命名实体，排除代词、泛指名词、代码/文件名/路径/URL 等）可以新建。没有就返回空数组。
 - state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD", "user_view": "晏晏当时对这件事的看法/态度（≤60字，来自她当时的话，没有就空字符串）", "ai_view": "栖当时对这件事的感受（≤60字，来自栖当时在对话中的反应，没有就空字符串）"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。**user_view/ai_view 是可选观测日记字段：只有对话中明确表达了态度/感受才写，禁止根据事件内容推断补写；没有就返回空字符串。宁可没有，不要硬编。**
+- **一致性约束**：下方「已知实体说明」里的内容是用户手写维护的结构性事实背景，不是待生成的状态；不要把它复述成 state_changes，生成的 state_changes 不得与对应实体的已知说明矛盾。
 
 <已知实体名册>
 {entities_roster}
 </已知实体名册>
+
+<已知实体说明（先验知识，用户手写维护）>
+{entity_priors}
+</已知实体说明>
 
 # 输出格式
 只输出JSON数组，不要解释或使用Markdown：
@@ -3674,9 +3679,35 @@ async def consolidate_memories_for_date_range(start_date, end_date):
         entity_roster = None
         print("⚠️ 合并事件实体名册拉取失败，本次不带 roster")
     roster_text = _render_entity_roster(entity_roster) if entity_roster else "（暂无已知实体）"
+    # 相关实体的卡说明（先验知识，用户手写维护）：只喂这批碎片实际关联到的实体，
+    # 不喂全量名册——说明作为状态生成的一致性约束，只在该发生的地方生效，零额外 LLM。
+    entity_priors = ""
+    try:
+        fragment_ids = [fragment["id"] for fragment in fragments]
+        linked = await get_entities_for_memory_ids(fragment_ids)
+        entity_by_id = {}
+        for fragment_id in fragment_ids:
+            for ent in linked.get(fragment_id, []):
+                entity_by_id.setdefault(int(ent["id"]), ent)
+        prior_lines = []
+        for _entity_id, ent in entity_by_id.items():
+            card = ent.get("entity_card_json")
+            if isinstance(card, str):
+                try:
+                    card = json.loads(card)
+                except (json.JSONDecodeError, TypeError):
+                    card = {}
+            description = str((card or {}).get("description") or "").strip()
+            if description:
+                prior_lines.append(f"- {ent.get('name')}：{description}")
+        if prior_lines:
+            entity_priors = "\n".join(prior_lines)
+    except Exception as exc:
+        print(f"⚠️ 合并先验知识拉取失败: {exc}")
     prompt = CONSOLIDATION_PROMPT.format(
         fragments=fragments_text,
         entities_roster=roster_text,
+        entity_priors=entity_priors or "（无）",
     )
     
     # 使用环境变量配置的模型，默认 haiku 节省成本

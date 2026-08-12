@@ -3589,7 +3589,7 @@ async def get_entities_for_memory_ids(memory_ids: list) -> dict:
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT me.memory_id, e.id, e.name, e.entity_type, e.profile_json,
-                   e.evidence_count, e.status_override, me.confidence
+                   e.evidence_count, e.status_override, e.entity_card_json, me.confidence
             FROM memory_entities me
             JOIN entities e ON e.id = me.entity_id
             WHERE me.memory_id = ANY($1::int[])
@@ -3602,6 +3602,7 @@ async def get_entities_for_memory_ids(memory_ids: list) -> dict:
             "profile_json": row["profile_json"],
             "evidence_count": row["evidence_count"],
             "status_override": row["status_override"],
+            "entity_card_json": row["entity_card_json"],
             "confidence": row["confidence"],
         }))
     return result
@@ -3655,7 +3656,7 @@ async def list_entities_without_card(limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
-            SELECT e.id, e.name, e.entity_type, e.evidence_count,
+            SELECT e.id, e.name, e.entity_type, e.evidence_count, e.entity_card_json,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e

@@ -258,6 +258,35 @@ class EntityCardHarnessTests(unittest.TestCase):
         self.assertNotIn("宁可多收录", prompt)
         self.assertNotIn("最多 6 条", prompt)
 
+    def test_build_snapshot_backfill_prompt_includes_description_prior(self):
+        entities = [{
+            "id": 9, "name": "Supabase", "entity_type": "project",
+            "aliases": [],
+            "entity_card_json": {
+                "description": "有两个账号，一个存插件数据，一个存设备数据",
+                "snapshots": [],
+            },
+            "memories": [{"id": 1, "content": "我又给 Supabase 建了一个表"}],
+        }]
+        prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
+        # 实体块里带上了用户手写说明（先验知识）
+        self.assertIn("已知说明（先验知识）：有两个账号，一个存插件数据，一个存设备数据", prompt)
+        # 说明是结构性事实背景：不是待生成的状态，生成的快照不得与其矛盾
+        self.assertIn("说明里的内容不是待生成的状态", prompt)
+        self.assertIn("生成的快照不得与已知说明矛盾", prompt)
+
+    def test_build_snapshot_backfill_prompt_without_card_defaults_to_none(self):
+        entities = [{
+            "id": 9, "name": "小明", "entity_type": "person",
+            "aliases": [], "memories": [{"id": 1, "content": "小明毕业了"}],
+        }]
+        prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
+        self.assertIn("已知说明（先验知识）：（无）", prompt)
+        # jsonb 列以字符串返回时同样解析
+        entities[0]["entity_card_json"] = '{"description": "是朋友", "snapshots": []}'
+        prompt2 = memory_extractor._build_snapshot_backfill_prompt(entities)
+        self.assertIn("已知说明（先验知识）：是朋友", prompt2)
+
 
 class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_proposal_inserts(self):
@@ -496,6 +525,37 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["candidates"], [])
         self.assertEqual(result["contradictions"], [])
 
+    async def test_trait_candidates_receive_description_prior_and_filter_duplicate(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [
+                {"text": "有两个 Supabase 账号，一个存插件数据，一个存设备数据", "first_seen": "2026-03-01",
+                 "last_confirmed": "2026-08-11", "evidence_memory_ids": [1, 2]},
+                {"text": "习惯用技术搭建数字化体验", "first_seen": "2026-03-01",
+                 "last_confirmed": "2026-08-11", "evidence_memory_ids": [1, 2]},
+            ],
+            "contradictions": [],
+            "confirmed": [],
+        })}}]}
+        client = _FakeCardClient(payload)
+        with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: client), \
+             patch("memory_extractor.get_memory_api_key", return_value="key"), \
+             patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
+            result = await memory_extractor.suggest_entity_trait_candidates(
+                {"id": 1, "name": "Supabase", "entity_type": "project"},
+                [
+                    {"id": 1, "content": "Supabase 是技术栈的一部分", "layer": 1},
+                    {"id": 2, "content": "我习惯用 Supabase 实现自动化", "layer": 1},
+                ],
+                current_traits=[],
+                card_description="有两个 Supabase 账号，一个存插件数据，一个存设备数据",
+            )
+        # prompt 里带上了先验知识 + 不重复说明的规则
+        prompt = client.last_messages[0]["content"]
+        self.assertIn("实体说明（先验知识", prompt)
+        self.assertIn("不得复述或改写说明里的内容", prompt)
+        # 与说明完全重复的候选被兜底过滤；正常的证据特征保留
+        self.assertEqual([c["text"] for c in result["candidates"]], ["习惯用技术搭建数字化体验"])
+
 
 class _FakeCardResponse:
     def __init__(self, payload, status=200):
@@ -511,6 +571,7 @@ class _FakeCardClient:
     def __init__(self, payload, status=200):
         self._payload = payload
         self._status = status
+        self.last_messages = None
 
     async def __aenter__(self):
         return self
@@ -519,6 +580,7 @@ class _FakeCardClient:
         return False
 
     async def post(self, *_args, **_kwargs):
+        self.last_messages = (_kwargs.get("json") or {}).get("messages")
         return _FakeCardResponse(self._payload, status=self._status)
 
 
