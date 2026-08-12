@@ -2,6 +2,7 @@ import logging
 import sys
 import types
 import unittest
+from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch
 
 
@@ -114,6 +115,40 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "status_override": "candidate",
         })
         self.assertEqual((manual["retrieval_status"], manual["status_source"]), ("candidate", "manual"))
+
+    def test_dormant_derivation_no_exemption(self):
+        """休眠对所有实体一视同仁（人工设 active / profile 都无豁免）。"""
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=100)).isoformat()
+        recent = (now - timedelta(days=1)).isoformat()
+        # 证据够但很久没被提到 → dormant
+        stale = database.attach_entity_lifecycle({"evidence_count": 5, "last_evidence_at": old})
+        self.assertEqual((stale["retrieval_status"], stale["status_source"]), ("dormant", "stale_evidence"))
+        # 证据够且最近被提到 → active
+        fresh = database.attach_entity_lifecycle({"evidence_count": 5, "last_evidence_at": recent})
+        self.assertEqual((fresh["retrieval_status"], fresh["status_source"]), ("active", "evidence"))
+        # 人工设 active 同样休眠（无豁免）
+        manual = database.attach_entity_lifecycle({
+            "evidence_count": 5, "last_evidence_at": old, "status_override": "active",
+        })
+        self.assertEqual((manual["retrieval_status"], manual["status_source"]), ("dormant", "stale_evidence"))
+        # profile 实体同样休眠（无豁免）
+        profile = database.attach_entity_lifecycle({
+            "evidence_count": 0, "profile_json": {"summary": "known"}, "last_evidence_at": old,
+        })
+        self.assertEqual((profile["retrieval_status"], profile["status_source"]), ("dormant", "stale_evidence"))
+        # 无 last_evidence_at → 保守视为 recent，不误杀
+        undated = database.attach_entity_lifecycle({"evidence_count": 3})
+        self.assertEqual(undated["retrieval_status"], "active")
+        # 阈值边界：89 天前 → 仍活跃；91 天前 → 休眠
+        boundary_fresh = database.attach_entity_lifecycle({
+            "evidence_count": 5, "last_evidence_at": (now - timedelta(days=89)).isoformat(),
+        })
+        self.assertEqual(boundary_fresh["retrieval_status"], "active")
+        boundary_stale = database.attach_entity_lifecycle({
+            "evidence_count": 5, "last_evidence_at": (now - timedelta(days=91)).isoformat(),
+        })
+        self.assertEqual(boundary_stale["retrieval_status"], "dormant")
 
     def test_entity_name_matching_rejects_short_and_partial_latin_names(self):
         self.assertEqual(

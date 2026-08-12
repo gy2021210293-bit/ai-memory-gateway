@@ -1,9 +1,11 @@
+import ast
 import json
 import logging
 import sys
 import types
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 
@@ -70,6 +72,8 @@ class ProposalConnection:
             row.setdefault("last_confirmed", None)
             row.setdefault("evidence_memory_ids", [])
             row.setdefault("evidence_message_ids", [])
+            row.setdefault("user_view", "")
+            row.setdefault("ai_view", "")
             return row
         if "entity_card_json" in sql:
             return {"entity_card_json": self.card_json}
@@ -269,6 +273,30 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         # fact_date 必须是 date 对象：asyncpg 不接受字符串绑 DATE 列（DataError）
         self.assertIsInstance(insert_calls[0][1][2], date)
 
+    async def test_create_proposal_stores_diary_views(self):
+        conn = ProposalConnection()
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.create_entity_card_proposal(
+                1, "住在上海", "2026-07-10", 7, 20, "event", "与既有快照同日冲突，需人工确认",
+                user_view="如释重负", ai_view="替她高兴",
+            )
+        self.assertEqual(result["status"], "ok")
+        insert_calls = [call for call in conn.execute_calls if "INSERT INTO entity_card_proposals" in call[0]]
+        self.assertEqual(insert_calls[0][1][12], "如释重负")
+        self.assertEqual(insert_calls[0][1][13], "替她高兴")
+
+    async def test_create_proposal_cleans_diary_views(self):
+        conn = ProposalConnection()
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            await database.create_entity_card_proposal(
+                1, "住在上海", "2026-07-10",
+                user_view="  用户  如释重负  ", ai_view="",
+            )
+        insert_calls = [call for call in conn.execute_calls if "INSERT INTO entity_card_proposals" in call[0]]
+        # 空白折叠 + 用户称谓替换 + 缺省空串
+        self.assertEqual(insert_calls[0][1][12], "晏晏 如释重负")
+        self.assertEqual(insert_calls[0][1][13], "")
+
     async def test_create_proposal_missing_entity(self):
         conn = ProposalConnection(entity_row=None)
         with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
@@ -288,6 +316,21 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(accepted_updates), 1)
         card_updates = [call for call in conn.execute_calls if "entity_card_json" in call[0]]
         self.assertEqual(len(card_updates), 1)
+
+    async def test_accept_proposal_applies_diary_views(self):
+        proposal = {
+            "id": 3, "entity_id": 1, "state": "搬到上海", "fact_date": "2026-08-01",
+            "evidence_memory_id": 7, "evidence_message_id": 20, "status": "pending",
+            "user_view": "如释重负", "ai_view": "替她高兴",
+        }
+        conn = ProposalConnection(proposal_row=proposal, evidence_valid=True)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.accept_entity_card_proposal(3)
+        self.assertEqual(result["status"], "ok")
+        card_updates = [call for call in conn.execute_calls if "entity_card_json" in call[0]]
+        written = json.loads(card_updates[0][1][1])
+        self.assertEqual(written["snapshots"][0]["user_view"], "如释重负")
+        self.assertEqual(written["snapshots"][0]["ai_view"], "替她高兴")
 
     async def test_accept_proposal_rejects_foreign_evidence(self):
         proposal = {
@@ -428,6 +471,31 @@ class EntityCardProposalAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["contradictions"]), 1)
         self.assertEqual(result["contradictions"][0]["text"], "已放弃的旧特征")
 
+    async def test_suggest_entity_trait_candidates_confirmed_requires_active_match(self):
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "candidates": [],
+            "contradictions": [],
+            "confirmed": [
+                {"text": "仍有效的特征", "evidence_memory_ids": [1, 2]},
+                {"text": "不是活跃特征", "evidence_memory_ids": [1, 2]},
+            ],
+        })}}]}
+        with patch("memory_extractor.httpx.AsyncClient", lambda **_kw: _FakeCardClient(payload)), \
+             patch("memory_extractor.get_memory_api_key", return_value="key"), \
+             patch("memory_extractor.get_memory_api_base_url", return_value="http://test"):
+            result = await memory_extractor.suggest_entity_trait_candidates(
+                {"id": 1, "name": "小明", "entity_type": "person"},
+                [
+                    {"id": 1, "content": "小明长期目标是边缘设备部署", "layer": 1},
+                    {"id": 2, "content": "小明也说过要专注部署", "layer": 1},
+                ],
+                current_traits=["仍有效的特征"],
+            )
+        # confirmed 只保留"当前活跃特征"里被模型原样命中的；错误路径也返回完整 dict
+        self.assertEqual(result["confirmed"], [{"text": "仍有效的特征"}])
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["contradictions"], [])
+
 
 class _FakeCardResponse:
     def __init__(self, payload, status=200):
@@ -521,6 +589,52 @@ class EntityCardBackfillAsyncTests(unittest.IsolatedAsyncioTestCase):
         # 名字键命中 + 单个对象被兼容包成数组
         self.assertEqual(result["results"][235][0]["state"], "住在上海")
         self.assertEqual(result["results"][235][0]["evidence_memory_id"], 7)
+
+
+class ApplyEventStateChangesDiaryTests(unittest.IsolatedAsyncioTestCase):
+    """冲突路径的日记字段随提案走（main.py 接线，AST 隔离提取）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "apply_event_state_changes"
+        )
+        cls.namespace = {
+            "_db_module": types.SimpleNamespace(
+                normalize_entity_name=lambda name: str(name or "").strip(),
+            ),
+            "get_entities_for_memory_ids": AsyncMock(return_value={11: [{"id": 7, "name": "Alice"}]}),
+            "link_memory_entities": AsyncMock(return_value=None),
+            "apply_entity_snapshot": AsyncMock(return_value={"status": "conflict"}),
+            "create_entity_card_proposal": AsyncMock(return_value={"status": "ok"}),
+            "print": lambda *args, **kwargs: None,
+        }
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), cls.namespace)
+
+    async def test_conflict_proposal_carries_diary_views(self):
+        ns = self.namespace
+        ns["create_entity_card_proposal"].reset_mock()
+        await ns["apply_event_state_changes"](11, [{
+            "entity": "Alice", "state": "搬到上海", "fact_date": "2026-08-01",
+            "user_view": "如释重负", "ai_view": "替她高兴",
+        }])
+        call = ns["create_entity_card_proposal"].call_args
+        self.assertEqual(call.kwargs["user_view"], "如释重负")
+        self.assertEqual(call.kwargs["ai_view"], "替她高兴")
+
+    async def test_conflict_proposal_absent_views_default_empty(self):
+        ns = self.namespace
+        ns["create_entity_card_proposal"].reset_mock()
+        await ns["apply_event_state_changes"](11, [{
+            "entity": "Alice", "state": "搬到上海", "fact_date": "2026-08-01",
+        }])
+        call = ns["create_entity_card_proposal"].call_args
+        self.assertEqual(call.kwargs.get("user_view", ""), "")
+        self.assertEqual(call.kwargs.get("ai_view", ""), "")
 
 
 if __name__ == "__main__":

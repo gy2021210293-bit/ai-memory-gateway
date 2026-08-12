@@ -194,6 +194,22 @@ class EntityCardTests(unittest.TestCase):
         # 旧卡没有 stable_traits 字段 → 空数组（兼容）
         self.assertEqual(database._parse_entity_card({"description": "x", "snapshots": []})["stable_traits"], [])
 
+    def test_parse_entity_card_parses_diary_views(self):
+        payload = {
+            "description": "",
+            "snapshots": [
+                {"fact_date": "2026-07-20", "recorded_at": "", "state": "搬到北京",
+                 "user_view": "  如释重负  ", "ai_view": "替她高兴", "source": "direct"},
+                {"fact_date": "2026-08-01", "recorded_at": "", "state": "入职新公司", "source": "direct"},
+            ],
+        }
+        card = database._parse_entity_card(payload)
+        self.assertEqual(card["snapshots"][0]["user_view"], "如释重负")
+        self.assertEqual(card["snapshots"][0]["ai_view"], "替她高兴")
+        # 无看法的快照 → 空字符串（可选字段）
+        self.assertEqual(card["snapshots"][1]["user_view"], "")
+        self.assertEqual(card["snapshots"][1]["ai_view"], "")
+
     def test_clean_int_list_dedupes_and_filters(self):
         self.assertEqual(database._clean_int_list([1, 1, 2, "3", None, 0]), [1, 2, 3])
         self.assertEqual(database._clean_int_list("not-a-list"), [])
@@ -324,6 +340,18 @@ class EntityCardAsyncTests(unittest.IsolatedAsyncioTestCase):
         written = json.loads(conn.execute_calls[0][1][1])
         # 人工确认覆盖同日末节点后，重排结果以新快照为末节点（当前状态）
         self.assertEqual(written["snapshots"][-1]["state"], "state B")
+
+    async def test_apply_snapshot_persists_diary_views(self):
+        conn = CardConnection({"description": "", "snapshots": []})
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            result = await database.apply_entity_snapshot(
+                1, "搬到北京", "2026-07-20", source="confirmed", force=True,
+                user_view="如释重负", ai_view="替她高兴",
+            )
+        self.assertEqual(result["status"], "ok")
+        written = json.loads(conn.execute_calls[0][1][1])
+        self.assertEqual(written["snapshots"][0]["user_view"], "如释重负")
+        self.assertEqual(written["snapshots"][0]["ai_view"], "替她高兴")
 
     async def test_backdated_snapshot_does_not_replace_newer_tail(self):
         conn = CardConnection({

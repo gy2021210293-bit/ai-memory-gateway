@@ -5,6 +5,7 @@ import logging
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -31,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROMPT_SYMBOLS = {
     "_format_matched_entity_overview",
     "_classify_entity_query",
+    "_card_date_is_stale",
     "ENTITY_SPECIFIC_QUERY_KEYWORDS",
 }
 
@@ -47,7 +49,15 @@ def _load_prompt_functions():
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id in PROMPT_SYMBOLS:
                     nodes.append(node)
-    namespace = {"json": json}
+    namespace = {
+        "json": json,
+        "datetime": datetime,
+        # _format_matched_entity_overview 里只用到这两个 database 常量
+        "_db_module": types.SimpleNamespace(
+            SNAPSHOT_STALE_DAYS=45,
+            TRAIT_STALE_DAYS=180,
+        ),
+    }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), namespace)
     return namespace
 
@@ -176,6 +186,68 @@ class EntityCardPromptTests(unittest.TestCase):
         self.assertLess(rendered.index("长期稳定特征：长期目标是边缘设备部署"), rendered.index("2026-08-01"))
         self.assertNotIn("已放弃的旧特征", rendered)  # retired 绝不注入
         self.assertIn("2026-07-20：阶段2", rendered)
+
+    def test_stale_trait_and_stale_tail_snapshot_are_labelled(self):
+        old_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+        entity = {
+            "id": 2, "name": "Alice", "type": "person", "retrieval_status": "active",
+            "aliases": [], "description": "", "exact_name_match": True,
+            "entity_card_json": {
+                "description": "",
+                "stable_traits": [
+                    {"id": "t1", "text": "旧特征", "status": "active",
+                     "first_seen": old_date, "last_confirmed": old_date,
+                     "evidence_memory_ids": [1, 2], "evidence_message_ids": [], "origin": "confirmed"},
+                ],
+                "snapshots": [
+                    {"fact_date": old_date, "recorded_at": "", "state": "旧状态", "source": "direct"},
+                ],
+            },
+        }
+        rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "她最近怎么样")
+        self.assertIn("较早确认，可能已不适用", rendered)
+        self.assertIn(f"最后更新于 {old_date}，可能已过时", rendered)
+
+    def test_recent_trait_and_snapshot_not_labelled(self):
+        recent = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+        entity = {
+            "id": 2, "name": "Alice", "type": "person", "retrieval_status": "active",
+            "aliases": [], "description": "", "exact_name_match": True,
+            "entity_card_json": {
+                "description": "",
+                "stable_traits": [
+                    {"id": "t1", "text": "近期特征", "status": "active",
+                     "first_seen": recent, "last_confirmed": recent,
+                     "evidence_memory_ids": [1, 2], "evidence_message_ids": [], "origin": "confirmed"},
+                ],
+                "snapshots": [
+                    {"fact_date": recent, "recorded_at": "", "state": "近期状态", "source": "direct"},
+                ],
+            },
+        }
+        rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "她最近怎么样")
+        self.assertIn("· 长期稳定特征：近期特征", rendered)
+        self.assertIn("：近期状态", rendered)
+        self.assertNotIn("较早确认", rendered)
+        self.assertNotIn("可能已过时", rendered)
+
+    def test_diary_views_rendered_only_when_present(self):
+        entity = {
+            "id": 2, "name": "Alice", "type": "person", "retrieval_status": "active",
+            "aliases": [], "description": "", "exact_name_match": True,
+            "entity_card_json": {
+                "description": "",
+                "snapshots": [
+                    {"fact_date": "2026-07-20", "recorded_at": "", "state": "搬到北京",
+                     "user_view": "如释重负", "ai_view": "替她高兴", "source": "direct"},
+                    {"fact_date": "2026-08-01", "recorded_at": "", "state": "入职新公司", "source": "direct"},
+                ],
+            },
+        }
+        rendered = self.ns["_format_matched_entity_overview"]([{"matched_entities": [entity]}], "她最近怎么样")
+        self.assertIn("她：如释重负；我：替她高兴", rendered)
+        self.assertIn("入职新公司", rendered)  # 无看法的快照不显示日记括号
+        self.assertNotIn("我：None", rendered)
 
     def test_trait_generate_not_on_chat_path(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")

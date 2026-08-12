@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memory Gateway</title>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=7.2">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=7.3">
 </head>
 <body>
     <div class="dashboard">
@@ -544,6 +544,7 @@
                             <h4 style="margin:0">实体卡</h4>
                             <span class="section-desc">说明仅人工编辑；当前状态由最后一条有效快照派生，不单独保存。</span>
                         </div>
+                        <div id="entity-card-stale-warning" class="card-warning" style="display:none;margin-top:8px"></div>
                         <div class="form-group">
                             <label for="entity-card-description-edit">简短说明（人工确认的稳定身份说明）</label>
                             <textarea id="entity-card-description-edit" class="textarea" rows="2" maxlength="200"></textarea>
@@ -579,6 +580,10 @@
                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
                             <input id="entity-card-snapshot-memory" class="input" placeholder="证据记忆 ID（可选）" inputmode="numeric">
                             <input id="entity-card-snapshot-message" class="input" placeholder="证据消息 ID（可选）" inputmode="numeric">
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+                            <input id="entity-card-snapshot-user-view" class="input" placeholder="她当时的看法（可选，≤60字）">
+                            <input id="entity-card-snapshot-ai-view" class="input" placeholder="我当时的心情（可选，≤60字）">
                         </div>
                         <div class="toolbar" style="margin-top:10px">
                             <button class="btn btn-primary" onclick="addEntityCardSnapshot()">新增快照</button>
@@ -828,6 +833,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=6.7"></script>
+    <script src="/static/js/dashboard.js?v=6.8"></script>
 </body>
 </html>

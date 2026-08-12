@@ -83,6 +83,10 @@ MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 
+# 特征定时重确认（P3 后台任务）
+TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
+TRAIT_RECHECK_BATCH = int(os.getenv("TRAIT_RECHECK_BATCH", "10"))                   # 每轮最多处理实体数
+
 # 记忆提取+注入总开关（false时数据库仍连接、消息仍存储，但不提取也不注入记忆）
 MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == "true"
 
@@ -312,9 +316,20 @@ async def lifespan(app: FastAPI):
             print("⚠️  记忆系统将不可用，但网关仍可正常转发")
     else:
         print("ℹ️  记忆系统已关闭（设置 MEMORY_ENABLED=true 开启）")
-    
+
+    # P3 特征定时重确认（后台调度；仅当记忆系统可用时启动）
+    trait_timer_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            trait_timer_task = asyncio.create_task(_trait_requalify_loop())
+            print(f"🔄 特征定时重确认已启动（间隔 {TRAIT_RECHECK_INTERVAL_HOURS}h，批量 {TRAIT_RECHECK_BATCH}）")
+        except Exception as exc:
+            print(f"⚠️ 特征定时重确认启动失败: {exc}")
+
     yield
-    
+
+    if trait_timer_task is not None:
+        trait_timer_task.cancel()
     await close_pool()
 
 
@@ -417,6 +432,17 @@ def _classify_entity_query(user_message: str) -> bool:
     return any(keyword in text for keyword in ENTITY_SPECIFIC_QUERY_KEYWORDS)
 
 
+def _card_date_is_stale(date_str: str, days: int) -> bool:
+    """True when a YYYY-MM-DD date is older than `days`. Empty/invalid → fresh."""
+    if not date_str:
+        return False
+    try:
+        d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return (datetime.now() - d).days > days
+
+
 def _format_matched_entity_overview(memories: list, user_message: str = "") -> str:
     """Render the matched-entity block from entity cards.
 
@@ -424,8 +450,12 @@ def _format_matched_entity_overview(memories: list, user_message: str = "") -> s
     / preferences / uncertainties) is never injected here. All non-specific
     questions get the card's short description plus the most recent 3 snapshots by
     fact date; specific quote/date questions skip the card so the existing Top-K
-    events/fragments answer directly; ambiguous (non-exact-name) matches label the
-    latest snapshot "（不确定是否仍为最新）".
+    events/fragments answer directly. Aging guards ride along so the AI treats
+    stale content cautiously: active stable traits with a `last_confirmed` older
+    than TRAIT_STALE_DAYS are labelled "（较早确认，可能已不适用）"; the tail
+    (current-state) snapshot whose fact_date is older than SNAPSHOT_STALE_DAYS is
+    labelled "（最后更新于 X，可能已过时）"; ambiguous (non-exact-name) matches
+    still label the tail "（不确定是否仍为最新）".
     """
     entities = {}
     for memory in memories:
@@ -462,14 +492,30 @@ def _format_matched_entity_overview(memories: list, user_message: str = "") -> s
             if not isinstance(trait, dict) or trait.get("status") != "active":
                 continue
             trait_text = str(trait.get("text") or "").strip()
-            if trait_text:
-                lines.append(f"  · 长期稳定特征：{trait_text}")
+            if not trait_text:
+                continue
+            if _card_date_is_stale(str(trait.get("last_confirmed") or ""), _db_module.TRAIT_STALE_DAYS):
+                trait_text += "（较早确认，可能已不适用）"
+            lines.append(f"  · 长期稳定特征：{trait_text}")
         recent = snapshots[-3:]
         exact_match = bool(entity.get("exact_name_match"))
         for i, snapshot in enumerate(recent):
             state_text = snapshot["state"]
-            if i == len(recent) - 1 and not exact_match:
-                state_text += "（不确定是否仍为最新）"
+            tail = i == len(recent) - 1
+            extras = []
+            if tail and not exact_match:
+                extras.append("不确定是否仍为最新")
+            if tail and _card_date_is_stale(str(snapshot.get("fact_date") or ""), _db_module.SNAPSHOT_STALE_DAYS):
+                extras.append(f"最后更新于 {snapshot.get('fact_date') or '未知日期'}，可能已过时")
+            diary = []
+            if snapshot.get("user_view"):
+                diary.append(f"她：{snapshot['user_view']}")
+            if snapshot.get("ai_view"):
+                diary.append(f"我：{snapshot['ai_view']}")
+            if diary:
+                extras.append("；".join(diary))
+            if extras:
+                state_text += "（" + "；".join(extras) + "）"
             lines.append(f"  · {snapshot.get('fact_date') or '未知日期'}：{state_text}")
     return "\n".join(lines)
 
@@ -1404,10 +1450,13 @@ async def apply_event_state_changes(memory_id: int, state_changes: list, default
             skipped += 1
             continue
         fact_date = str(change.get("fact_date") or "").strip() or default_date
+        user_view = str(change.get("user_view") or "").strip()
+        ai_view = str(change.get("ai_view") or "").strip()
         try:
             result = await apply_entity_snapshot(
                 entity_id, state, fact_date,
                 memory_id, None, source="confirmed", force=False,
+                user_view=user_view, ai_view=ai_view,
             )
         except Exception as exc:
             print(f"⚠️ 事件状态快照写入失败: {exc}")
@@ -1419,6 +1468,7 @@ async def apply_event_state_changes(memory_id: int, state_changes: list, default
                 await create_entity_card_proposal(
                     entity_id, state, fact_date,
                     memory_id, None, "event", "与既有快照同日冲突，需人工确认",
+                    user_view=user_view, ai_view=ai_view,
                 )
             except Exception as exc:
                 print(f"⚠️ 事件状态冲突提案创建失败: {exc}")
@@ -2719,6 +2769,8 @@ async def api_add_entity_card_snapshot(entity_id: int, request: Request):
     data = await request.json()
     state = str(data.get("state") or "").strip()
     fact_date = str(data.get("fact_date") or "").strip()
+    user_view = str(data.get("user_view") or "").strip()
+    ai_view = str(data.get("ai_view") or "").strip()
     if not state:
         return JSONResponse(status_code=400, content={"error": "快照状态不能为空"})
     if not fact_date:
@@ -2750,6 +2802,7 @@ async def api_add_entity_card_snapshot(entity_id: int, request: Request):
     result = await apply_entity_snapshot(
         entity_id, state, fact_date,
         evidence_memory_id, evidence_message_id, source="confirmed", force=True,
+        user_view=user_view, ai_view=ai_view,
     )
     if result.get("status") in ("not_found", "error"):
         return JSONResponse(status_code=400, content=result)
@@ -2867,29 +2920,30 @@ async def api_retire_entity_card_trait(entity_id: int, trait_id: str):
     return result
 
 
-@app.post("/api/entities/{entity_id}/card/traits/generate")
-async def api_generate_entity_trait_candidates(entity_id: int, request: Request):
-    """Dashboard-triggered: LLM proposes stable-trait candidates from entity memories.
+def _card_today_str() -> str:
+    """Today's date as YYYY-MM-DD in the configured timezone (card date convention)."""
+    local = timezone(timedelta(hours=_memory_extractor_module.TIMEZONE_HOURS))
+    return datetime.now(local).strftime("%Y-%m-%d")
 
-    Never runs on the chat request path. Every candidate must cite ≥2 distinct
-    evidence memories and becomes a pending trait_add proposal (human-only accept).
+
+async def route_trait_suggestions(entity_id: int, suggestion: dict, card: dict) -> dict:
+    """Route one `suggest_entity_trait_candidates` result to the card / proposals.
+
+    Shared by the Dashboard "生成稳定特征候选" button and the background
+    re-confirmation timer:
+      - confirmed (existing active trait still supported) → auto-bump last_confirmed
+        (metadata refresh; no duplication; single-writer untouched);
+      - contradictions → trait_retire proposals (human-confirmed);
+      - candidates (new) → trait_add proposals (human-confirmed).
     """
-    entity = await get_entity_detail(entity_id)
-    if not entity:
-        return JSONResponse(status_code=404, content={"error": "实体不存在"})
-    memories = await get_entity_memories(entity_id)
-    if not memories:
-        return JSONResponse(status_code=400, content={"error": "该实体没有关联记忆，无法生成候选"})
-    evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
-    card = await get_entity_card(entity_id) or {}
-    current_traits = [
-        t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
-    ]
-    suggestion = await suggest_entity_trait_candidates(
-        entity, memories, evidence_message_map, current_traits,
-    )
     candidates = suggestion.get("candidates") or []
     contradictions = suggestion.get("contradictions") or []
+    confirmed = suggestion.get("confirmed") or []
+    card = card or {}
+    active_by_text = {
+        str(t.get("text") or "").strip().casefold(): t
+        for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+    }
     existing = await list_entity_card_proposals(entity_id)
     pending_texts = {
         str(p["state"]).strip().casefold() for p in existing
@@ -2899,10 +2953,24 @@ async def api_generate_entity_trait_candidates(entity_id: int, request: Request)
         str(p["state"]).strip().casefold() for p in existing
         if p["status"] == "pending" and p.get("proposal_type") == "trait_retire"
     }
+    reconfirmed = 0
     proposed = 0
-    skipped = 0
     retired_proposed = 0
+    skipped = 0
     errors = []
+    # 仍被支持的活跃特征 → 自动刷新最后确认日期（元数据，无重复、不碰单一写者）
+    today = _card_today_str()
+    for item in confirmed:
+        text = str(item.get("text") or "").strip()
+        trait = active_by_text.get(text.casefold())
+        if trait is None:
+            continue
+        result = await update_entity_card_trait(entity_id, trait["id"], last_confirmed=today)
+        if result.get("error"):
+            errors.append(result["error"])
+        else:
+            reconfirmed += 1
+    # 新特征 → trait_add 提案（人工确认）
     for candidate in candidates:
         if str(candidate["text"]).strip().casefold() in pending_texts:
             skipped += 1
@@ -2923,11 +2991,7 @@ async def api_generate_entity_trait_candidates(entity_id: int, request: Request)
         else:
             proposed += 1
             pending_texts.add(str(candidate["text"]).strip().casefold())
-    # 矛盾检测：被新证据推翻的活跃特征 → trait_retire 提案（绝不静默删除）
-    active_by_text = {
-        str(t.get("text") or "").strip().casefold(): t
-        for t in (card.get("stable_traits") or []) if t.get("status") == "active"
-    }
+    # 矛盾 → trait_retire 提案（绝不静默删除）
     for contradiction in contradictions:
         text = str(contradiction.get("text") or "").strip()
         trait = active_by_text.get(text.casefold())
@@ -2951,14 +3015,101 @@ async def api_generate_entity_trait_candidates(entity_id: int, request: Request)
             retired_proposed += 1
             pending_retire_texts.add(text.casefold())
     return {
-        "status": "ok",
+        "reconfirmed": reconfirmed,
         "proposed": proposed,
         "retired_proposed": retired_proposed,
         "skipped": skipped,
         "errors": errors,
-        "candidates": [{"text": c["text"]} for c in candidates],
-        "contradictions": [{"text": c["text"]} for c in contradictions],
     }
+
+
+@app.post("/api/entities/{entity_id}/card/traits/generate")
+async def api_generate_entity_trait_candidates(entity_id: int, request: Request):
+    """Dashboard-triggered: LLM proposes stable-trait candidates from entity memories.
+
+    Never runs on the chat request path. Every candidate must cite ≥2 distinct
+    evidence memories and becomes a pending trait_add proposal (human-only accept);
+    still-supported existing traits are re-confirmed (last_confirmed bumped).
+    """
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    memories = await get_entity_memories(entity_id)
+    if not memories:
+        return JSONResponse(status_code=400, content={"error": "该实体没有关联记忆，无法生成候选"})
+    evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+    card = await get_entity_card(entity_id) or {}
+    current_traits = [
+        t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+    ]
+    suggestion = await suggest_entity_trait_candidates(
+        entity, memories, evidence_message_map, current_traits,
+    )
+    result = await route_trait_suggestions(entity_id, suggestion, card)
+    return {
+        "status": "ok",
+        "proposed": result["proposed"],
+        "retired_proposed": result["retired_proposed"],
+        "reconfirmed": result["reconfirmed"],
+        "skipped": result["skipped"],
+        "errors": result["errors"],
+        "candidates": [{"text": c["text"]} for c in suggestion.get("candidates") or []],
+        "contradictions": [{"text": c["text"]} for c in suggestion.get("contradictions") or []],
+        "confirmed": [{"text": c["text"]} for c in suggestion.get("confirmed") or []],
+    }
+
+
+# ---- P3 特征定时重确认（后台调度 + 手动触发共用 run_trait_requalify_once）----
+_trait_requalify_lock = asyncio.Lock()
+
+
+async def run_trait_requalify_once() -> dict:
+    """One re-confirmation sweep over stale-trait entities (P3 timer)."""
+    if _trait_requalify_lock.locked():
+        return {"status": "already_running", "entities": 0}
+    async with _trait_requalify_lock:
+        try:
+            entities = await _db_module.find_stale_trait_entities(TRAIT_RECHECK_BATCH)
+        except Exception as exc:
+            print(f"⚠️ 特征重确认扫描失败: {exc}")
+            return {"status": "error", "entities": 0}
+        if not entities:
+            return {"status": "noop", "entities": 0}
+        done = 0
+        for ent in entities:
+            try:
+                entity = await get_entity_detail(ent["id"])
+                if not entity:
+                    continue
+                memories = await get_entity_memories(ent["id"])
+                if not memories:
+                    continue
+                evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+                card = await get_entity_card(ent["id"]) or {}
+                current_traits = [
+                    t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+                ]
+                suggestion = await suggest_entity_trait_candidates(
+                    entity, memories, evidence_message_map, current_traits,
+                )
+                result = await route_trait_suggestions(ent["id"], suggestion, card)
+                done += 1
+                print(f"🔄 特征重确认 {ent['name']}: 刷新 {result['reconfirmed']} · 新增提案 {result['proposed']} · 退休提案 {result['retired_proposed']}")
+            except Exception as exc:
+                print(f"⚠️ 特征重确认实体 {ent['name']} 失败: {exc}")
+        return {"status": "ok", "entities": done}
+
+
+async def _trait_requalify_loop():
+    """Background scheduler: periodically re-confirm stale active stable traits."""
+    while True:
+        try:
+            await asyncio.sleep(TRAIT_RECHECK_INTERVAL_HOURS * 3600)
+            await run_trait_requalify_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 特征重确认任务异常: {exc}")
 
 
 @app.post("/api/entities/merge")
@@ -3245,7 +3396,7 @@ CONSOLIDATION_PROMPT = """
 为合并后的事件标注涉及的关键实体，并识别事件里体现的实体状态变化：
 
 - entities：数组，每个元素 {{"name": "实体名", "type": "person|place|organization|project|object|pet|activity|event|other"}}。事件正文里明确出现、且作为长期记忆锚点值得追踪的命名实体才标；下方「已知实体名册」里已有的实体必须用其规范名，不要新建同名实体；名册里没有的新实体（需是稳定命名实体，排除代词、泛指名词、代码/文件名/路径/URL 等）可以新建。没有就返回空数组。
-- state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。
+- state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD", "user_view": "晏晏当时对这件事的看法/态度（≤60字，来自她当时的话，没有就空字符串）", "ai_view": "栖当时对这件事的感受（≤60字，来自栖当时在对话中的反应，没有就空字符串）"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。**user_view/ai_view 是可选观测日记字段：只有对话中明确表达了态度/感受才写，禁止根据事件内容推断补写；没有就返回空字符串。宁可没有，不要硬编。**
 
 <已知实体名册>
 {entities_roster}

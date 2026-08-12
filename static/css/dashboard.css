@@ -1725,6 +1725,13 @@ body::after {
     gap: 6px;
 }
 
+.entity-card-snapshot-diary {
+    margin-top: 4px;
+    font-size: 13px;
+    color: #8b5aa6;
+    line-height: 1.5;
+}
+
 .entity-card-snapshot-edit {
     display: flex;
     flex-direction: column;
@@ -1980,6 +1987,22 @@ details.entity-group[open] > summary {
     color: #8a8f98;
     background: rgba(107, 114, 128, .08);
     border: 1px dashed rgba(107, 114, 128, .35);
+}
+
+.entity-badge-dormant {
+    color: #7a5c8e;
+    background: rgba(139, 92, 246, .14);
+    border: 1px solid rgba(139, 92, 246, .32);
+}
+
+.card-warning {
+    color: #9a3412;
+    background: rgba(249, 115, 22, .12);
+    border: 1px solid rgba(234, 88, 12, .35);
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.5;
 }
 
 .entity-item-aliases {

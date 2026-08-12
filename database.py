@@ -51,6 +51,10 @@ MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 MEMORY_HW_ENTITY = float(os.getenv("MEMORY_HW_ENTITY", "0.25"))
 ENTITY_ACTIVE_EVIDENCE_THRESHOLD = 3
+# 实体卡时效性阈值（P3/P4/P6），env 可覆盖
+TRAIT_STALE_DAYS = int(os.getenv("TRAIT_STALE_DAYS", "180"))       # 稳定特征 last_confirmed 超过即触发重查/提醒
+SNAPSHOT_STALE_DAYS = int(os.getenv("SNAPSHOT_STALE_DAYS", "45"))   # 卡片最后一条快照 fact_date 超过即提醒过时
+ENTITY_DORMANT_DAYS = int(os.getenv("ENTITY_DORMANT_DAYS", "90"))   # 最近一次被提到超过即休眠（无豁免）
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
     for name in os.getenv("USER_ENTITY_NAMES", "晏晏,用户,user,the user").split(",")
@@ -530,7 +534,9 @@ async def init_tables():
                 trait_id            TEXT DEFAULT NULL,
                 last_confirmed      DATE DEFAULT NULL,
                 evidence_memory_ids   INTEGER[] DEFAULT ARRAY[]::INTEGER[],
-                evidence_message_ids  INTEGER[] DEFAULT ARRAY[]::INTEGER[]
+                evidence_message_ids  INTEGER[] DEFAULT ARRAY[]::INTEGER[],
+                user_view           TEXT NOT NULL DEFAULT '',
+                ai_view             TEXT NOT NULL DEFAULT ''
             );
         """)
         # 为存量库补充稳定特征相关列（新装已含，幂等）
@@ -566,6 +572,18 @@ async def init_tables():
                     WHERE table_name = 'entity_card_proposals' AND column_name = 'evidence_message_ids'
                 ) THEN
                     ALTER TABLE entity_card_proposals ADD COLUMN evidence_message_ids INTEGER[] DEFAULT ARRAY[]::INTEGER[];
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'user_view'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN user_view TEXT NOT NULL DEFAULT '';
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'entity_card_proposals' AND column_name = 'ai_view'
+                ) THEN
+                    ALTER TABLE entity_card_proposals ADD COLUMN ai_view TEXT NOT NULL DEFAULT '';
                 END IF;
             END $$;
         """)
@@ -1253,6 +1271,9 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
                    e.id AS entity_id, e.name AS entity_name, e.normalized_name,
                    e.entity_type, e.description, e.profile_json, e.entity_card_json,
                    e.evidence_count, e.status_override, me.confidence,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
                    COALESCE(array_agg(DISTINCT ea.alias)
                        FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
                    COALESCE(array_agg(DISTINCT ea.normalized_alias)
@@ -1314,9 +1335,10 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
         )
         SELECT * FROM ranked
         WHERE entity_rank <= 3
+          AND (last_evidence_at IS NULL OR last_evidence_at >= now() - make_interval(days => $5::int))
         ORDER BY importance DESC, created_at DESC
         LIMIT $4
-    """, terms, normalized_query, ENTITY_ACTIVE_EVIDENCE_THRESHOLD, max(limit * 10, 30))
+    """, terms, normalized_query, ENTITY_ACTIVE_EVIDENCE_THRESHOLD, max(limit * 10, 30), ENTITY_DORMANT_DAYS)
     candidates = {}
     for row in rows:
         names = [row["normalized_name"], *(row["normalized_aliases"] or [])]
@@ -1334,6 +1356,7 @@ async def _fetch_entity_search_candidates(conn, query: str, keywords: list, limi
             "entity_card_json": row.get("entity_card_json"),
             "evidence_count": row.get("evidence_count", 0),
             "status_override": row.get("status_override"),
+            "last_evidence_at": row.get("last_evidence_at"),
             "exact_name_match": bool(exact),
         })
         item = candidates.setdefault(row["id"], {
@@ -1355,6 +1378,9 @@ async def _attach_entity_context(conn, results: list):
     rows = await conn.fetch("""
         SELECT me.memory_id, me.confidence, e.id, e.name, e.entity_type, e.description, e.profile_json,
                e.entity_card_json, e.evidence_count, e.status_override,
+               (SELECT MAX(m2.created_at) FROM memory_entities me2
+                JOIN memories m2 ON m2.id = me2.memory_id
+                WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
                COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
         FROM memory_entities me
         JOIN entities e ON e.id = me.entity_id
@@ -1373,6 +1399,7 @@ async def _attach_entity_context(conn, results: list):
             "entity_card_json": row.get("entity_card_json"),
             "evidence_count": row["evidence_count"],
             "status_override": row["status_override"],
+            "last_evidence_at": row.get("last_evidence_at"),
             "confidence": row["confidence"],
         }))
     for result in results:
@@ -2971,17 +2998,51 @@ def _entity_similar_enough(a: str, b: str) -> bool:
 ENTITY_TYPES = {"person", "place", "organization", "project", "object", "pet", "activity", "event", "other"}
 
 
+def _entity_is_recent(value: dict) -> bool:
+    """True when the entity's last evidence falls within ENTITY_DORMANT_DAYS.
+
+    No usable recency signal (NULL / unparseable / missing field) counts as
+    recent so we never mis-sleep an entity we simply lack timing for. This is the
+    single recency predicate that MUST stay in sync with the recall SQL in
+    `_fetch_entity_search_candidates` (both gate entity recall identically).
+    """
+    last = value.get("last_evidence_at")
+    if not last:
+        return True
+    try:
+        if isinstance(last, str):
+            last = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=dt_timezone.utc)
+        age_days = (datetime.now(dt_timezone.utc) - last).total_seconds() / 86400.0
+        return age_days <= ENTITY_DORMANT_DAYS
+    except Exception:
+        return True
+
+
 def attach_entity_lifecycle(entity: dict) -> dict:
-    """Attach the effective retrieval status to one entity row."""
+    """Attach the effective retrieval status to one entity row.
+
+    Dormancy applies to every eligible entity with no exemption (manual override
+    and legacy profile included): once `last_evidence_at` is older than
+    ENTITY_DORMANT_DAYS the entity is derived `dormant` and excluded from recall
+    until a new memory links it again.
+    """
     value = dict(entity)
     evidence_count = max(0, int(value.get("evidence_count") or 0))
     override = value.get("status_override")
-    if override in {"active", "candidate"}:
-        status, source = override, "manual"
-    elif value.get("profile_json"):
-        status, source = "active", "profile"
-    elif evidence_count >= ENTITY_ACTIVE_EVIDENCE_THRESHOLD:
-        status, source = "active", "evidence"
+    if override == "candidate":
+        status, source = "candidate", "manual"
+    elif override == "active" or value.get("profile_json") or evidence_count >= ENTITY_ACTIVE_EVIDENCE_THRESHOLD:
+        if _entity_is_recent(value):
+            if override == "active":
+                status, source = "active", "manual"
+            elif value.get("profile_json"):
+                status, source = "active", "profile"
+            else:
+                status, source = "active", "evidence"
+        else:
+            status, source = "dormant", "stale_evidence"
     else:
         status, source = "candidate", "candidate"
     value["evidence_count"] = evidence_count
@@ -3344,6 +3405,9 @@ async def list_entities():
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
                    e.entity_card_json, e.entity_card_updated_at,
                    e.evidence_count, e.status_override, e.created_at, e.updated_at,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
                    COUNT(DISTINCT me.memory_id)::int AS memory_count,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases,
                    (SELECT COUNT(*) FROM entity_card_proposals p
@@ -3547,6 +3611,9 @@ async def get_entity_detail(entity_id: int):
                    e.profile_evidence_ids, e.profile_updated_at, e.profile_model,
                    e.entity_card_json, e.entity_card_updated_at,
                    e.evidence_count, e.status_override,
+                   (SELECT MAX(m2.created_at) FROM memory_entities me2
+                    JOIN memories m2 ON m2.id = me2.memory_id
+                    WHERE me2.entity_id = e.id AND m2.is_active = TRUE AND me2.source <> 'inherited') AS last_evidence_at,
                    COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
             FROM entities e
             LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
@@ -3682,6 +3749,7 @@ async def save_entity_profile(entity_id: int, profile: dict, evidence_ids: list,
 
 ENTITY_CARD_STATE_LIMIT = 200
 ENTITY_CARD_TRAIT_TEXT_LIMIT = 120
+SNAPSHOT_VIEW_LIMIT = 60  # 快照日记 user_view/ai_view 单字段上限
 ENTITY_CARD_PROPOSAL_TYPES = ("snapshot", "trait_add", "trait_retire")
 
 
@@ -3754,6 +3822,8 @@ def _parse_entity_card(card_json) -> dict:
                 "fact_date": str(raw.get("fact_date") or "").strip(),
                 "recorded_at": str(raw.get("recorded_at") or "").strip(),
                 "state": re.sub(r"\s+", " ", str(raw.get("state") or "")).strip(),
+                "user_view": re.sub(r"\s+", " ", str(raw.get("user_view") or "")).strip(),
+                "ai_view": re.sub(r"\s+", " ", str(raw.get("ai_view") or "")).strip(),
                 "evidence_memory_id": raw.get("evidence_memory_id"),
                 "evidence_message_id": raw.get("evidence_message_id"),
                 "source": str(raw.get("source") or "direct").strip(),
@@ -3895,12 +3965,18 @@ async def apply_entity_snapshot(
     evidence_message_id=None,
     source: str = "confirmed",
     force: bool = False,
+    user_view=None,
+    ai_view=None,
 ) -> dict:
     """Append a state snapshot to the entity card and re-sort (never capped).
 
     `force=True` (human confirmation: manual add or proposal accept) overrides the
     same-date-as-tail conflict guard; `force=False` (Harness auto-accept) escalates
     such conflicts to the caller so it can create a pending proposal.
+
+    `user_view`/`ai_view` are optional observation-diary companions ("双方当时的
+    看法") and default to empty when the conversation expressed no stance — never
+    inferred by the caller.
 
     Returns {"status": "ok" | "duplicate" | "conflict" | "not_found" | "error"}.
     """
@@ -3910,6 +3986,8 @@ async def apply_entity_snapshot(
     if not state[:ENTITY_CARD_STATE_LIMIT]:
         return {"status": "error", "error": "快照状态无效"}
     state = state[:ENTITY_CARD_STATE_LIMIT]
+    user_view = sanitize_user_references(re.sub(r"\s+", " ", str(user_view or "")).strip())[:SNAPSHOT_VIEW_LIMIT]
+    ai_view = sanitize_user_references(re.sub(r"\s+", " ", str(ai_view or "")).strip())[:SNAPSHOT_VIEW_LIMIT]
     fact_date = str(fact_date or "").strip()
     if not fact_date:
         return {"status": "error", "error": "快照日期不能为空"}
@@ -3918,6 +3996,8 @@ async def apply_entity_snapshot(
         "fact_date": fact_date,
         "recorded_at": recorded_at,
         "state": state,
+        "user_view": user_view,
+        "ai_view": ai_view,
         "evidence_memory_id": evidence_memory_id,
         "evidence_message_id": evidence_message_id,
         "source": source if source in ("direct", "confirmed") else "confirmed",
@@ -4081,11 +4161,17 @@ async def create_entity_card_proposal(
     last_confirmed=None,
     evidence_memory_ids=None,
     evidence_message_ids=None,
+    user_view=None,
+    ai_view=None,
 ) -> dict:
     """Record a pending entity-card proposal (snapshot / trait_add / trait_retire).
 
     `trait_add` must cite at least two distinct evidence memories (the stable-trait
     rule: a single message can never auto-promote a trait).
+
+    `user_view`/`ai_view` are the observation-diary companions of a snapshot;
+    they travel with the proposal so a human-confirmed accept keeps the "双方当时
+    的看法" that the event layer originally extracted.
     """
     state = re.sub(r"\s+", " ", str(state or "")).strip()
     if not state:
@@ -4094,6 +4180,8 @@ async def create_entity_card_proposal(
         return {"error": f"未知提案类型: {proposal_type}"}
     fact_date = _parse_fact_date(fact_date)
     last_confirmed = _parse_fact_date(last_confirmed)
+    user_view = sanitize_user_references(re.sub(r"\s+", " ", str(user_view or "")).strip())[:SNAPSHOT_VIEW_LIMIT]
+    ai_view = sanitize_user_references(re.sub(r"\s+", " ", str(ai_view or "")).strip())[:SNAPSHOT_VIEW_LIMIT]
     if proposal_type == "trait_add":
         memory_ids = _clean_int_list(evidence_memory_ids)
         if len(memory_ids) < 2:
@@ -4109,12 +4197,13 @@ async def create_entity_card_proposal(
             INSERT INTO entity_card_proposals
                 (entity_id, state, fact_date, evidence_memory_id, evidence_message_id,
                  source_role, reason, proposal_type, trait_id, last_confirmed,
-                 evidence_memory_ids, evidence_message_ids)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 evidence_memory_ids, evidence_message_ids, user_view, ai_view)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         """, entity_id, state[:ENTITY_CARD_STATE_LIMIT], fact_date,
             evidence_memory_id, evidence_message_id, source_role, str(reason or ""),
             proposal_type, trait_id, last_confirmed,
-            evidence_memory_ids or [], evidence_message_ids or [])
+            evidence_memory_ids or [], evidence_message_ids or [],
+            user_view, ai_view)
     return {"status": "ok"}
 
 
@@ -4125,7 +4214,7 @@ async def list_entity_card_proposals(entity_id: int) -> List[dict]:
             SELECT id, state, fact_date, evidence_memory_id, evidence_message_id,
                    source_role, reason, status, created_at, decided_at,
                    proposal_type, trait_id, last_confirmed,
-                   evidence_memory_ids, evidence_message_ids
+                   evidence_memory_ids, evidence_message_ids, user_view, ai_view
             FROM entity_card_proposals
             WHERE entity_id = $1
             ORDER BY (status = 'pending') DESC, created_at DESC
@@ -4145,7 +4234,8 @@ async def accept_entity_card_proposal(proposal_id: int) -> dict:
             row = await conn.fetchrow("""
                 SELECT id, entity_id, state, fact_date, evidence_memory_id,
                        evidence_message_id, status, proposal_type, trait_id,
-                       last_confirmed, evidence_memory_ids, evidence_message_ids
+                       last_confirmed, evidence_memory_ids, evidence_message_ids,
+                       user_view, ai_view
                 FROM entity_card_proposals WHERE id = $1 FOR UPDATE
             """, proposal_id)
             if not row:
@@ -4165,6 +4255,7 @@ async def accept_entity_card_proposal(proposal_id: int) -> dict:
                     row["entity_id"], row["state"], row["fact_date"],
                     row["evidence_memory_id"], row["evidence_message_id"],
                     source="confirmed", force=True,
+                    user_view=row["user_view"], ai_view=row["ai_view"],
                 )
                 if result.get("status") in ("not_found", "error"):
                     return {"error": result.get("error", "实体不存在")}
@@ -4272,6 +4363,44 @@ async def add_entity_card_trait(
             WHERE id = $1
         """, entity_id, json.dumps(card, ensure_ascii=False))
     return {"status": "ok", "trait": new_trait}
+
+
+async def find_stale_trait_entities(limit: int = 10) -> list:
+    """Find entities that need trait re-confirmation (P3 timer).
+
+    Qualifies when an entity has at least one ACTIVE stable trait whose
+    `last_confirmed` is older than TRAIT_STALE_DAYS AND it gained new active
+    memories after that confirmation date — new evidence to re-check against.
+    Without new evidence a re-check is pointless (nothing could have changed).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            WITH stale AS (
+                SELECT e.id, e.name,
+                       MAX(NULLIF(t->>'last_confirmed', '')::date)
+                           FILTER (WHERE t->>'status' = 'active') AS max_confirmed
+                FROM entities e
+                CROSS JOIN LATERAL jsonb_array_elements(e.entity_card_json->'stable_traits') t
+                WHERE e.entity_card_json IS NOT NULL
+                  AND jsonb_typeof(e.entity_card_json->'stable_traits') = 'array'
+                GROUP BY e.id, e.name
+                HAVING MAX(NULLIF(t->>'last_confirmed', '')::date) IS NOT NULL
+                   AND MAX(NULLIF(t->>'last_confirmed', '')::date)
+                       < (now() - make_interval(days => $1::int))::date
+            )
+            SELECT s.id, s.name
+            FROM stale s
+            WHERE EXISTS (
+                SELECT 1 FROM memory_entities me2
+                JOIN memories m2 ON m2.id = me2.memory_id
+                WHERE me2.entity_id = s.id AND m2.is_active = TRUE AND me2.source <> 'inherited'
+                  AND m2.created_at >= s.max_confirmed
+            )
+            ORDER BY s.name
+            LIMIT $2
+        """, TRAIT_STALE_DAYS, limit)
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
 
 
 async def update_entity_card_trait(entity_id: int, trait_id: str, text=None, last_confirmed=None) -> dict:

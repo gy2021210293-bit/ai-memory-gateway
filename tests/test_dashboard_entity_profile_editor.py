@@ -62,8 +62,8 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
         self.assertIn(".entity-card-proposal", self.css)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=6.7", self.html)
-        self.assertIn("/static/css/dashboard.css?v=7.2", self.html)
+        self.assertIn("/static/js/dashboard.js?v=6.8", self.html)
+        self.assertIn("/static/css/dashboard.css?v=7.3", self.html)
 
     def test_snapshot_edit_delete_endpoints_and_ui_exist(self):
         self.assertIn("/card/snapshots", self.javascript)

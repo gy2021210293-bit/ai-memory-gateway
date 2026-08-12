@@ -186,6 +186,14 @@ function initEntityCombos() {
 }
 document.addEventListener('DOMContentLoaded', initEntityCombos);
 
+// 距今天数（ISO 或 YYYY-MM-DD 均可，Date.parse 兼容）；无效返回 null
+function daysSinceIso(iso) {
+    if (!iso) return null;
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return null;
+    return Math.max(0, Math.floor((Date.now() - t) / 86400000));
+}
+
 function renderEntities() {
     const list = document.getElementById('entity-list');
     list.replaceChildren();
@@ -258,6 +266,13 @@ function renderEntities() {
                 pending.textContent = `待确认 ${entity.pending_proposal_count}`;
                 badges.appendChild(pending);
             }
+            if (entity.retrieval_status === 'dormant') {
+                const dorm = document.createElement('span');
+                dorm.className = 'entity-badge entity-badge-dormant';
+                const idle = daysSinceIso(entity.last_evidence_at);
+                dorm.textContent = '休眠' + (idle !== null ? ` · ${idle}天未提及` : '');
+                badges.appendChild(dorm);
+            }
             if (entity.card_has_snapshots) {
                 const hasCard = document.createElement('span');
                 hasCard.className = 'entity-badge entity-badge-card';
@@ -298,7 +313,8 @@ function renderEntities() {
         list.appendChild(container);
     };
     renderGroup('活跃实体', allEntities.filter(entity => entity.retrieval_status === 'active'));
-    renderGroup('候选实体', allEntities.filter(entity => entity.retrieval_status !== 'active'), true);
+    renderGroup('休眠实体', allEntities.filter(entity => entity.retrieval_status === 'dormant'));
+    renderGroup('候选实体', allEntities.filter(entity => entity.retrieval_status !== 'active' && entity.retrieval_status !== 'dormant'), true);
 }
 
 async function loadEntityMemories(entity) {
@@ -313,9 +329,10 @@ async function loadEntityMemories(entity) {
         document.getElementById('entity-name-edit').value = selectedEntity.name || '';
         document.getElementById('entity-type-edit').value = selectedEntity.entity_type || 'other';
         document.getElementById('entity-aliases-edit').value = (selectedEntity.aliases || []).join('\n');
-        const sourceLabels = { manual: '人工设置', profile: '已确认概况', evidence: '累计证据', candidate: '证据不足' };
+        const sourceLabels = { manual: '人工设置', profile: '已确认概况', evidence: '累计证据', candidate: '证据不足', stale_evidence: '久未提及' };
+        const lifecycleLabel = { active: '活跃实体', dormant: '休眠实体', candidate: '候选实体' }[selectedEntity.retrieval_status] || '候选实体';
         document.getElementById('entity-lifecycle-summary').textContent =
-            `${selectedEntity.retrieval_status === 'active' ? '活跃实体' : '候选实体'} · ` +
+            `${lifecycleLabel} · ` +
             `累计原始证据 ${selectedEntity.evidence_count || 0} 条 · 当前关联记忆 ${(data.memories || []).length} 条 · ` +
             `判定来源：${sourceLabels[selectedEntity.status_source] || selectedEntity.status_source || '自动'}`;
         const list = document.getElementById('entity-memory-list');
@@ -440,6 +457,27 @@ function formatEntityProfile(profile, fallback = '') {
         .map(([title, content]) => `${title}：${Array.isArray(content) ? content.join('；') : content}`).join('\n');
 }
 
+// 快照过时警告：尾部快照 fact_date 距今超过 SNAPSHOT_STALE_DAYS。
+// 阈值与后端 database.SNAPSHOT_STALE_DAYS 保持一致（默认 45）。
+const SNAPSHOT_STALE_DAYS = 45;
+// 特征老化徽标：last_confirmed 距今超过 TRAIT_STALE_DAYS。
+// 阈值与后端 database.TRAIT_STALE_DAYS 保持一致（默认 180）。
+const TRAIT_STALE_DAYS = 180;
+function renderEntityCardStaleWarning(snapshots) {
+    const el = document.getElementById('entity-card-stale-warning');
+    if (!el) return;
+    const sorted = (snapshots || []).filter(s => s && s.state)
+        .slice().sort((a, b) => (a.fact_date || '').localeCompare(b.fact_date || ''));
+    const tail = sorted[sorted.length - 1];
+    const idle = tail ? daysSinceIso(tail.fact_date) : null;
+    if (idle !== null && idle > SNAPSHOT_STALE_DAYS) {
+        el.style.display = 'block';
+        el.textContent = `⚠️ 近况信息已 ${idle} 天未更新（最后快照 ${tail.fact_date || '未知日期'}）。`;
+    } else {
+        el.style.display = 'none';
+    }
+}
+
 function renderEntityCardSnapshots(snapshots) {
     const container = document.getElementById('entity-card-snapshots');
     container.replaceChildren();
@@ -462,6 +500,15 @@ function renderEntityCardSnapshots(snapshots) {
         body.textContent = snapshot.state;
         item.appendChild(header);
         item.appendChild(body);
+        if (snapshot.user_view || snapshot.ai_view) {
+            const diary = document.createElement('div');
+            diary.className = 'entity-card-snapshot-diary';
+            const bits = [];
+            if (snapshot.user_view) bits.push(`她：${snapshot.user_view}`);
+            if (snapshot.ai_view) bits.push(`我：${snapshot.ai_view}`);
+            diary.textContent = bits.join(' · ');
+            item.appendChild(diary);
+        }
         const actions = document.createElement('div');
         actions.className = 'toolbar entity-card-snapshot-actions';
         const editButton = document.createElement('button');
@@ -561,6 +608,15 @@ function renderEntityCardTraits(traits) {
         header.className = `entity-card-trait-header ${statusClass}`;
         header.textContent = `【${statusLabel}】首见 ${trait.first_seen || '未知'} · 最后确认 ${trait.last_confirmed || '未知'}`
             + `${evidenceMem ? ` · 证据记忆 ${evidenceMem}` : ''}${evidenceMsg ? ` · 证据消息 ${evidenceMsg}` : ''}`;
+        if (active) {
+            const idle = trait.last_confirmed ? daysSinceIso(trait.last_confirmed) : null;
+            if (idle !== null && idle > TRAIT_STALE_DAYS) {
+                const staleBadge = document.createElement('span');
+                staleBadge.className = 'entity-badge entity-badge-dormant';
+                staleBadge.textContent = `已 ${idle} 天未确认`;
+                header.appendChild(staleBadge);
+            }
+        }
         const body = document.createElement('div');
         body.textContent = trait.text;
         item.appendChild(header);
@@ -699,6 +755,12 @@ function renderEntityCardProposals(proposals) {
         const meta = document.createElement('div');
         meta.className = 'section-desc';
         const parts = [];
+        if (proposal.user_view || proposal.ai_view) {
+            const views = [];
+            if (proposal.user_view) views.push(`她：${proposal.user_view}`);
+            if (proposal.ai_view) views.push(`我：${proposal.ai_view}`);
+            parts.push(`看法：${views.join(' · ')}`);
+        }
         if (proposal.evidence_memory_id) parts.push(`证据记忆 #${proposal.evidence_memory_id}`);
         if ((proposal.evidence_memory_ids || []).length) parts.push(`证据记忆 ${proposal.evidence_memory_ids.map(id => `#${id}`).join('、')}`);
         if (proposal.evidence_message_id) parts.push(`证据消息 #${proposal.evidence_message_id}`);
@@ -738,6 +800,7 @@ async function loadEntityCard(entityId) {
         document.getElementById('entity-card-description-edit').value = card.description || '';
         renderEntityCardTraits(card.stable_traits || []);
         renderEntityCardSnapshots(card.snapshots || []);
+        renderEntityCardStaleWarning(card.snapshots || []);
         renderEntityCardProposals(data.proposals || []);
         document.getElementById('entity-profile-current').textContent = formatEntityProfile(
             selectedEntity ? selectedEntity.profile_json : null,
@@ -775,6 +838,8 @@ async function addEntityCardSnapshot() {
     const factDate = document.getElementById('entity-card-snapshot-date').value;
     const memoryIdText = document.getElementById('entity-card-snapshot-memory').value.trim();
     const messageIdText = document.getElementById('entity-card-snapshot-message').value.trim();
+    const userView = document.getElementById('entity-card-snapshot-user-view').value.trim();
+    const aiView = document.getElementById('entity-card-snapshot-ai-view').value.trim();
     if (!state) {
         feedback.textContent = '快照状态不能为空。';
         return;
@@ -783,7 +848,7 @@ async function addEntityCardSnapshot() {
         feedback.textContent = '快照日期不能为空。';
         return;
     }
-    const payload = { state, fact_date: factDate };
+    const payload = { state, fact_date: factDate, user_view: userView, ai_view: aiView };
     if (memoryIdText) {
         if (!/^\d+$/.test(memoryIdText)) { feedback.textContent = '证据记忆 ID 必须是整数。'; return; }
         payload.evidence_memory_id = Number(memoryIdText);
@@ -803,7 +868,10 @@ async function addEntityCardSnapshot() {
         document.getElementById('entity-card-snapshot-state').value = '';
         document.getElementById('entity-card-snapshot-memory').value = '';
         document.getElementById('entity-card-snapshot-message').value = '';
+        document.getElementById('entity-card-snapshot-user-view').value = '';
+        document.getElementById('entity-card-snapshot-ai-view').value = '';
         renderEntityCardSnapshots(data.card ? data.card.snapshots : []);
+        renderEntityCardStaleWarning(data.card ? data.card.snapshots : []);
         status.textContent = '已新增快照，当前状态由末节点自动更新。';
     } catch (error) {
         feedback.textContent = error.message;

@@ -359,10 +359,15 @@ def normalize_entity_snapshot(raw) -> Optional[Dict]:
     if evidence_quote:
         evidence_quote = evidence_quote[:SNAPSHOT_QUOTE_LIMIT]
 
+    user_view = sanitize_user_references(re.sub(r"\s+", " ", str(raw.get("user_view") or "")).strip())[:60]
+    ai_view = sanitize_user_references(re.sub(r"\s+", " ", str(raw.get("ai_view") or "")).strip())[:60]
+
     return {
         "state": state,
         "fact_date": fact_date,
         "evidence_quote": evidence_quote,
+        "user_view": user_view,
+        "ai_view": ai_view,
     }
 
 
@@ -964,16 +969,19 @@ async def suggest_entity_trait_candidates(
     memories: List[Dict],
     evidence_message_map: Optional[Dict] = None,
     current_traits: Optional[List[str]] = None,
-) -> List[Dict]:
-    """One LLM call to propose stable-trait candidates and flag contradictions.
+) -> Dict:
+    """One LLM call to propose stable-trait candidates, flag contradictions, and
+    re-confirm still-valid existing traits.
 
     Each candidate must cite ≥2 distinct evidence memories; contradictions are
-    only returned for active traits the evidence clearly supersedes. Returns
-    {"candidates": [...], "contradictions": [...]}; persistence (trait_add /
-    trait_retire proposals) happens in the caller.
+    only returned for active traits the evidence clearly supersedes; `confirmed`
+    lists existing active trait texts that fresh evidence still supports. Returns
+    {"candidates": [...], "contradictions": [...], "confirmed": [...]};
+    persistence (bump last_confirmed / trait_add / trait_retire) happens in the
+    caller.
     """
     if not memories or not get_memory_api_key():
-        return []
+        return {"candidates": [], "contradictions": [], "confirmed": []}
     evidence_map = evidence_message_map or {}
     evidence_lines = []
     for memory in memories:
@@ -995,18 +1003,21 @@ async def suggest_entity_trait_candidates(
 证据记忆：
 {chr(10).join(evidence_lines)}
 
-请仅依据上述证据，为这个实体做两件事，只返回一个 JSON 对象：
-{{"candidates": [候选数组], "contradictions": [矛盾数组]}}
+请仅依据上述证据，为这个实体做三件事，只返回一个 JSON 对象：
+{{"candidates": [候选数组], "contradictions": [矛盾数组], "confirmed": [仍成立的现有活跃特征原文数组]}}
 candidates 每条：
 {{"text": "一句话特征（≤120字，第一人称口吻：我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）", "first_seen": "YYYY-MM-DD", "last_confirmed": "YYYY-MM-DD", "evidence_memory_ids": [至少两条不同证据记忆ID]}}
 contradictions 每条：
 {{"text": "被新证据推翻/取代的【当前活跃稳定特征】原文", "evidence_memory_ids": [支持矛盾判断的证据记忆ID]}}
+confirmed 每条：
+{{"text": "【当前活跃稳定特征】里仍被上方证据支持、应当继续保持的原文", "evidence_memory_ids": [支持它仍成立的最相关证据记忆ID]}}
 要求：
 - candidates 每条必须引用至少两条**不同**的证据记忆 ID（只能引用上方出现的 ID）；与当前已有活跃特征重复的不要输出；
 - contradictions 只能引用「当前已有活跃稳定特征」里的原文，且要有上方证据记忆明确支持"它已不再成立/被取代"；没有明确矛盾的不要输出；
+- confirmed 只能引用「当前已有活跃稳定特征」里的原文，且要有上方证据记忆明确支持它仍然成立；没有明确支持的不要输出；
 - 一次性事件、临时心情、短期计划、琐碎日常不要输出；
 - first_seen 取证据中最早出现时间，last_confirmed 取最近支持时间；无法确定就留空字符串；
-- 证据不足时 candidates/contradictions 返回空数组；禁止推测证据中没有的信息。
+- 证据不足时 candidates/contradictions/confirmed 返回空数组；禁止推测证据中没有的信息。
 只返回 JSON 对象。
 """
     request_messages = [{"role": "user", "content": prompt}]
@@ -1019,7 +1030,7 @@ contradictions 每条：
             )
             if response.status_code != 200:
                 print(f"⚠️ 稳定特征候选生成失败: {response.status_code} {response.text[:200]}")
-                return []
+                return {"candidates": [], "contradictions": [], "confirmed": []}
             text = _extract_response_content(response.json()).strip()
             try:
                 parsed = parse_json_object(text)
@@ -1037,16 +1048,16 @@ contradictions 每条：
                     ]},
                 )
                 if retry_response.status_code != 200:
-                    return {"candidates": [], "contradictions": []}
+                    return {"candidates": [], "contradictions": [], "confirmed": []}
                 retry_text = _extract_response_content(retry_response.json()).strip()
                 try:
                     parsed = parse_json_object(retry_text)
                 except ValueError:
                     print(f"⚠️ 稳定特征候选重试仍无法解析: {retry_text[:200]}")
-                    return {"candidates": [], "contradictions": []}
+                    return {"candidates": [], "contradictions": [], "confirmed": []}
     except Exception as exc:
         print(f"⚠️ 稳定特征候选生成异常: type={type(exc).__name__}, {exc!r}")
-        return {"candidates": [], "contradictions": []}
+        return {"candidates": [], "contradictions": [], "confirmed": []}
     known_ids = {int(m.get("id")) for m in memories if m.get("id")}
     candidates = []
     seen_texts = set()
@@ -1109,8 +1120,22 @@ contradictions 每条：
                 seen.add(mid)
                 mem_ids.append(mid)
         contradictions.append({"text": text, "evidence_memory_ids": mem_ids})
-    print(f"📝 稳定特征：实体 {entity.get('id')}，候选 {len(candidates)} 条，矛盾 {len(contradictions)} 条")
-    return {"candidates": candidates, "contradictions": contradictions}
+    # 再确认：只保留"当前已有活跃特征"里仍被证据支持的（原文逐字命中）
+    confirmed = []
+    seen_confirmed = set()
+    for item in (parsed.get("confirmed") if isinstance(parsed, dict) else []) or []:
+        if not isinstance(item, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if not text or text.casefold() not in current_keys:
+            continue
+        key = text.casefold()
+        if key in seen_confirmed:
+            continue
+        seen_confirmed.add(key)
+        confirmed.append({"text": text})
+    print(f"📝 稳定特征：实体 {entity.get('id')}，候选 {len(candidates)} 条，矛盾 {len(contradictions)} 条，再确认 {len(confirmed)} 条")
+    return {"candidates": candidates, "contradictions": contradictions, "confirmed": confirmed}
 
 
 # ---- 三元一场认知模型 ----
