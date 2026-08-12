@@ -1616,30 +1616,30 @@ body::after {
     line-height: 1.7;
 }
 
-/* 实体管理区状态栏：独占一行、带底色，避免按钮点了"没反应"的错觉 */
+/* 实体管理区状态：跟「小贴士」卡片一个语言——浅色底 + 细描边 + 弱化文字，
+   紧凑地跟在按钮后，不抢眼也不至于看不见 */
 #entity-status {
-    display: block;
-    flex-basis: 100%;
-    padding: 10px 14px;
-    margin-top: 10px;
-    border-radius: 8px;
-    background: var(--info-bg);
-    color: var(--info);
-    font-size: 0.92em;
-    font-weight: 500;
+    display: inline-block;
+    padding: 5px 12px;
+    font-size: 13px;
     line-height: 1.6;
-    box-shadow: var(--shadow-sm);
+    color: var(--text-light);
+    background: var(--info-bg);
+    border: 1px solid #bae6fd;
+    border-radius: 10px;
 }
 #entity-status:empty {
     display: none;
 }
-#entity-status[data-level="error"] {
-    background: var(--danger-bg);
-    color: var(--danger);
-}
 #entity-status[data-level="success"] {
     background: var(--success-bg);
+    border-color: #c6e9d6;
     color: var(--success);
+}
+#entity-status[data-level="error"] {
+    background: var(--danger-bg);
+    border-color: #f3d0d0;
+    color: var(--danger);
 }
 
 .card,
