@@ -154,7 +154,15 @@ def _merge_cognitive_sources(rows: list, labels: list[str]) -> tuple[str, float,
 
 
 async def _migrate_cognitive_model_v2(conn) -> int:
-    """Transactionally migrate the legacy six slots into 三元一场."""
+    """Transactionally migrate the legacy six slots into 三元一场.
+
+    Only the DDL (review_after column + subject CHECK) is idempotent and safe to
+    re-run on every startup. The one-time data migration (fold legacy slots into
+    三元一场) is gated behind a gateway_config marker so it runs at most once:
+    re-running it would re-apply the old one-card-per-section collapse and
+    deactivate already-confirmed cards, which conflicts with the multi-card
+    design introduced by v3.
+    """
     migrated = 0
     async with conn.transaction():
         await conn.execute("""
@@ -184,6 +192,15 @@ async def _migrate_cognitive_model_v2(conn) -> int:
             END $$;
         """)
 
+        # 一次性数据迁移：仅旧库首次升级时真正执行。已迁移过的库靠标记跳过，
+        # 避免每次启动重复执行旧的"每区仅留一张"折叠逻辑，把已确认的卡误标为 superseded。
+        if await conn.fetchval(
+            "SELECT value FROM gateway_config WHERE key = 'cognitive_v2_migrated'"
+        ):
+            return migrated
+
+        # 收集各区块现有卡用于合并判断；只读不写，不再按"每区一张"去重停用
+        # （v3 之后支持一区多张原子卡，停用多余卡会丢掉用户已确认的卡）。
         active_rows = [
             dict(row) for row in await conn.fetch("""
                 SELECT id, subject, cognitive_type, content, confidence,
@@ -195,19 +212,8 @@ async def _migrate_cognitive_model_v2(conn) -> int:
             """)
         ]
         latest_by_type = {}
-        duplicate_ids = []
         for row in active_rows:
-            cognitive_type = row["cognitive_type"]
-            if cognitive_type in latest_by_type:
-                duplicate_ids.append(row["id"])
-            else:
-                latest_by_type[cognitive_type] = row
-        if duplicate_ids:
-            await conn.execute("""
-                UPDATE cognitive_items
-                SET status = 'superseded', updated_at = NOW()
-                WHERE id = ANY($1::int[])
-            """, duplicate_ids)
+            latest_by_type.setdefault(row["cognitive_type"], row)
 
         migration_specs = (
             ("user", "user_core", ("user_traits_preferences",), ("",)),
@@ -255,10 +261,10 @@ async def _migrate_cognitive_model_v2(conn) -> int:
                 SET status = 'superseded', updated_at = NOW()
                 WHERE id = ANY($1::int[])
             """, sorted(set(legacy_ids)))
+        # 迁移完成标记：保证数据迁移只执行一次。
         await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_cognitive_items_one_active_type
-            ON cognitive_items (cognitive_type)
-            WHERE status = 'active';
+            INSERT INTO gateway_config (key, value) VALUES ('cognitive_v2_migrated', '1')
+            ON CONFLICT (key) DO UPDATE SET value = '1'
         """)
     return migrated
 

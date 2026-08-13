@@ -221,9 +221,10 @@ class _FakeTransaction:
 
 
 class _FakeMigrationConnection:
-    def __init__(self, rows, fail_on_insert=False):
+    def __init__(self, rows, fail_on_insert=False, migrated_marker=None):
         self.rows = rows
         self.fail_on_insert = fail_on_insert
+        self.migrated_marker = migrated_marker
         self.executions = []
         self.transaction_context = _FakeTransaction()
 
@@ -232,6 +233,11 @@ class _FakeMigrationConnection:
 
     async def fetch(self, _query, *_args):
         return self.rows
+
+    async def fetchval(self, query, *_args):
+        if "cognitive_v2_migrated" in query:
+            return self.migrated_marker
+        return None
 
     async def execute(self, query, *args):
         normalized = " ".join(query.split())
@@ -322,6 +328,51 @@ class CognitiveMigrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "insert failed"):
             await database._migrate_cognitive_model_v2(conn)
         self.assertIs(conn.transaction_context.exc_type, RuntimeError)
+
+    async def test_v2_data_migration_skipped_when_marker_present(self):
+        """已迁移过的库靠标记跳过数据迁移：不插入、不取代旧卡、不重复折叠。"""
+        conn = _FakeMigrationConnection(self.legacy_rows(), migrated_marker="1")
+        migrated = await database._migrate_cognitive_model_v2(conn)
+        self.assertEqual(migrated, 0)
+        self.assertFalse(any(
+            query.startswith("INSERT INTO cognitive_items")
+            for query, _args in conn.executions
+        ))
+        self.assertFalse(any(
+            "WHERE id = ANY($1::int[])" in query
+            for query, _args in conn.executions
+        ))
+
+    async def test_v2_does_not_deactivate_multiple_cards_in_same_section(self):
+        """回归测试：一区多张 active 卡时，v2 不得把除最新外的卡停用。
+
+        旧逻辑每次启动都会把同 cognitive_type 的多余 active 卡标成 superseded，
+        与 v3 之后的多卡设计冲突，导致已确认的卡在部署/重启后消失。
+        """
+        updated_at = datetime(2026, 7, 30, tzinfo=timezone.utc)
+        rows = [
+            {
+                "id": 10, "subject": "user", "cognitive_type": "user_core",
+                "content": "最新一张", "confidence": 0.8,
+                "evidence_memory_ids": [], "status": "active",
+                "created_by": "manual", "created_at": updated_at,
+                "updated_at": updated_at, "review_after": None,
+            },
+            {
+                "id": 11, "subject": "user", "cognitive_type": "user_core",
+                "content": "更早一张", "confidence": 0.8,
+                "evidence_memory_ids": [], "status": "active",
+                "created_by": "manual", "created_at": updated_at,
+                "updated_at": updated_at, "review_after": None,
+            },
+        ]
+        conn = _FakeMigrationConnection(rows)
+        await database._migrate_cognitive_model_v2(conn)
+        # 不得把其中任何一张标成 superseded
+        self.assertFalse(any(
+            "WHERE id = ANY($1::int[])" in query
+            for query, _args in conn.executions
+        ))
 
     async def test_v3_migration_adds_layering_columns_and_drops_unique_index(self):
         conn = _FakeMigrationConnection([])
