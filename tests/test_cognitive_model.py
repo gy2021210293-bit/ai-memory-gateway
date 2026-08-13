@@ -25,27 +25,25 @@ import database
 
 
 class CognitiveModelTests(unittest.TestCase):
-    def test_normalize_accepts_all_four_sections(self):
+    def test_normalize_accepts_all_three_scopes(self):
         examples = {
             "user": "user_core",
             "self": "self_core",
             "relationship": "relationship_core",
-            "context": "current_field",
         }
-        with patch.object(database, "_local_today", return_value=date(2026, 7, 30)):
-            for subject, cognitive_type in examples.items():
-                item = database.normalize_cognitive_item_input({
-                    "subject": subject,
-                    "cognitive_type": cognitive_type,
-                    "content": "  有证据的认知  ",
-                    "confidence": 0.8,
-                    "evidence_memory_ids": [3, "4", 3, "bad"],
-                })
-                self.assertEqual(item["subject"], subject)
-                self.assertEqual(item["content"], "有证据的认知")
-                self.assertEqual(item["evidence_memory_ids"], [3, 4])
-                expected_review = date(2026, 8, 13) if cognitive_type == "current_field" else None
-                self.assertEqual(item["review_after"], expected_review)
+        for subject, cognitive_type in examples.items():
+            item = database.normalize_cognitive_item_input({
+                "subject": subject,
+                "cognitive_type": cognitive_type,
+                "content": "  有证据的认知  ",
+                "confidence": 0.8,
+                "evidence_memory_ids": [3, "4", 3, "bad"],
+            })
+            self.assertEqual(item["subject"], subject)
+            self.assertEqual(item["content"], "有证据的认知")
+            self.assertEqual(item["evidence_memory_ids"], [3, 4])
+            # 未显式给 review_after 时不再自动默认；稳定/当前由前端开关决定
+            self.assertIsNone(item["review_after"])
 
     def test_normalize_rejects_unknown_subject_and_type(self):
         with self.assertRaises(ValueError):
@@ -69,14 +67,19 @@ class CognitiveModelTests(unittest.TestCase):
                 "content": "旧槽位",
             })
 
-    def test_current_field_review_date_can_be_explicit(self):
-        item = database.normalize_cognitive_item_input({
-            "subject": "context",
-            "cognitive_type": "current_field",
-            "content": "近期安排",
-            "review_after": "2026-08-05",
-        })
-        self.assertEqual(item["review_after"], date(2026, 8, 5))
+    def test_review_date_can_be_explicit_on_any_scope(self):
+        for subject, cognitive_type in (
+            ("user", "user_core"),
+            ("self", "self_core"),
+            ("relationship", "relationship_core"),
+        ):
+            item = database.normalize_cognitive_item_input({
+                "subject": subject,
+                "cognitive_type": cognitive_type,
+                "content": "近期安排",
+                "review_after": "2026-08-05",
+            })
+            self.assertEqual(item["review_after"], date(2026, 8, 5))
 
     def test_normalize_keeps_long_item_content(self):
         item = database.normalize_cognitive_item_input({
@@ -105,12 +108,13 @@ class CognitiveModelTests(unittest.TestCase):
                 "content": "x", "action": "bogus",
             })
 
-    def test_normalize_requires_target_id_for_reinforce_or_supersede(self):
-        with self.assertRaises(ValueError):
-            database.normalize_cognitive_item_input({
-                "subject": "user", "cognitive_type": "user_core",
-                "content": "x", "action": "reinforce",
-            })
+    def test_normalize_requires_target_id_for_reinforce_supersede_or_conflict(self):
+        for action in ("reinforce", "supersede", "conflict"):
+            with self.assertRaises(ValueError):
+                database.normalize_cognitive_item_input({
+                    "subject": "user", "cognitive_type": "user_core",
+                    "content": "x", "action": action,
+                })
         with self.assertRaises(ValueError):
             database.normalize_cognitive_item_input({
                 "subject": "user", "cognitive_type": "user_core",
@@ -118,8 +122,9 @@ class CognitiveModelTests(unittest.TestCase):
             })
         item = database.normalize_cognitive_item_input({
             "subject": "user", "cognitive_type": "user_core",
-            "content": "x", "action": "supersede", "target_id": 7,
+            "content": "x", "action": "conflict", "target_id": 7,
         })
+        self.assertEqual(item["action"], "conflict")
         self.assertEqual(item["target_id"], 7)
 
     def test_prompt_does_not_truncate_a_selected_item(self):
@@ -130,7 +135,7 @@ class CognitiveModelTests(unittest.TestCase):
         }])
         self.assertIn(content, prompt)
 
-    def test_prompt_groups_three_cores_and_current_field(self):
+    def test_prompt_groups_three_scopes_and_stability_markers(self):
         prompt = database.format_cognitive_items_for_prompt([
             {"subject": "user", "cognitive_type": "user_core",
              "content": "偏好简短回答", "confidence": 0.8,
@@ -140,7 +145,7 @@ class CognitiveModelTests(unittest.TestCase):
              "level": "deductive", "times_derived": 1},
             {"subject": "relationship", "cognitive_type": "relationship_core",
              "content": "共同检查证据", "confidence": 0.95},
-            {"subject": "context", "cognitive_type": "current_field",
+            {"subject": "user", "cognitive_type": "user_core",
              "content": "正在准备旅行", "confidence": 0.8,
              "review_after": date(2026, 8, 13)},
         ], today=date(2026, 7, 30))
@@ -150,7 +155,9 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertIn("[演绎推断·强化×1｜置信度0.90] 重视诚实", prompt)
         self.assertIn("【AI 自我核心】", prompt)
         self.assertIn("【关系核心】", prompt)
-        self.assertIn("【当前认知场】", prompt)
+        self.assertNotIn("当前认知场", prompt)
+        # 未到期的 current 卡带稳定度标记
+        self.assertIn("正在准备旅行（当前状态）", prompt)
         self.assertIn("当前用户消息", prompt)
 
     def test_prompt_uses_fixed_order_without_total_budget(self):
@@ -164,20 +171,20 @@ class CognitiveModelTests(unittest.TestCase):
             for cognitive_type in reversed(database.COGNITIVE_TYPE_ORDER)
         ]
         prompt = database.format_cognitive_items_for_prompt(items)
-        labels = ["用户核心", "AI 自我核心", "关系核心", "当前认知场"]
+        labels = ["用户核心", "AI 自我核心", "关系核心"]
         positions = [prompt.index(label) for label in labels]
         self.assertEqual(positions, sorted(positions))
-        self.assertGreater(len(prompt), 1200)
+        self.assertGreater(len(prompt), 1000)
 
     def test_prompt_keeps_top_cards_per_section_and_drops_lowest_ranked(self):
         prompt = database.format_cognitive_items_for_prompt([
-            {"subject": "context", "cognitive_type": "current_field",
+            {"subject": "user", "cognitive_type": "user_core",
              "content": "较早状态", "level": "explicit", "times_derived": 1, "id": 1},
-            {"subject": "context", "cognitive_type": "current_field",
+            {"subject": "user", "cognitive_type": "user_core",
              "content": "重复状态", "level": "explicit", "times_derived": 1, "id": 2},
-            {"subject": "context", "cognitive_type": "current_field",
+            {"subject": "user", "cognitive_type": "user_core",
              "content": "第四状态", "level": "explicit", "times_derived": 1, "id": 4},
-            {"subject": "context", "cognitive_type": "current_field",
+            {"subject": "user", "cognitive_type": "user_core",
              "content": "推断状态", "level": "inductive", "times_derived": 9, "id": 3},
         ])
         # 每格最多 COGNITIVE_PER_TYPE_LIMIT 张：明确陈述优先，归纳推断被挤出
@@ -186,10 +193,10 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertIn("第四状态", prompt)
         self.assertNotIn("推断状态", prompt)
 
-    def test_stale_current_field_is_still_injected_with_warning(self):
+    def test_stale_current_card_is_still_injected_with_warning(self):
         item = {
-            "subject": "context",
-            "cognitive_type": "current_field",
+            "subject": "user",
+            "cognitive_type": "user_core",
             "content": "旧的当前状态",
             "confidence": 0.6,
             "review_after": date(2026, 7, 30),
@@ -334,6 +341,16 @@ class CognitiveMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("'create', 'reinforce', 'supersede'", combined)
         self.assertIn("idx_cognitive_revision_log_type_time", combined)
 
+    async def test_v5_migration_folds_current_field_into_user_core(self):
+        conn = _FakeMigrationConnection([])
+        await database._migrate_cognitive_model_v5(conn)
+        combined = " ".join(query for query, _args in conn.executions)
+        self.assertIn("UPDATE cognitive_items", combined)
+        self.assertIn("cognitive_type = 'current_field'", combined)
+        self.assertIn("UPDATE cognitive_revision_log", combined)
+        self.assertIn("'user', 'self', 'relationship'", combined)
+        self.assertIn("DROP CONSTRAINT cognitive_items_subject_check", combined)
+
 
 class _FakeAcquire:
     def __init__(self, conn):
@@ -365,16 +382,21 @@ TARGET_CARD = {
 class _FakeSaveConnection:
     """Minimal stand-in for the save_cognitive_item query flow."""
 
-    def __init__(self, target=None):
+    def __init__(self, target=None, duplicate_content=None):
         self.transaction_context = _FakeTransaction()
         self.executions = []
         self.target = target
+        self.duplicate_content = duplicate_content
 
     def transaction(self):
         return self.transaction_context
 
-    async def fetch(self, _query, evidence_ids):
-        return [{"id": memory_id} for memory_id in evidence_ids]
+    async def fetch(self, query, arg):
+        normalized = " ".join(query.split())
+        if "FROM cognitive_items" in normalized:
+            # create 去重查询：默认返回空（不重复），可用 duplicate_content 制造命中
+            return [{"content": self.duplicate_content}] if self.duplicate_content else []
+        return [{"id": memory_id} for memory_id in arg]
 
     async def fetchrow(self, query, *args):
         normalized = " ".join(query.split())
@@ -502,6 +524,27 @@ class CognitiveSaveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.supersede_executions(conn), [(5, 99)])
         # 手动编辑被记录为 action=edit
         self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["edit"])
+
+    async def test_create_rejects_duplicate_content_in_same_scope(self):
+        conn = _FakeSaveConnection(duplicate_content="新的用户核心")
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "新的用户核心", "level": "explicit",
+                "confidence": 0.8, "evidence_memory_ids": [2, 3],
+            })
+        self.assertEqual(result["error"], "该区块已存在相同内容的认知，请用强化或取代")
+
+    async def test_conflict_must_be_resolved_before_save(self):
+        conn = _FakeSaveConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "新证据", "level": "explicit",
+                "confidence": 0.6, "evidence_memory_ids": [2, 3],
+                "action": "conflict", "target_id": 5,
+            })
+        self.assertEqual(result["error"], "冲突需先裁决为具体动作（保留/取代/新建/修正）")
 
 
 class _FakeDeleteConnection:

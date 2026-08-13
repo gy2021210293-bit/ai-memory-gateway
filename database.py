@@ -66,9 +66,9 @@ USER_ENTITY_NAMES = {
     if name.strip()
 }
 
-COGNITIVE_SUBJECTS = {"user", "self", "relationship", "context"}
+COGNITIVE_SUBJECTS = {"user", "self", "relationship"}
 COGNITIVE_TYPE_ORDER = (
-    "user_core", "self_core", "relationship_core", "current_field",
+    "user_core", "self_core", "relationship_core",
 )
 COGNITIVE_TYPES = set(COGNITIVE_TYPE_ORDER)
 LEGACY_COGNITIVE_TYPES = {
@@ -86,7 +86,6 @@ COGNITIVE_TYPE_SUBJECTS = {
     "user_core": "user",
     "self_core": "self",
     "relationship_core": "relationship",
-    "current_field": "context",
 }
 COGNITIVE_ITEM_RECOMMENDED_CHARS = 120
 COGNITIVE_FIELD_REVIEW_DAYS = 14
@@ -98,7 +97,7 @@ COGNITIVE_LEVEL_LABELS = {
     "inductive": "归纳推断",
 }
 COGNITIVE_LEVEL_RANK = {"explicit": 0, "deductive": 1, "inductive": 2}
-COGNITIVE_ACTIONS = ("create", "reinforce", "supersede")
+COGNITIVE_ACTIONS = ("create", "reinforce", "supersede", "conflict")
 COGNITIVE_PER_TYPE_LIMIT = 3   # 编译注入时每格最多展示的 active 卡数
 COGNITIVE_DRAFT_TOTAL_LIMIT = 12  # 单次草稿最多返回的候选卡数
 
@@ -322,6 +321,50 @@ async def _migrate_cognitive_model_v4(conn) -> int:
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_cognitive_revision_log_type_time
             ON cognitive_revision_log (cognitive_type, created_at)
+        """)
+    return 0
+
+
+async def _migrate_cognitive_model_v5(conn) -> int:
+    """Collapse 三元一场 from four buckets to three scopes.
+
+    The former fourth bucket (current_field / subject 'context') mixed "user's
+    current state" with "topic focus". Its cards fold into user_core — review_after
+    is preserved so they remain 'current' — and the subject CHECK drops 'context'.
+    Idempotent.
+    """
+    async with conn.transaction():
+        await conn.execute("""
+            UPDATE cognitive_items
+            SET subject = 'user', cognitive_type = 'user_core'
+            WHERE cognitive_type = 'current_field'
+        """)
+        await conn.execute("""
+            UPDATE cognitive_revision_log
+            SET subject = 'user', cognitive_type = 'user_core'
+            WHERE cognitive_type = 'current_field'
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'cognitive_items'::regclass
+                      AND conname = 'cognitive_items_subject_check'
+                      AND pg_get_constraintdef(oid) LIKE '%context%'
+                ) THEN
+                    ALTER TABLE cognitive_items
+                    DROP CONSTRAINT cognitive_items_subject_check;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'cognitive_items'::regclass
+                      AND conname = 'cognitive_items_subject_check'
+                ) THEN
+                    ALTER TABLE cognitive_items
+                    ADD CONSTRAINT cognitive_items_subject_check
+                    CHECK (subject IN ('user', 'self', 'relationship'));
+                END IF;
+            END $$;
         """)
     return 0
 
@@ -732,7 +775,7 @@ async def init_tables():
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS cognitive_items (
                 id                  SERIAL PRIMARY KEY,
-                subject             TEXT NOT NULL CHECK (subject IN ('user', 'self', 'relationship', 'context')),
+                subject             TEXT NOT NULL CHECK (subject IN ('user', 'self', 'relationship')),
                 cognitive_type      TEXT NOT NULL,
                 content             TEXT NOT NULL,
                 confidence          REAL NOT NULL DEFAULT 0.7 CHECK (confidence >= 0 AND confidence <= 1),
@@ -754,6 +797,7 @@ async def init_tables():
             print(f"✅ 三元一场认知模型已迁移 {migrated_cognitive_items} 个区块")
         await _migrate_cognitive_model_v3(conn)
         await _migrate_cognitive_model_v4(conn)
+        await _migrate_cognitive_model_v5(conn)
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -5125,6 +5169,11 @@ async def merge_entities(source_id: int, target_id: int):
 # 三元认知模型
 # ============================================================
 
+def _normalize_cognitive_content(content) -> str:
+    """Fold whitespace + case for duplicate detection."""
+    return re.sub(r"\s+", " ", str(content or "")).strip().casefold()
+
+
 def normalize_cognitive_item_input(data: dict) -> dict:
     """Validate the deliberately small manual cognitive-item schema."""
     subject = str(data.get("subject", "")).strip().lower()
@@ -5133,7 +5182,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
     if cognitive_type in LEGACY_COGNITIVE_TYPES:
         raise ValueError("认知模型已升级为“三元一场”，请刷新页面后重试")
     if subject not in COGNITIVE_SUBJECTS:
-        raise ValueError("subject 必须是 user、self、relationship 或 context")
+        raise ValueError("subject 必须是 user、self 或 relationship")
     if cognitive_type not in COGNITIVE_TYPES:
         raise ValueError("不支持的认知类型")
     if COGNITIVE_TYPE_SUBJECTS[cognitive_type] != subject:
@@ -5149,7 +5198,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         raise ValueError("level 必须是 explicit、deductive 或 inductive")
     action = str(data.get("action", "create")).strip().lower()
     if action not in COGNITIVE_ACTIONS:
-        raise ValueError("action 必须是 create、reinforce 或 supersede")
+        raise ValueError("action 必须是 create、reinforce、supersede 或 conflict")
     target_id = data.get("target_id")
     if target_id in (None, ""):
         target_id = None
@@ -5159,7 +5208,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         except (TypeError, ValueError):
             raise ValueError("target_id 必须是卡片 ID")
     if action != "create" and target_id is None:
-        raise ValueError("reinforce / supersede 必须指定 target_id")
+        raise ValueError("reinforce / supersede / conflict 必须指定 target_id")
     evidence_ids = []
     for value in data.get("evidence_memory_ids", []) or []:
         try:
@@ -5169,11 +5218,9 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         if memory_id > 0 and memory_id not in evidence_ids:
             evidence_ids.append(memory_id)
     review_after = None
-    if cognitive_type == "current_field":
-        raw_review_after = data.get("review_after")
-        if raw_review_after in (None, ""):
-            review_after = _local_today() + timedelta(days=COGNITIVE_FIELD_REVIEW_DAYS)
-        elif isinstance(raw_review_after, datetime):
+    raw_review_after = data.get("review_after")
+    if raw_review_after not in (None, ""):
+        if isinstance(raw_review_after, datetime):
             review_after = raw_review_after.date()
         elif isinstance(raw_review_after, date):
             review_after = raw_review_after
@@ -5196,7 +5243,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
 
 
 def is_cognitive_item_stale(item: dict, today: date = None) -> bool:
-    if item.get("cognitive_type") != "current_field" or not item.get("review_after"):
+    if not item.get("review_after"):
         return False
     review_after = item["review_after"]
     if isinstance(review_after, str):
@@ -5214,7 +5261,6 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
         "user_core": "用户核心",
         "self_core": "AI 自我核心",
         "relationship_core": "关系核心",
-        "current_field": "当前认知场",
     }
     by_type = {}
     for item in items:
@@ -5252,8 +5298,10 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
             evidence = item.get("evidence_memory_ids") or []
             evidence_text = "（证据 " + "、".join(f"#{e}" for e in evidence) + "）" if evidence else ""
             stale = ""
-            if cognitive_type == "current_field" and is_cognitive_item_stale(item, today=today):
+            if is_cognitive_item_stale(item, today=today):
                 stale = "（可能过时，只能作为背景）"
+            elif item.get("review_after"):
+                stale = "（当前状态）"
             lines.append(
                 f"- [{level_label}·强化×{times}｜置信度{confidence:.2f}] "
                 f"{str(item.get('content', '')).strip()}{evidence_text}{stale}"
@@ -5263,8 +5311,8 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
         return ""
     return "【三元一场认知模型】\n" + "\n\n".join(sections) + (
         "\n\n使用规则：当前用户消息，以及其中更明确、更新的日期或状态，始终优先于以上认知；"
-        "置信度较低的内容只能保守参考；标记为“可能过时”的当前认知场只能作为背景，"
-        "不得当作当前事实；“明确陈述”优先于“演绎推断”，“归纳推断”仅为倾向；"
+        "置信度较低的内容只能保守参考；标记为“可能过时”的认知只能作为背景，不得当作当前事实；"
+        "“明确陈述”优先于“演绎推断”，“归纳推断”仅为倾向；"
         "自然体现相关认知，不要向用户展示内部字段。"
     )
 
@@ -5283,8 +5331,7 @@ async def list_cognitive_items(active_only: bool = False):
                          WHEN 'user_core' THEN 1
                          WHEN 'self_core' THEN 2
                          WHEN 'relationship_core' THEN 3
-                         WHEN 'current_field' THEN 4
-                         ELSE 5
+                         ELSE 4
                      END,
                      updated_at DESC, id DESC
         """)
@@ -5308,6 +5355,8 @@ async def save_cognitive_item(data: dict, item_id: int = None):
             # 编辑既有卡 == 以新版本取代它；否则按 action 处理 create / reinforce / supersede。
             action = "supersede" if item_id is not None else item["action"]
             target_id = item_id if item_id is not None else item["target_id"]
+            if action == "conflict":
+                return {"error": "冲突需先裁决为具体动作（保留/取代/新建/修正）"}
 
             target = None
             if target_id is not None:
@@ -5352,9 +5401,16 @@ async def save_cognitive_item(data: dict, item_id: int = None):
                 )
             else:
                 # create 或 supersede：插入新卡；supersede 保留旧卡为历史并记录指针。
+                if action == "create":
+                    existing = await conn.fetch("""
+                        SELECT content FROM cognitive_items
+                        WHERE cognitive_type = $1 AND status = 'active'
+                    """, item["cognitive_type"])
+                    norm = _normalize_cognitive_content(item["content"])
+                    if any(_normalize_cognitive_content(row["content"]) == norm for row in existing):
+                        return {"error": "该区块已存在相同内容的认知，请用强化或取代"}
                 review_after = item["review_after"]
-                if (not review_after and item["cognitive_type"] == "current_field"
-                        and target and target["review_after"]):
+                if not review_after and target and target["review_after"]:
                     review_after = target["review_after"]
                 carry = int(target["times_derived"]) if target else 1
                 row = await conn.fetchrow("""

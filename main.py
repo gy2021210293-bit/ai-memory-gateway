@@ -33,7 +33,7 @@ from database import init_tables, close_pool, search_memories, save_memory, get_
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
-from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK
@@ -2845,7 +2845,12 @@ async def api_generate_cognitive_draft():
         int(item["id"]): item for item in current_items
         if item.get("id") is not None
     }
-    draft, seen_counts = [], {}
+    existing_norms = {}
+    for it in current_items:
+        existing_norms.setdefault(it["cognitive_type"], set()).add(
+            _normalize_cognitive_content(it.get("content"))
+        )
+    draft, seen_counts, seen_norms = [], {}, {}
     for raw_item in raw_draft:
         if not isinstance(raw_item, dict):
             continue
@@ -2863,15 +2868,29 @@ async def api_generate_cognitive_draft():
         ]
         if not item["evidence_memory_ids"]:
             continue
-        # reinforce / supersede 必须指向同一区块的现有 active 卡；无效引用降级为 create，
-        # 避免丢失模型已提取的认知内容。
-        if item["action"] != "create":
+        action = item["action"]
+        if action in ("reinforce", "supersede"):
+            # 无效引用降级为 create，避免丢失模型已提取的认知内容。
             target = active_by_id.get(item["target_id"])
             if (not target
                     or target["cognitive_type"] != cognitive_type
                     or target.get("subject") != item["subject"]):
                 item["action"] = "create"
                 item["target_id"] = None
+                action = "create"
+        elif action == "conflict":
+            # 冲突必须指向同区块现存 active 卡；无效引用丢弃（不降级）。
+            target = active_by_id.get(item["target_id"])
+            if (not target
+                    or target["cognitive_type"] != cognitive_type
+                    or target.get("subject") != item["subject"]):
+                continue
+        if action == "create":
+            norm = _normalize_cognitive_content(item["content"])
+            if (norm in existing_norms.get(cognitive_type, set())
+                    or norm in seen_norms.get(cognitive_type, set())):
+                continue  # 与现有卡或本批候选内容重复
+            seen_norms.setdefault(cognitive_type, set()).add(norm)
         if seen_counts.get(cognitive_type, 0) >= COGNITIVE_PER_TYPE_LIMIT:
             continue
         seen_counts[cognitive_type] = seen_counts.get(cognitive_type, 0) + 1

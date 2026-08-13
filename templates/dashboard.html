@@ -46,6 +46,7 @@
                 <a href="#" class="nav-item" data-section="cognition">
                     <span class="nav-icon">◉</span>
                     <span class="nav-label">认知模型</span>
+                    <span class="nav-badge" id="cognition-due-badge" style="display:none"></span>
                 </a>
                 <a href="#" class="nav-item" data-section="settings">
                     <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></span>
@@ -617,7 +618,7 @@
             <section id="section-cognition" class="section">
                 <div class="section-header">
                     <h1>三元一场认知模型</h1>
-                    <p class="section-desc">以原子认知卡维护用户核心、AI 自我核心、关系核心与当前认知场；每条卡标注明确陈述/演绎推断/归纳推断，草稿只供预览，逐项确认后才会进入聊天上下文。</p>
+                    <p class="section-desc">以原子认知卡维护用户核心、AI 自我核心、关系核心三格；每条卡标注明确陈述/演绎推断/归纳推断与「稳定/当前」稳定度，草稿只供预览，逐项确认后才会进入聊天上下文。</p>
                 </div>
                 <div class="card">
                     <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
@@ -638,6 +639,12 @@
                                 <option value="explicit">明确陈述</option>
                                 <option value="deductive">演绎推断</option>
                                 <option value="inductive">归纳推断</option>
+                            </select>
+                        </label>
+                        <label>稳定度
+                            <select id="cognition-stability" class="input" style="width:110px" onchange="onCognitionStabilityChange()">
+                                <option value="stable">稳定</option>
+                                <option value="current">当前</option>
                             </select>
                         </label>
                         <label>置信度

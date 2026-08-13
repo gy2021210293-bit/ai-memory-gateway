@@ -219,7 +219,7 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(failed_result)
         self.assertEqual(empty_result, [])
 
-    async def test_cognitive_draft_prompt_reviews_all_four_sections(self):
+    async def test_cognitive_draft_prompt_reviews_all_three_scopes(self):
         response = Mock()
         response.status_code = 200
         response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
@@ -245,14 +245,43 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("user_core", prompt)
         self.assertIn("self_core", prompt)
         self.assertIn("relationship_core", prompt)
-        self.assertIn("current_field", prompt)
+        self.assertNotIn("current_field", prompt)
         self.assertIn("card_id=10", prompt)
         self.assertIn("card_id=11", prompt)
         self.assertIn("自我旧认知", prompt)
         self.assertIn("用户旧认知", prompt)
         self.assertIn("原子化：每条候选只陈述一个自包含的认知", prompt)
-        self.assertIn("action 为 reinforce / supersede 时，target_id 必须指向同一区块的 active 卡", prompt)
+        self.assertIn("reinforce / supersede / conflict 的 target_id 必须指向同区块的 active 卡", prompt)
         self.assertIn("不能提出删除", prompt)
+
+    async def test_cognitive_draft_prompt_covers_conflict_stability_and_evidence_independence(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_cognitive_draft(
+                [{"id": 1, "content": "证据", "layer": 1, "importance": 8,
+                  "created_at": "2026-07-30T08:00:00+00:00"}],
+                [
+                    {"subject": "user", "cognitive_type": "user_core", "content": "用户当前状态",
+                     "level": "explicit", "times_derived": 1, "evidence_memory_ids": [1],
+                     "id": 10, "review_after": "2026-08-13"},
+                ],
+            )
+
+        self.assertEqual(result, [])
+        prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("conflict 冲突", prompt)
+        self.assertIn("同一次对话里的复述不算多份独立证据", prompt)
+        self.assertIn("稳定度（review_after）", prompt)
+        self.assertIn("[当前]", prompt)  # 现有卡带稳定度标记
+        self.assertIn("不要为“正在聊的话题/主题”建卡", prompt)
+        self.assertIn("候选内容不得与任一区块现有 active 卡实质重复", prompt)
 
     async def test_cognitive_draft_prompt_feeds_back_human_revisions(self):
         response = Mock()

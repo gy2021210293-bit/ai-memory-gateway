@@ -1297,24 +1297,37 @@ const COGNITIVE_LEVEL_LABELS = {
 const COGNITION_SECTIONS = [
     {
         subject: 'user', cognitive_type: 'user_core', label: '用户核心',
-        description: '稳定的价值、需求、偏好、敏感点与边界。',
+        description: '关于你的稳定身份/偏好（稳定）与近期状态/待办（当前）。',
     },
     {
         subject: 'self', cognitive_type: 'self_core', label: 'AI 自我核心',
-        description: '栖的身份、价值、承诺、能力边界与成长理解。',
+        description: '关于我的定位/原则（稳定）与近期状态/待办（当前）。',
     },
     {
         subject: 'relationship', cognitive_type: 'relationship_core', label: '关系核心',
-        description: '关系定义、相处方式、共同约定、稳定模式与长期方向。',
-    },
-    {
-        subject: 'context', cognitive_type: 'current_field', label: '当前认知场',
-        description: '当前仍有效的状态、目标、计划与未完成事项。',
+        description: '我们关系的基调/约定（稳定）与近期共同事项（当前）。',
     },
 ];
 
 function cognitionSection(cognitiveType) {
     return COGNITION_SECTIONS.find(section => section.cognitive_type === cognitiveType);
+}
+
+function defaultReviewAfter() {
+    const d = new Date();
+    d.setDate(d.getDate() + 14);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+}
+
+function onCognitionStabilityChange() {
+    const current = document.getElementById('cognition-stability').value === 'current';
+    const wrap = document.getElementById('cognition-review-wrap');
+    if (wrap) wrap.style.display = current ? '' : 'none';
+    const dateInput = document.getElementById('cognition-review-after');
+    if (current && dateInput && !dateInput.value) dateInput.value = defaultReviewAfter();
 }
 
 async function loadCognitiveItems() {
@@ -1329,9 +1342,22 @@ async function loadCognitiveItems() {
         cognitiveItems = data.items || [];
         renderCognitiveItems();
         renderCognitiveRevisions();
+        updateCognitiveDueBadge();
         status.textContent = `${cognitiveItems.length} 条认知`;
     } catch (error) {
         status.textContent = error.message;
+    }
+}
+
+function updateCognitiveDueBadge() {
+    const badge = document.getElementById('cognition-due-badge');
+    if (!badge) return;
+    const due = cognitiveItems.filter(item => item.is_stale).length;
+    if (due > 0) {
+        badge.textContent = `待复核 ${due}`;
+        badge.style.display = '';
+    } else {
+        badge.style.display = 'none';
     }
 }
 
@@ -1377,6 +1403,10 @@ function cognitiveCardRow(item) {
     const level = document.createElement('span');
     level.className = `cognition-level level-${item.level || 'explicit'}`;
     level.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
+    const stability = document.createElement('span');
+    const isCurrent = !!item.review_after;
+    stability.className = `cognition-stability stability-${isCurrent ? 'current' : 'stable'}`;
+    stability.textContent = isCurrent ? '当前' : '稳定';
     const content = document.createElement('div');
     content.className = 'cognition-content';
     content.textContent = item.content;
@@ -1390,15 +1420,15 @@ function cognitiveCardRow(item) {
         `强化×${item.times_derived || 1}`,
         evidenceText,
     ];
-    if (item.cognitive_type === 'current_field' && item.review_after) {
+    if (item.review_after) {
         parts.push(`下次复核：${item.review_after}`);
     }
     meta.textContent = parts.join(' · ');
-    row.append(level, content, meta);
+    row.append(level, stability, content, meta);
     if (item.is_stale) {
         const stale = document.createElement('div');
         stale.className = 'cognition-stale';
-        stale.textContent = '此认知场已到复核日期，聊天中仍会作为“可能过时”的背景使用。';
+        stale.textContent = '此认知已到复核日期，聊天中仍会作为“可能过时”的背景使用。';
         row.appendChild(stale);
     }
     const rowActions = document.createElement('div');
@@ -1476,20 +1506,23 @@ function renderCognitiveDrafts(meta = {}) {
             actionTag.textContent = target ? `强化 #${target.id}` : '强化';
         } else if (item.action === 'supersede') {
             actionTag.textContent = target ? `取代 #${target.id}` : '取代';
+        } else if (item.action === 'conflict') {
+            actionTag.textContent = target ? `冲突 #${target.id}` : '冲突';
         } else {
             actionTag.textContent = '新建';
         }
         title.append(label, badge, actionTag);
         row.appendChild(title);
 
-        if (item.action === 'supersede' && target) {
+        if ((item.action === 'supersede' || item.action === 'conflict') && target) {
+            const isConflict = item.action === 'conflict';
             const diff = document.createElement('div');
             diff.className = 'cognition-diff-grid';
             diff.style.marginTop = '10px';
             const oldPane = document.createElement('div');
             oldPane.className = 'cognition-diff-pane';
             const oldLabel = document.createElement('strong');
-            oldLabel.textContent = `当前版本 #${target.id}`;
+            oldLabel.textContent = isConflict ? `现有认知 #${target.id}` : `当前版本 #${target.id}`;
             const oldContent = document.createElement('div');
             oldContent.className = 'cognition-content';
             oldContent.textContent = target.content;
@@ -1497,7 +1530,7 @@ function renderCognitiveDrafts(meta = {}) {
             const newPane = document.createElement('div');
             newPane.className = 'cognition-diff-pane';
             const newLabel = document.createElement('strong');
-            newLabel.textContent = '建议版本';
+            newLabel.textContent = isConflict ? '新证据' : '建议版本';
             const newContent = document.createElement('div');
             newContent.className = 'cognition-content';
             newContent.textContent = item.content;
@@ -1520,21 +1553,43 @@ function renderCognitiveDrafts(meta = {}) {
         const actions = document.createElement('div');
         actions.className = 'toolbar';
         actions.style.marginTop = '8px';
-        const confirm = document.createElement('button');
-        confirm.className = 'btn btn-primary btn-sm';
-        if (item.action === 'reinforce') {
-            confirm.textContent = target ? `确认强化 #${target.id}` : '确认';
-            confirm.onclick = () => confirmCognitiveReinforce(index);
+        if (item.action === 'conflict' && target) {
+            const keep = document.createElement('button');
+            keep.className = 'btn btn-sm';
+            keep.textContent = '保留旧卡';
+            keep.title = '保留现有认知，拒绝这条新证据';
+            keep.onclick = () => rejectCognitiveDraft(index);
+            const replace = document.createElement('button');
+            replace.className = 'btn btn-primary btn-sm';
+            replace.textContent = '用新证据取代';
+            replace.onclick = () => resolveConflictCognitiveDraft(index, 'supersede');
+            const both = document.createElement('button');
+            both.className = 'btn btn-sm';
+            both.textContent = '都保留';
+            both.onclick = () => resolveConflictCognitiveDraft(index, 'create');
+            const manual = document.createElement('button');
+            manual.className = 'btn btn-sm';
+            manual.textContent = '你来定';
+            manual.title = '打开编辑器，人工改写现有认知';
+            manual.onclick = () => resolveConflictCognitiveDraft(index, 'edit');
+            actions.append(keep, replace, both, manual);
         } else {
-            confirm.textContent = item.action === 'supersede' ? '编辑并保存（取代）' : '编辑并保存';
-            confirm.onclick = () => useCognitiveDraft(index);
+            const confirm = document.createElement('button');
+            confirm.className = 'btn btn-primary btn-sm';
+            if (item.action === 'reinforce') {
+                confirm.textContent = target ? `确认强化 #${target.id}` : '确认';
+                confirm.onclick = () => confirmCognitiveReinforce(index);
+            } else {
+                confirm.textContent = item.action === 'supersede' ? '编辑并保存（取代）' : '编辑并保存';
+                confirm.onclick = () => useCognitiveDraft(index);
+            }
+            const reject = document.createElement('button');
+            reject.className = 'btn btn-sm';
+            reject.textContent = '拒绝';
+            reject.title = '记录这次拒绝，后续审视不会重新提出类似认知';
+            reject.onclick = () => rejectCognitiveDraft(index);
+            actions.append(confirm, reject);
         }
-        const reject = document.createElement('button');
-        reject.className = 'btn btn-sm';
-        reject.textContent = '拒绝';
-        reject.title = '记录这次拒绝，后续审视不会重新提出类似认知';
-        reject.onclick = () => rejectCognitiveDraft(index);
-        actions.append(confirm, reject);
         row.appendChild(actions);
         root.appendChild(row);
     });
@@ -1614,6 +1669,27 @@ function useCognitiveDraft(index) {
     }
 }
 
+function resolveConflictCognitiveDraft(index, mode) {
+    const item = pendingCognitiveDrafts[index];
+    if (!item) return;
+    const section = cognitionSection(item.cognitive_type);
+    editingDraftIndex = index;
+    if (mode === 'supersede') {
+        startCognitiveEdit(section, { ...item, id: null }, '确认取代保存', { action: 'supersede', target_id: item.target_id });
+    } else if (mode === 'create') {
+        startCognitiveEdit(section, { ...item, id: null, target_id: null }, '确认保存草稿', { action: 'create' });
+    } else {
+        const target = item.target_id != null
+            ? cognitiveItems.find(candidate => candidate.id === item.target_id)
+            : null;
+        if (target) {
+            startCognitiveEdit(section, target, '保存认知', null);
+        } else {
+            startCognitiveEdit(section, { ...item, id: null }, '确认保存草稿', { action: 'create' });
+        }
+    }
+}
+
 function startCognitiveEdit(section, item = null, saveLabel = '保存认知', actionContext = null) {
     if (!section) return;
     editingCognitiveId = item?.id || null;
@@ -1626,6 +1702,8 @@ function startCognitiveEdit(section, item = null, saveLabel = '保存认知', ac
     document.getElementById('cognition-confidence').value = item?.confidence ?? '0.7';
     document.getElementById('cognition-evidence').value = (item?.evidence_memory_ids || []).join(', ');
     document.getElementById('cognition-level').value = item?.level || 'explicit';
+    const editingIsCurrent = !!item?.review_after;
+    document.getElementById('cognition-stability').value = editingIsCurrent ? 'current' : 'stable';
     const actionHint = document.getElementById('cognition-action-hint');
     if (actionHint) {
         if (editingCognitiveId) {
@@ -1639,7 +1717,7 @@ function startCognitiveEdit(section, item = null, saveLabel = '保存认知', ac
         }
     }
     const reviewWrap = document.getElementById('cognition-review-wrap');
-    reviewWrap.style.display = section.cognitive_type === 'current_field' ? '' : 'none';
+    reviewWrap.style.display = editingIsCurrent ? '' : 'none';
     document.getElementById('cognition-review-after').value = item?.review_after || '';
     document.getElementById('cognition-save').textContent = saveLabel;
     document.getElementById('cognition-editor').style.display = '';
@@ -1662,8 +1740,8 @@ function cognitiveFormData() {
         confidence: Number(document.getElementById('cognition-confidence').value),
         evidence_memory_ids: document.getElementById('cognition-evidence').value
             .split(',').map(value => Number(value.trim())).filter(Number.isInteger),
-        review_after: document.getElementById('cognition-type').value === 'current_field'
-            ? document.getElementById('cognition-review-after').value || null
+        review_after: document.getElementById('cognition-stability').value === 'current'
+            ? document.getElementById('cognition-review-after').value || defaultReviewAfter()
             : null,
         level: document.getElementById('cognition-level').value || 'explicit',
     };
@@ -1714,6 +1792,7 @@ function cancelCognitiveEdit() {
     document.getElementById('cognition-content').value = '';
     document.getElementById('cognition-evidence').value = '';
     document.getElementById('cognition-confidence').value = '0.7';
+    document.getElementById('cognition-stability').value = 'stable';
     document.getElementById('cognition-review-after').value = '';
     document.getElementById('cognition-review-wrap').style.display = 'none';
     document.getElementById('cognition-save').textContent = '保存认知';

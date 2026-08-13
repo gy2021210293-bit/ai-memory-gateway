@@ -18,14 +18,29 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertNotIn("generateCognitiveDraft('user')", self.html)
         self.assertIn("id=\"cognition-review-after\"", self.html)
 
-    def test_dashboard_renders_four_fixed_sections_and_diff(self):
+    def test_dashboard_renders_three_fixed_sections_and_diff(self):
         for cognitive_type in (
-            "user_core", "self_core", "relationship_core", "current_field"
+            "user_core", "self_core", "relationship_core"
         ):
             self.assertIn(f"cognitive_type: '{cognitive_type}'", self.js)
+        self.assertNotIn("current_field", self.js)
+        self.assertNotIn("'context'", self.js)
         self.assertIn("cognition-diff-grid", self.js)
         self.assertIn("可能过时", self.js)
         self.assertNotIn("user_traits_preferences", self.js)
+
+    def test_dashboard_supports_stability_toggle_conflict_and_due_badge(self):
+        # 稳定/当前开关 + 默认复核日期
+        self.assertIn('id="cognition-stability"', self.html)
+        self.assertIn("onCognitionStabilityChange", self.js)
+        self.assertIn("defaultReviewAfter", self.js)
+        # 到期提醒徽章
+        self.assertIn("cognition-due-badge", self.html)
+        self.assertIn("待复核", self.js)
+        # 冲突裁决四按钮
+        self.assertIn("resolveConflictCognitiveDraft", self.js)
+        self.assertIn("保留旧卡", self.js)
+        self.assertIn("用新证据取代", self.js)
 
     def test_cognition_layout_is_responsive_without_fixed_min_width(self):
         self.assertIn(".cognition-grid", self.css)

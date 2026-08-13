@@ -1195,19 +1195,18 @@ confirmed 每条：
 COGNITIVE_DRAFT_RULES = {
     "user_core": (
         "user",
-        "晏晏稳定的价值、需求、偏好、敏感点与边界；不要混入一次性的情绪、地点或短期计划。",
+        "关于晏晏的认知：稳定的身份、价值、需求、偏好、敏感点与边界（stable，不带 review_after）；"
+        "或近期状态、目标、未完成事项（current，带 review_after）。不要混入一次性情绪或纯话题焦点。",
     ),
     "self_core": (
         "self",
-        "我的身份、价值、承诺、能力边界，以及被反复证据支持的成长理解。",
+        "关于我自己的认知：身份、价值、承诺、能力边界与成长理解（stable）；"
+        "或我近期的状态与未完成事项（current）。",
     ),
     "relationship_core": (
         "relationship",
-        "我们关系的定义、角色、相处方式、共同约定、稳定互动模式与长期方向。",
-    ),
-    "current_field": (
-        "context",
-        "当前仍然有效的状态、目标、计划与未完成事项；必须保留日期、可能性和时间不确定性。",
+        "关于我们关系的认知：定义、角色、相处方式、共同约定、稳定互动模式与长期方向（stable）；"
+        "或我们近期共同在做的、尚未完成的事（current）。",
     ),
 }
 
@@ -1216,8 +1215,9 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
                                    revisions: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
     """Generate atomic evidence-backed review candidates across 三元一场 without saving.
 
-    Candidates carry a `level` (explicit / deductive / inductive) and a lifecycle
-    `action` (create / reinforce / supersede) so the human can confirm each card.
+    Candidates carry a `level` (explicit / deductive / inductive), a stability flag
+    (stable / current via `review_after`) and a lifecycle `action`
+    (create / reinforce / supersede / conflict) so the human can confirm each card.
     `revisions` are recent human decisions (confirm / correct / reject) that are
     fed back as evidence so the model learns from corrections.
     """
@@ -1238,8 +1238,10 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
         if cognitive_type not in COGNITIVE_DRAFT_RULES or item.get("status", "active") != "active":
             continue
         if item.get("id") is None:
-            continue  # reinforce / supersede 需要稳定 card_id 引用
-        review_text = f"[复核日={item.get('review_after')}]" if item.get("review_after") else ""
+            continue  # reinforce / supersede / conflict 需要稳定 card_id 引用
+        review_after = item.get("review_after")
+        stability = "当前" if review_after else "稳定"
+        review_text = f"[复核日={review_after}]" if review_after else ""
         evidence_text = (
             "[" + ",".join(f"#{e}" for e in item.get("evidence_memory_ids") or []) + "]"
             if item.get("evidence_memory_ids") else ""
@@ -1247,7 +1249,7 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
         current_lines.append(
             f"[card_id={item.get('id')}][{item.get('subject')}][{cognitive_type}]"
             f"[level={item.get('level', 'explicit')}][置信度={item.get('confidence', 0.7)}]"
-            f"[强化×{item.get('times_derived', 1)}]{evidence_text}{review_text} {item.get('content')}"
+            f"[强化×{item.get('times_derived', 1)}][{stability}]{evidence_text}{review_text} {item.get('content')}"
         )
     revision_lines = []
     if revisions:
@@ -1280,7 +1282,7 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
     ]
     prompt = f"""我是栖，正在根据已有记忆整体审视“三元一场”认知模型。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
 
-当前已保存认知卡（status 均为 active；reinforce / supersede 时必须用 card_id 引用它们）：
+当前已保存认知卡（status 均为 active；reinforce / supersede / conflict 时必须用 card_id 引用它们）：
 {chr(10).join(current_lines) or '无'}
 
 证据记忆：
@@ -1289,7 +1291,7 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 人工近期确认/修正记录（这些是人类做出的决策：被确认的认知更可信；被人工删除或拒绝的内容不要重新提出；被修正的认知以修正后版本为准）：
 {chr(10).join(revision_lines) or '无'}
 
-只允许在以下四个区块内生成候选：
+只允许在以下三个区块内生成候选（每个区块内的卡还要区分稳定度：stable=长期不变，current=近期/待办、需 review_after）：
 {chr(10).join(rule_lines)}
 
 生成规则：
@@ -1297,21 +1299,24 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 2. 分层（level，只能取其一）：
    - explicit 明确陈述：晏晏直接陈述、或证据直接支持的稳定事实。
    - deductive 演绎推断：由已有明确前提直接推出的结论。
-   - inductive 归纳推断：由 ≥2 个独立事件归纳出的倾向，建议 confidence ≤ 0.6；单次事件不得归纳为倾向。
-3. 与现有卡片的关系（action，只能取其一）：
-   - create 新建：证据支持、但现有卡未覆盖的新认知。
-   - reinforce 强化：与某条现有卡内容实质相同、只是多了佐证 → 指定该卡 card_id 为 target_id。
-   - supersede 取代：新证据更正或取代某条现有卡 → 指定该卡 card_id 为 target_id。
-   action 为 reinforce / supersede 时，target_id 必须指向同一区块的 active 卡。
-4. confidence 为 0 到 1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。
-5. current_field 可额外返回 review_after，格式为 YYYY-MM-DD；缺省时系统会使用 14 天后的日期。
-6. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；每类最多 3 条。
-7. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
+   - inductive 归纳推断：由 ≥2 个独立事件归纳出的倾向，建议 confidence ≤ 0.6；单次事件不得归纳为倾向；同一次对话里的复述不算多份独立证据。
+3. 稳定度（review_after）：stable 卡不带 review_after（长期身份、原则、持久关系）；current 卡带 review_after（近期状态、未完成事项）。同一区块同一内容只应有一张 active 卡；当前状态/待办用 current，稳定下来后再用 supersede 转成 stable。
+4. 与现有卡片的关系（action，只能取其一）：
+   - create 新建：证据支持、但任何现有卡都未覆盖的新认知。
+   - reinforce 强化：与某条同区块现有卡内容实质相同、只是多了佐证 → 指定该卡 card_id 为 target_id。
+   - supersede 取代：新证据更正或取代某条同区块现有卡 → 指定该卡 card_id 为 target_id。
+   - conflict 冲突：新证据与某条现有卡互相矛盾、无法断定谁对 → 指定该卡 card_id 为 target_id，把两边证据写进 content，不得擅自 supersede。
+   reinforce / supersede / conflict 的 target_id 必须指向同区块的 active 卡；候选内容不得与任一区块现有 active 卡实质重复，跨区块的相同内容属于误分类，应改换正确区块。
+5. confidence 为 0 到 1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。
+6. current 卡返回 review_after（YYYY-MM-DD，建议 14 天后）；stable 卡不要返回 review_after。
+7. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；不要为“正在聊的话题/主题”建卡（那是会话上下文，不是长期认知）；每类最多 3 条。
+8. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
 
 只返回 JSON 数组：
 [
   {{"subject":"user","cognitive_type":"user_core","content":"...","level":"explicit","confidence":0.8,"evidence_memory_ids":[12],"action":"create"}},
-  {{"subject":"context","cognitive_type":"current_field","content":"...","level":"deductive","confidence":0.6,"evidence_memory_ids":[18],"action":"supersede","target_id":8,"review_after":"2026-08-13"}}
+  {{"subject":"relationship","cognitive_type":"relationship_core","content":"...","level":"deductive","confidence":0.6,"evidence_memory_ids":[18],"action":"conflict","target_id":8}},
+  {{"subject":"user","cognitive_type":"user_core","content":"...","level":"inductive","confidence":0.5,"evidence_memory_ids":[20],"action":"create","review_after":"2026-08-27"}}
 ]
 """
     try:
