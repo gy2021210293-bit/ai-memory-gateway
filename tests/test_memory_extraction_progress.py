@@ -202,6 +202,9 @@ def _load_background_processor(interval=2):
         "complete_memory_extraction": AsyncMock(return_value=True),
         "release_memory_extraction_claim": AsyncMock(return_value=True),
         "get_all_memories_count": AsyncMock(return_value=0),
+        "_memory_extractor_module": types.SimpleNamespace(
+            MEMORY_EXTRACTION_LAST_ERROR="test extraction failure",
+        ),
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
     return namespace, namespace["process_memories_background"]
@@ -298,7 +301,8 @@ class BackgroundExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
             persistence_plan=_persistence_plan(completed_round=False),
         )
 
-        namespace["ensure_memory_extraction_state"].assert_awaited_once_with("thread-a")
+        namespace["ensure_memory_extraction_state"].assert_not_awaited()
+        namespace["persist_conversation_batch"].assert_not_awaited()
         namespace["record_memory_extraction_round"].assert_not_awaited()
 
     async def test_tool_chain_final_response_increments_exactly_once(self):

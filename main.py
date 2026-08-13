@@ -1611,6 +1611,17 @@ async def process_memories_background(
             f"skip={skip_conversation_log}"
         )
 
+        # Tool-call-only responses are an in-flight workflow, not durable history.
+        if should_defer_extraction(assistant_tool_calls):
+            print("⏭️  工具链尚未完成，等待最终回答后再整批持久化")
+            return
+
+        if not skip_conversation_log and (
+            persistence_plan is None or not persistence_plan.completed_round
+        ):
+            print("⏭️  本轮尚未完整，不持久化")
+            return
+
         progress_ready = False
         should_track_progress = (
             not skip_conversation_log
@@ -1651,11 +1662,6 @@ async def process_memories_background(
             )
 
         if skip_conversation_log:
-            return
-
-        # 工具链尚未结束：状态已经保存，但等最终回答后再提取一次记忆。
-        if should_defer_extraction(assistant_tool_calls):
-            print("⏭️  assistant 仍在请求工具，延后到工具链最终回答再提取记忆")
             return
 
         # 2. 检查是否需要提取记忆
@@ -1807,26 +1813,6 @@ async def process_memories_background(
             except Exception as release_error:
                 print(f"⚠️ 释放对话线 {session_id} 的提取 claim 失败: {release_error}")
         print(f"⚠️  后台记忆处理失败: {e}")
-
-
-async def persist_tool_request_before_followup(persistence_plan, model: str) -> bool:
-    """Durably record an assistant tool request before the client can return results."""
-    try:
-        result = await persist_conversation_batch(
-            persistence_plan.session_id,
-            list(persistence_plan.messages),
-            model,
-        )
-        print(
-            "🔧 工具调用已在返回客户端前持久化: "
-            f"写入{result['inserted']}条"
-            + ("，重新生成覆盖" if result["rerolled"] else ""),
-            flush=True,
-        )
-        return True
-    except Exception as exc:
-        print(f"⚠️ 工具调用即时持久化失败，回退后台写入: {exc}", flush=True)
-        return False
 
 
 # ============================================================
@@ -2303,11 +2289,7 @@ async def _chat_completions_inner(request: Request):
                         assistant_reasoning,
                         skip_conversation_log,
                     )
-                    if assistant_tool_calls:
-                        persisted = await persist_tool_request_before_followup(
-                            persistence_plan, model
-                        )
-                    if not assistant_tool_calls or not persisted:
+                    if persistence_plan.completed_round:
                         asyncio.create_task(
                             process_memories_background(session_id, user_message, assistant_msg, model,
                                                         assistant_tool_calls=assistant_tool_calls,
@@ -2508,7 +2490,6 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     stream_usage = {}
     upstream_sse_buffer = bytearray()
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
-    deferred_tool_events = []
     
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
@@ -2645,12 +2626,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                     if "arguments" in fn:
                                         accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
 
-                    # 工具客户端可能在 tool_calls / finish_reason=tool_calls 时立即回传。
-                    # 因此从第一个工具调用事件起，等 PostgreSQL 持久化完成再交付。
-                    if accumulated_tool_calls:
-                        deferred_tool_events.append(forwarded_event)
-                    else:
-                        yield forwarded_event
+                    yield forwarded_event
         finally:
             await response.aclose()
 
@@ -2706,9 +2682,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             assistant_reasoning,
             skip_conversation_log,
         )
-        if assistant_tool_calls:
-            persisted = await persist_tool_request_before_followup(persistence_plan, model)
-        if not assistant_tool_calls or not persisted:
+        if persistence_plan.completed_round:
             asyncio.create_task(
                 process_memories_background(session_id, user_message, assistant_msg, model,
                                             assistant_tool_calls=assistant_tool_calls,
@@ -2728,10 +2702,6 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
         print(f"❌ 上游 SSE 在事件边界前结束: session={session_id}", flush=True)
         yield _upstream_malformed_sse_event("truncated_event")
         return
-
-    for event in deferred_tool_events:
-        yield event
-
 
 # ============================================================
 # 记忆管理接口

@@ -107,6 +107,28 @@ class MessagePipelineTests(unittest.TestCase):
         self.assertFalse(plan.completed_round)
         self.assertEqual(plan.messages[-1]["tool_calls"][0]["id"], "call-1")
 
+    def test_final_answer_persists_the_entire_tool_workflow_as_one_round(self):
+        plan = make_persistence_plan(
+            "thread-a",
+            (
+                {"role": "user", "content": "request"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2"}]},
+                {"role": "tool", "tool_call_id": "call-2", "content": "result"},
+            ),
+            "final answer",
+            None,
+            None,
+            False,
+        )
+
+        self.assertTrue(plan.completed_round)
+        self.assertEqual(
+            [message["role"] for message in plan.messages],
+            ["user", "assistant", "tool", "assistant", "tool", "assistant"],
+        )
+
     def test_closed_tool_tail_is_detected_for_rotation_deferral(self):
         messages = [
             {"role": "user", "content": "run"},

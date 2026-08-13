@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock
 
 import main
 
@@ -34,6 +35,32 @@ class _FakeAsyncClient:
 
     async def send(self, _request, stream=False):
         return self.response
+
+    async def post(self, *_args, **_kwargs):
+        return self.response
+
+
+class _FakeJSONResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "choices": [{"message": {
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            }}],
+        }
+
+
+class _FakeRequest:
+    headers = {}
+
+    async def json(self):
+        return {
+            "model": "model",
+            "stream": False,
+            "messages": [{"role": "user", "content": "run tool"}],
+        }
 
 
 class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
@@ -95,15 +122,10 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.saved_states, [])
 
-    async def test_stream_holds_tool_call_sse_until_persisted(self):
+    async def test_stream_forwards_tool_call_sse_without_persisting(self):
         original_client = main.httpx.AsyncClient
         original_memory_enabled = main.MEMORY_ENABLED
-        original_persist = main.persist_tool_request_before_followup
-        persisted = []
-
-        async def persist_before_followup(plan, model):
-            persisted.append((plan, model))
-            return True
+        original_background = main.process_memories_background
 
         _FakeAsyncClient.response = _FakeResponse([
             b'data: {"choices":[{"delta":{"content":"checking"}}]}\n\n',
@@ -114,7 +136,7 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         ])
         main.httpx.AsyncClient = _FakeAsyncClient
         main.MEMORY_ENABLED = True
-        main.persist_tool_request_before_followup = persist_before_followup
+        main.process_memories_background = AsyncMock()
         try:
             stream = main.stream_and_capture(
                 {}, {"stream": True}, "session", "run", "model",
@@ -123,13 +145,54 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await anext(stream), b": keep-alive\n\n")
             self.assertIn(b'"content":"checking"', await anext(stream))
             tool_call_chunk = await anext(stream)
-            self.assertTrue(persisted)
             self.assertIn(b'"tool_calls"', tool_call_chunk)
+            self.assertIn(b'"finish_reason":"tool_calls"', await anext(stream))
+            self.assertEqual(await anext(stream), b"data: [DONE]\n\n")
+            main.process_memories_background.assert_not_called()
             await stream.aclose()
         finally:
             main.httpx.AsyncClient = original_client
             main.MEMORY_ENABLED = original_memory_enabled
-            main.persist_tool_request_before_followup = original_persist
+            main.process_memories_background = original_background
+
+    async def test_non_stream_tool_call_does_not_schedule_persistence(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_extract_enabled = main.MEMORY_EXTRACT_ENABLED
+        original_partition_enabled = main.CACHE_PARTITION_ENABLED
+        original_force_stream = main.FORCE_STREAM
+        original_session_id = main.get_active_session_id
+        original_system_prompt = main.get_system_prompt
+        original_background = main.process_memories_background
+        original_drives_enabled = main.drives.is_enabled
+
+        async def system_prompt():
+            return ""
+
+        _FakeAsyncClient.response = _FakeJSONResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = True
+        main.MEMORY_EXTRACT_ENABLED = False
+        main.CACHE_PARTITION_ENABLED = False
+        main.FORCE_STREAM = False
+        main.get_active_session_id = lambda: "session"
+        main.get_system_prompt = system_prompt
+        main.process_memories_background = AsyncMock()
+        main.drives.is_enabled = lambda: False
+        try:
+            response = await main._chat_completions_inner(_FakeRequest())
+            self.assertEqual(response.status_code, 200)
+            main.process_memories_background.assert_not_called()
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.MEMORY_EXTRACT_ENABLED = original_extract_enabled
+            main.CACHE_PARTITION_ENABLED = original_partition_enabled
+            main.FORCE_STREAM = original_force_stream
+            main.get_active_session_id = original_session_id
+            main.get_system_prompt = original_system_prompt
+            main.process_memories_background = original_background
+            main.drives.is_enabled = original_drives_enabled
 
     async def test_stream_converts_malformed_sse_to_a_safe_error(self):
         original_client = main.httpx.AsyncClient
@@ -164,7 +227,6 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             await stream.aclose()
         finally:
             main.httpx.AsyncClient = original_client
-
 
 if __name__ == "__main__":
     unittest.main()
