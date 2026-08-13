@@ -4005,6 +4005,44 @@ async def list_entities_without_card(limit: int = 20):
         return [dict(row) for row in rows]
 
 
+async def list_entities_without_active_traits(limit: int = 20):
+    """Entities with evidence but no active stable trait, used by the trait backfill.
+
+    Cold-start selection for the 补齐稳定特征 button: an entity qualifies when it is
+    active (same filter as retrieval), has ≥1 linked memory, and its card has no
+    active stable_trait (NULL card, non-array stable_traits, or no status='active'
+    element). Trait expiry/re-confirmation stays with the P3 timer; this query only
+    fills the "never generated a trait" gap.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT e.id, e.name, e.entity_type, e.evidence_count, e.entity_card_json,
+                   COUNT(DISTINCT me.memory_id)::int AS memory_count,
+                   COALESCE(array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL), ARRAY[]::text[]) AS aliases
+            FROM entities e
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+            LEFT JOIN memory_entities me ON me.entity_id = e.id
+            WHERE (
+                e.entity_card_json IS NULL
+                OR jsonb_typeof(e.entity_card_json->'stable_traits') <> 'array'
+                OR NOT EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(e.entity_card_json->'stable_traits') t
+                    WHERE t->>'status' = 'active'
+                )
+            )
+              AND (
+                  e.status_override = 'active'
+                  OR (e.status_override IS NULL AND (e.profile_json IS NOT NULL OR e.evidence_count >= {ENTITY_ACTIVE_EVIDENCE_THRESHOLD}))
+              )
+            GROUP BY e.id
+            HAVING COUNT(DISTINCT me.memory_id) > 0
+            ORDER BY memory_count DESC, e.name
+            LIMIT $1
+        """, max(1, int(limit)))
+        return [dict(row) for row in rows]
+
+
 async def list_entity_roster(limit: int = 150):
     """Lightweight entity roster for the extraction prompt (no profile payloads).
 

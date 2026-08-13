@@ -57,12 +57,20 @@ class DashboardEntityCardEditorTests(unittest.TestCase):
         self.assertIn("/api/entities/backfill-cards/status", self.javascript)
         self.assertIn("待确认提案", self.javascript)
 
+    def test_backfill_traits_button_and_action_exist(self):
+        self.assertIn("补齐稳定特征", self.html)
+        self.assertIn("function backfillEntityTraits(", self.javascript)
+        self.assertIn("/api/entities/backfill-traits", self.javascript)
+        self.assertIn("/api/entities/backfill-traits/status", self.javascript)
+        # 与特征生命周期共用：候选 → trait_add 提案（人工确认）
+        self.assertIn("trait_add", self.javascript)
+
     def test_card_styles_exist(self):
         self.assertIn(".entity-card-snapshot", self.css)
         self.assertIn(".entity-card-proposal", self.css)
 
     def test_dashboard_script_cache_version_is_bumped(self):
-        self.assertIn("/static/js/dashboard.js?v=6.9", self.html)
+        self.assertIn("/static/js/dashboard.js?v=7.0", self.html)
         self.assertIn("/static/css/dashboard.css?v=7.4", self.html)
 
     def test_entity_relation_editor_and_actions_exist(self):

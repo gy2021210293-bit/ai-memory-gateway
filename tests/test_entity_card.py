@@ -290,6 +290,27 @@ class EntityCardTests(unittest.TestCase):
         self.assertIn("LIMIT $1", sql)
         self.assertEqual(calls[0][1], (5,))
 
+    def test_list_entities_without_active_traits_filters_no_active_traits(self):
+        calls = []
+
+        async def fake_fetch(sql, *args):
+            calls.append((sql, args))
+            return []
+
+        conn = types.SimpleNamespace(fetch=fake_fetch)
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            asyncio.run(database.list_entities_without_active_traits(5))
+        self.assertEqual(len(calls), 1)
+        sql = calls[0][0]
+        # 只补「卡上没有 active 稳定特征」的实体
+        self.assertIn("stable_traits", sql)
+        self.assertIn("t->>'status' = 'active'", sql)
+        self.assertIn("HAVING COUNT(DISTINCT me.memory_id) > 0", sql)
+        # 只补可命中（活跃）实体：与检索路径同一过滤条件
+        self.assertIn("status_override = 'active'", sql)
+        self.assertIn("LIMIT $1", sql)
+        self.assertEqual(calls[0][1], (5,))
+
 
 class EntityCardAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_apply_snapshot_appends_sorts_and_caps(self):

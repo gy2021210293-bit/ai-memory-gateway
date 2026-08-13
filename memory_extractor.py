@@ -773,6 +773,8 @@ async def generate_entity_profile(entity: Dict, memories: List[Dict]) -> Optiona
 BACKFILL_SNAPSHOT_CHUNK = 3
 BACKFILL_MEMORIES_PER_ENTITY = 16
 BACKFILL_MEMORY_CHARS = 160
+# 状态快照生成时注入的「既有状态快照」条数上限（最新 N 条，按 fact_date 升序取尾）
+ENTITY_PRIOR_SNAPSHOT_LIMIT = 5
 
 
 def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
@@ -790,19 +792,52 @@ def _resolve_evidence_memory(quote: str, memories: List[Dict]) -> Optional[int]:
     return None
 
 
-def _entity_card_description(entity: Dict) -> str:
-    """Extract the manual card description from an entity dict (None/str/dict jsonb)."""
+def _entity_card_json(entity: Dict) -> dict:
+    """Parse the entity card jsonb column (None/str/dict) into a plain dict."""
     raw = entity.get("entity_card_json")
     if isinstance(raw, dict):
-        card = raw
-    elif isinstance(raw, str):
+        return raw
+    if isinstance(raw, str):
         try:
-            card = json.loads(raw)
+            return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            card = {}
-    else:
-        card = {}
-    return str((card or {}).get("description") or "").strip()
+            return {}
+    return {}
+
+
+def _entity_card_description(entity: Dict) -> str:
+    """Extract the manual card description from an entity dict (None/str/dict jsonb)."""
+    return str(_entity_card_json(entity).get("description") or "").strip()
+
+
+def _entity_card_active_traits(entity: Dict) -> str:
+    """Active stable-trait texts from the card, joined with '、', or '（无）'."""
+    traits = []
+    for raw in (_entity_card_json(entity).get("stable_traits") or []):
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("status") or "active").strip() != "active":
+            continue
+        text = re.sub(r"\s+", " ", str(raw.get("text") or "")).strip()
+        if text:
+            traits.append(text)
+    return "、".join(traits) or "（无）"
+
+
+def _entity_card_recent_snapshots(entity: Dict, limit: int = ENTITY_PRIOR_SNAPSHOT_LIMIT) -> str:
+    """Recent snapshot states (fact_date 升序，最新在后，取尾 limit 条), joined with '；', or '（无）'."""
+    snapshots = [
+        raw for raw in (_entity_card_json(entity).get("snapshots") or [])
+        if isinstance(raw, dict) and raw.get("state")
+    ]
+    snapshots.sort(key=lambda s: (str(s.get("fact_date") or ""), str(s.get("recorded_at") or "")))
+    recent = snapshots[-limit:] if limit > 0 else snapshots
+    parts = []
+    for snap in recent:
+        date = str(snap.get("fact_date") or "").strip()
+        state = re.sub(r"\s+", " ", str(snap.get("state") or "")).strip()
+        parts.append(f"{date}：{state}" if date else state)
+    return "；".join(parts) or "（无）"
 
 
 def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
@@ -823,10 +858,15 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
             memory_lines.append(f"[ID={memory.get('id')}] {content}")
         evidence = "\n".join(memory_lines) or "（无证据记忆）"
         description = _entity_card_description(entity) or "（无）"
+        traits_text = _entity_card_active_traits(entity)
+        snap_text = _entity_card_recent_snapshots(entity)
         blocks.append(
             f"### 实体 {entity.get('id')}：{entity.get('name')}"
             f"（{entity.get('entity_type', 'other')}，别名：{aliases}）\n"
-            f"已知说明（先验知识）：{description}\n{evidence}"
+            f"已知说明（先验知识）：{description}\n"
+            f"活跃稳定特征：{traits_text}\n"
+            f"既有状态快照：{snap_text}\n"
+            f"{evidence}"
         )
     return (
         "我是栖，一个 AI 陪伴者。下面的证据记忆都是我以第一人称写下的："
@@ -851,10 +891,12 @@ def _build_snapshot_backfill_prompt(entities: List[Dict]) -> str:
         "- 若证据里没有明确、值得长期记录的状态或重要节点，输出空数组 [];\n"
         "- 每条快照的 fact_date 必填且为 YYYY-MM-DD：证据里有明确时间就用证据时间，只暗示「现在」就用今天日期，绝不输出空日期；\n"
         "- 不得推测证据中没有的信息；\n"
-        "- 每个实体块开头标明了实体类型与「已知说明（先验知识）」。先读它们弄清楚这个实体是什么、"
-        "属于哪一类（人/宠物/地点/项目…），再据此判断哪些证据构成它的状态，防止因性质不明而张冠李戴"
-        "（如把人的行为写成宠物的，或反过来）；\n"
-        "「已知说明」本身不是待生成的状态，不要把它复述成快照；生成的快照不得与已知说明矛盾；\n"
+        "- 每个实体块开头标明了实体类型与先验知识（「已知说明（先验知识）」+「活跃稳定特征」+「既有状态快照」）。"
+        "先读它们弄清楚这个实体是什么、属于哪一类（人/宠物/地点/项目…），再据此判断哪些证据构成它的状态，"
+        "防止因性质不明而张冠李戴（如把人的行为写成宠物的，或反过来）；\n"
+        "说明和活跃稳定特征是用户确认的结构性事实背景、既有状态快照是该实体已知的状态演进史：它们都不是待生成的状态，"
+        "不要把它们复述成快照；若证据只是复述既有快照里已有的状态、没有体现新变化，不要输出；"
+        "生成的快照不得与已知说明、活跃稳定特征或既有状态快照矛盾；\n"
         "- 指代用户本人（晏晏）时，一律用「晏晏」或「她」，禁止出现「用户」「user」字样。\n\n"
         + "\n\n".join(blocks)
         + "\n\n只返回一个 JSON 对象，键必须是上面每个实体行开头标记的数字实体ID"

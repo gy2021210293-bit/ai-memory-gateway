@@ -36,7 +36,7 @@ from database import upsert_entity_relation, delete_entity_relation, list_entity
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
-from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
 import memory_extractor as _memory_extractor_module
 import drives_integration as drives
 from upstream_compat import normalize_chat_request
@@ -3870,6 +3870,124 @@ async def api_backfill_entity_cards_status():
     return dict(_card_backfill_status)
 
 
+# ============================================================
+# 稳定特征补齐（后台异步执行，前端轮询进度）
+# 给「有证据但无活跃稳定特征」的存量实体生成特征候选 → 全部走 trait_add 提案，人工确认后入卡。
+# 特征过期/再确认仍由 P3 定时任务负责；本按钮只做冷启动补第一波，不碰现有生成 prompt。
+# ============================================================
+
+_trait_backfill_status = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "proposed": 0,
+    "reconfirmed": 0,
+    "retired_proposed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "errors_detail": [],
+    "error": None,
+    "finished_at": None,
+}
+
+
+async def _run_trait_backfill(entities: list) -> None:
+    """One trait cold-start backfill task: per-entity candidates → trait_add proposals.
+
+    逐实体调用既有的 suggest_entity_trait_candidates（不新增/不改 prompt），结果交给
+    route_trait_suggestions 统一落库：新候选 → trait_add 提案，矛盾 → trait_retire 提案，
+    仍成立的旧特征 → 刷新 last_confirmed。因挑选条件保证实体无活跃特征，实际多为纯新增提案。
+    """
+    proposed = 0
+    reconfirmed = 0
+    retired_proposed = 0
+    skipped = 0
+    errors = 0
+    errors_detail = []
+    try:
+        for index, ent in enumerate(entities):
+            _trait_backfill_status["processed"] = index + 1
+            try:
+                entity = await get_entity_detail(ent["id"])
+                if not entity:
+                    skipped += 1
+                    continue
+                memories = await get_entity_memories(ent["id"])
+                if not memories:
+                    skipped += 1
+                    continue
+                evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+                card = await get_entity_card(ent["id"]) or {}
+                current_traits = [
+                    t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+                ]
+                suggestion = await suggest_entity_trait_candidates(
+                    entity, memories, evidence_message_map, current_traits,
+                    card_description=card.get("description") or "",
+                )
+                result = await route_trait_suggestions(ent["id"], suggestion, card)
+                proposed += result.get("proposed", 0)
+                reconfirmed += result.get("reconfirmed", 0)
+                retired_proposed += result.get("retired_proposed", 0)
+                skipped += result.get("skipped", 0)
+                for err in result.get("errors") or []:
+                    errors += 1
+                    errors_detail.append(f"实体 {ent['name']}（{ent['id']}）：{err}")
+            except Exception as exc:
+                errors += 1
+                errors_detail.append(f"实体 {ent['name']}（{ent['id']}）：{exc!r}")
+            _trait_backfill_status["proposed"] = proposed
+            _trait_backfill_status["reconfirmed"] = reconfirmed
+            _trait_backfill_status["retired_proposed"] = retired_proposed
+            _trait_backfill_status["skipped"] = skipped
+            _trait_backfill_status["errors"] = errors
+            _trait_backfill_status["errors_detail"] = list(errors_detail)
+        _trait_backfill_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+        print(f"✅ 稳定特征补齐完成：{len(entities)} 个实体，新增提案 {proposed}，退休提案 {retired_proposed}，刷新 {reconfirmed}，跳过 {skipped}，失败 {errors}")
+    except Exception as exc:
+        _trait_backfill_status["error"] = str(exc)
+        print(f"❌ 稳定特征补齐异常: {exc}")
+    finally:
+        _trait_backfill_status["running"] = False
+        _trait_backfill_status["processed"] = len(entities)
+
+
+@app.post("/api/entities/backfill-traits")
+async def api_backfill_entity_traits(request: Request):
+    """启动稳定特征补齐（立即返回，后台逐实体执行）。"""
+    if _trait_backfill_status["running"]:
+        return {"error": "稳定特征补齐任务正在运行中，请稍候"}
+    data = await request.json()
+    try:
+        limit = max(1, min(10, int(data.get("limit", 5))))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
+    entities = await _db_module.list_entities_without_active_traits(limit)
+    if not entities:
+        return {"status": "done", "total": 0, "proposed": 0, "reconfirmed": 0, "retired_proposed": 0, "skipped": 0, "errors": 0}
+    _trait_backfill_status.update(
+        running=True,
+        total=len(entities),
+        processed=0,
+        proposed=0,
+        reconfirmed=0,
+        retired_proposed=0,
+        skipped=0,
+        errors=0,
+        errors_detail=[],
+        error=None,
+        finished_at=None,
+    )
+    asyncio.create_task(_run_trait_backfill(entities))
+    return {"status": "started", "total": len(entities)}
+
+
+@app.get("/api/entities/backfill-traits/status")
+async def api_backfill_entity_traits_status():
+    """查询稳定特征补齐进度（前端轮询）。"""
+    return dict(_trait_backfill_status)
+
+
 @app.get("/api/memories/search")
 async def api_search_memories(q: str = "", limit: int = 20):
     """语义搜索记忆（Dashboard用，走后端 search_memories）"""
@@ -3988,15 +4106,15 @@ CONSOLIDATION_PROMPT = """
 
 - entities：数组，每个元素 {{"name": "实体名", "type": "person|place|organization|project|object|pet|activity|event|other"}}。事件正文里明确出现、且作为长期记忆锚点值得追踪的命名实体才标；下方「已知实体名册」里已有的实体必须用其规范名，不要新建同名实体；名册里没有的新实体（需是稳定命名实体，排除代词、泛指名词、代码/文件名/路径/URL 等）可以新建。没有就返回空数组。
 - state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD", "user_view": "晏晏当时对这件事的看法/态度（≤60字，来自她当时的话，没有就空字符串）", "ai_view": "栖当时对这件事的感受（≤60字，来自栖当时在对话中的反应，没有就空字符串）"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。**user_view/ai_view 是可选观测日记字段：只有对话中明确表达了态度/感受才写，禁止根据事件内容推断补写；没有就返回空字符串。宁可没有，不要硬编。**
-- **先读说明再定状态**：生成 state_changes 前，先读下方「已知实体说明」和名册里的实体类型，明确这个实体是什么、属于哪一类（人/宠物/地点/项目…），再据此判断事件正文体现出它的什么状态变化，防止性质错判、张冠李戴（如把人的状态写成宠物的，或反过来）；说明本身是用户手写维护的结构性事实背景，不是待生成的状态，不要把它复述成 state_changes，生成的 state_changes 不得与对应实体的已知说明矛盾。
+- **先读先验再定状态**：生成 state_changes 前，先读下方「已知实体先验知识」和名册里的实体类型，明确这个实体是什么、属于哪一类（人/宠物/地点/项目…），再据此判断事件正文体现出它的什么状态变化，防止性质错判、张冠李戴（如把人的状态写成宠物的，或反过来）。先验知识里每个实体含三段——**说明**（用户手写维护的结构性事实背景）、**既有状态快照**（该实体已知的状态演进史，最新在后）、**活跃稳定特征**（用户已确认的长期特质）——它们都不是待生成的状态：不要把它们复述成 state_changes；若事件正文只是复述既有快照里已有的状态、没有体现新变化，不要输出 state_changes；生成的 state_changes 不得与对应实体的说明、既有快照或活跃稳定特征矛盾。
 
 <已知实体名册>
 {entities_roster}
 </已知实体名册>
 
-<已知实体说明（先验知识，用户手写维护）>
+<已知实体先验知识（说明 + 既有状态快照 + 活跃稳定特征）>
 {entity_priors}
-</已知实体说明>
+</已知实体先验知识>
 
 # 输出格式
 只输出JSON数组，不要解释或使用Markdown：
@@ -4089,9 +4207,33 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     card = json.loads(card)
                 except (json.JSONDecodeError, TypeError):
                     card = {}
-            description = str((card or {}).get("description") or "").strip()
+            card = card if isinstance(card, dict) else {}
+            description = str(card.get("description") or "").strip()
+            # 既有状态快照：fact_date 升序（最新在后），只取最近 N 条做状态演进先验
+            snapshots = [
+                snap for snap in (card.get("snapshots") or [])
+                if isinstance(snap, dict) and snap.get("state")
+            ]
+            snapshots.sort(key=lambda s: (str(s.get("fact_date") or ""), str(s.get("recorded_at") or "")))
+            snap_parts = []
+            for snap in snapshots[-ENTITY_PRIOR_SNAPSHOT_LIMIT:]:
+                date = str(snap.get("fact_date") or "未知日期")
+                state = re.sub(r"\s+", " ", str(snap.get("state") or "")).strip()
+                snap_parts.append(f"{date}：{state}")
+            snap_text = "；".join(snap_parts) or "（无）"
+            # 活跃稳定特征：用户已确认的长期特质
+            traits = [
+                re.sub(r"\s+", " ", str(t.get("text") or "")).strip()
+                for t in (card.get("stable_traits") or [])
+                if isinstance(t, dict) and str(t.get("status") or "active").strip() == "active"
+            ]
+            trait_text = "、".join(t for t in traits if t) or "（无）"
+            lines = [f"- {ent.get('name')}（{ent.get('type') or ent.get('entity_type') or 'other'}）"]
             if description:
-                prior_lines.append(f"- {ent.get('name')}：{description}")
+                lines.append(f"  说明：{description}")
+            lines.append(f"  既有状态快照（最近 {ENTITY_PRIOR_SNAPSHOT_LIMIT} 条）：{snap_text}")
+            lines.append(f"  活跃稳定特征：{trait_text}")
+            prior_lines.append("\n".join(lines))
         if prior_lines:
             entity_priors = "\n".join(prior_lines)
     except Exception as exc:

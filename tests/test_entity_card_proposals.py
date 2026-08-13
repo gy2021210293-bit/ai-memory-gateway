@@ -271,10 +271,44 @@ class EntityCardHarnessTests(unittest.TestCase):
         prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
         # 实体块里带上了用户手写说明（先验知识）
         self.assertIn("已知说明（先验知识）：有两个账号，一个存插件数据，一个存设备数据", prompt)
-        # 先读说明+类型明确实体性质再定状态（防张冠李戴）；说明不是待生成的状态，生成的快照不得与其矛盾
+        # 先读说明+类型明确实体性质再定状态（防张冠李戴）；先验三段（说明/特征/快照）不是待生成状态，不得复述或矛盾
         self.assertIn("先读它们弄清楚这个实体是什么", prompt)
-        self.assertIn("「已知说明」本身不是待生成的状态", prompt)
-        self.assertIn("生成的快照不得与已知说明矛盾", prompt)
+        self.assertIn("它们都不是待生成的状态", prompt)
+        self.assertIn("生成的快照不得与已知说明、活跃稳定特征或既有状态快照矛盾", prompt)
+        # 无既有快照/特征时渲染（无）
+        self.assertIn("活跃稳定特征：（无）", prompt)
+        self.assertIn("既有状态快照：（无）", prompt)
+
+    def test_build_snapshot_backfill_prompt_includes_snapshots_and_active_traits(self):
+        entities = [{
+            "id": 9, "name": "豆豆", "entity_type": "pet", "aliases": ["豆豆子"],
+            "entity_card_json": {
+                "description": "豆豆是一只猫",
+                "stable_traits": [
+                    {"id": "t1", "text": "怕生", "status": "active"},
+                    {"id": "t2", "text": "已退休特征", "status": "retired"},
+                    {"id": "t3", "text": "待确认特征", "status": "pending"},
+                ],
+                # 6 条快照，fact_date 升序后只取最近 5 条（最新的在尾部）
+                "snapshots": [
+                    {"fact_date": f"2026-05-{i:02d}", "state": f"状态{i}"}
+                    for i in range(1, 7)
+                ],
+            },
+            "memories": [{"id": 1, "content": "豆豆搬来了"}],
+        }]
+        prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
+        # 活跃稳定特征注入，retired/pending 不注入
+        self.assertIn("活跃稳定特征：怕生", prompt)
+        self.assertNotIn("已退休特征", prompt)
+        self.assertNotIn("待确认特征", prompt)
+        # 既有快照按 fact_date 升序渲染、只取最近 5 条（2026-05-01 被截掉）
+        self.assertIn(
+            "既有状态快照：2026-05-02：状态2；2026-05-03：状态3；2026-05-04：状态4；"
+            "2026-05-05：状态5；2026-05-06：状态6",
+            prompt,
+        )
+        self.assertNotIn("2026-05-01", prompt)
 
     def test_build_snapshot_backfill_prompt_without_card_defaults_to_none(self):
         entities = [{
