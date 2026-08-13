@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
@@ -2936,16 +2936,23 @@ async def api_get_cognitive_items():
 
 @app.post("/api/cognitive-items/draft")
 async def api_generate_cognitive_draft():
-    """Review cognitive sections without persisting any candidate."""
+    """Review cognitive sections without persisting any candidate.
+
+    Incremental: only new memories since the last successful draft (cursor) are
+    read as evidence. The cursor advances only after generation succeeds, so a
+    failed run never skips a batch.
+    """
     allowed_rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES
     memories = await get_memories_for_cognitive_draft(80)
     if not memories:
-        return JSONResponse(status_code=400, content={"error": "没有可用于生成认知草稿的活跃记忆"})
+        return JSONResponse(status_code=400, content={"error": "没有新的记忆可审视（自上次草稿后无新增）"})
     current_items = await list_cognitive_items(active_only=True)
     revisions = await get_recent_cognitive_revisions(30)
     raw_draft = await generate_cognitive_draft(memories, current_items, revisions)
     if raw_draft is None:
         return JSONResponse(status_code=502, content={"error": "认知草稿模型调用失败，现有认知未改变"})
+    # 生成成功才推进书签：这批记忆已展示过，下次只看更新的；失败则保持原位。
+    cursor = await advance_cognitive_draft_cursor([m["id"] for m in memories])
     allowed_memory_ids = {int(memory["id"]) for memory in memories}
     active_by_id = {
         int(item["id"]): item for item in current_items
@@ -3004,7 +3011,7 @@ async def api_generate_cognitive_draft():
         if len(draft) >= COGNITIVE_DRAFT_TOTAL_LIMIT:
             break
     return {"status": "draft", "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
-            "evidence_count": len(memories)}
+            "evidence_count": len(memories), "new_count": len(memories), "cursor": cursor}
 
 
 @app.get("/api/cognitive-items/revisions")
@@ -3981,7 +3988,7 @@ CONSOLIDATION_PROMPT = """
 
 - entities：数组，每个元素 {{"name": "实体名", "type": "person|place|organization|project|object|pet|activity|event|other"}}。事件正文里明确出现、且作为长期记忆锚点值得追踪的命名实体才标；下方「已知实体名册」里已有的实体必须用其规范名，不要新建同名实体；名册里没有的新实体（需是稳定命名实体，排除代词、泛指名词、代码/文件名/路径/URL 等）可以新建。没有就返回空数组。
 - state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD", "user_view": "晏晏当时对这件事的看法/态度（≤60字，来自她当时的话，没有就空字符串）", "ai_view": "栖当时对这件事的感受（≤60字，来自栖当时在对话中的反应，没有就空字符串）"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（我自己用「我」，晏晏用「晏晏」或「她」，禁止出现「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。**user_view/ai_view 是可选观测日记字段：只有对话中明确表达了态度/感受才写，禁止根据事件内容推断补写；没有就返回空字符串。宁可没有，不要硬编。**
-- **一致性约束**：下方「已知实体说明」里的内容是用户手写维护的结构性事实背景，不是待生成的状态；不要把它复述成 state_changes，生成的 state_changes 不得与对应实体的已知说明矛盾。
+- **先读说明再定状态**：生成 state_changes 前，先读下方「已知实体说明」和名册里的实体类型，明确这个实体是什么、属于哪一类（人/宠物/地点/项目…），再据此判断事件正文体现出它的什么状态变化，防止性质错判、张冠李戴（如把人的状态写成宠物的，或反过来）；说明本身是用户手写维护的结构性事实背景，不是待生成的状态，不要把它复述成 state_changes，生成的 state_changes 不得与对应实体的已知说明矛盾。
 
 <已知实体名册>
 {entities_roster}
@@ -4097,23 +4104,34 @@ async def consolidate_memories_for_date_range(start_date, end_date):
     
     # 使用环境变量配置的模型，默认 haiku 节省成本
     consolidation_model = os.getenv("MEMORY_MODEL", "") or os.getenv("DEFAULT_MODEL", "anthropic/claude-haiku-4.5")
-    
+
+    # 整理请求可能携带多天大量碎片，模型生成耗时较长；读取超时放宽到与主对话一致（可配），
+    # 并在读超时/连接中断等瞬时故障时重试，而不是直接让整个整理任务失败
+    consolidation_timeout = float(os.getenv("CONSOLIDATION_TIMEOUT", "300"))
+
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            # 最多重试2次（应对429限流）
+        async with httpx.AsyncClient(timeout=consolidation_timeout) as client:
+            # 最多重试2次（应对429限流与读超时/连接中断等瞬时故障）
             last_error = None
             for attempt in range(3):
-                response = await client.post(
-                    get_memory_api_base_url(),
-                    headers={
-                        "Authorization": f"Bearer {get_memory_api_key()}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": consolidation_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                    }
-                )
+                try:
+                    response = await client.post(
+                        get_memory_api_base_url(),
+                        headers={
+                            "Authorization": f"Bearer {get_memory_api_key()}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": consolidation_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                        }
+                    )
+                except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+                    wait_time = (attempt + 1) * 10
+                    print(f"⚠️ 整理API请求{type(exc).__name__}，{wait_time}秒后重试（第{attempt+1}次）")
+                    last_error = f"{type(exc).__name__}（重试{attempt+1}次）"
+                    await asyncio.sleep(wait_time)
+                    continue
 
                 if response.status_code == 429:
                     wait_time = (attempt + 1) * 10

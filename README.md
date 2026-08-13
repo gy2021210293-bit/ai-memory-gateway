@@ -135,6 +135,7 @@ PostgreSQL 存储对话、记忆、实体、认知与配置；`system_prompt.txt
 | `USER_ENTITY_NAMES`（可选） | 不应创建为实体的用户本人名称（英文逗号分隔），请填你部署环境里的称呼 | `用户,user,the user` |
 | `AI_ENTITY_NAMES`（可选） | 不应创建为实体的 AI 名称（英文逗号分隔） | `AI,助手` |
 | `MEMORY_API_KEY` / `MEMORY_API_BASE_URL`（可选） | 独立于主连接的记忆提取 API（留空则复用主连接） | 无 |
+| `CONSOLIDATION_TIMEOUT`（可选） | 整理碎片请求 LLM 的读取超时（秒），碎片多/模型慢时可调大 | `300` |
 
 **3. 重新部署**
 

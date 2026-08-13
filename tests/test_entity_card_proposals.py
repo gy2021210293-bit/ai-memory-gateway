@@ -271,8 +271,9 @@ class EntityCardHarnessTests(unittest.TestCase):
         prompt = memory_extractor._build_snapshot_backfill_prompt(entities)
         # 实体块里带上了用户手写说明（先验知识）
         self.assertIn("已知说明（先验知识）：有两个账号，一个存插件数据，一个存设备数据", prompt)
-        # 说明是结构性事实背景：不是待生成的状态，生成的快照不得与其矛盾
-        self.assertIn("说明里的内容不是待生成的状态", prompt)
+        # 先读说明+类型明确实体性质再定状态（防张冠李戴）；说明不是待生成的状态，生成的快照不得与其矛盾
+        self.assertIn("先读它们弄清楚这个实体是什么", prompt)
+        self.assertIn("「已知说明」本身不是待生成的状态", prompt)
         self.assertIn("生成的快照不得与已知说明矛盾", prompt)
 
     def test_build_snapshot_backfill_prompt_without_card_defaults_to_none(self):

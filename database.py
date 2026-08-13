@@ -100,6 +100,8 @@ COGNITIVE_LEVEL_RANK = {"explicit": 0, "deductive": 1, "inductive": 2}
 COGNITIVE_ACTIONS = ("create", "reinforce", "supersede", "conflict")
 COGNITIVE_PER_TYPE_LIMIT = 3   # 编译注入时每格最多展示的 active 卡数
 COGNITIVE_DRAFT_TOTAL_LIMIT = 12  # 单次草稿最多返回的候选卡数
+COGNITIVE_DRAFT_NEW_LIMIT = 40  # 增量草稿每次最多只读"书签之后"的新记忆
+COGNITIVE_DRAFT_CURSOR_KEY = "cognitive_draft_cursor"  # 书签：上次草稿已展示的最大记忆 ID
 
 
 # ============================================================
@@ -2738,39 +2740,39 @@ async def get_fragments_by_date_range(start_date, end_date):
 
 
 async def get_memories_for_cognitive_draft(limit: int = 80):
-    """Return up to 60 high-signal plus 20 recent active memories, deduplicated."""
-    high_signal_limit = min(60, max(0, int(limit)))
-    recent_limit = min(20, max(0, int(limit) - high_signal_limit))
+    """增量取草稿证据：只读书签之后新出现的记忆，旧的不再重复喂。
+
+    书签 = gateway_config.cognitive_draft_cursor，记录上次草稿已展示的最大记忆 ID。
+    草稿成功生成后才由 advance_cognitive_draft_cursor 推进；生成失败书签不动，下次重试不丢批。
+    """
+    new_limit = min(COGNITIVE_DRAFT_NEW_LIMIT, max(0, int(limit)))
+    cursor = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            WITH high_signal AS (
-                SELECT id, content, importance, created_at, layer, title
-                FROM memories
-                WHERE is_active = TRUE
-                ORDER BY layer DESC, importance DESC, created_at DESC
-                LIMIT $1
-            ),
-            recent AS (
-                SELECT id, content, importance, created_at, layer, title
-                FROM memories
-                WHERE is_active = TRUE
-                ORDER BY created_at DESC
-                LIMIT $2
-            )
             SELECT id, content, importance, created_at, layer, title
-            FROM (
-                SELECT high_signal.*, 1 AS source_order FROM high_signal
-                UNION ALL
-                SELECT recent.*, 2 AS source_order FROM recent
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM high_signal WHERE high_signal.id = recent.id
-                )
-            ) evidence
-            ORDER BY source_order, layer DESC, importance DESC, created_at DESC
-            LIMIT $3
-        """, high_signal_limit, recent_limit, limit)
+            FROM memories
+            WHERE is_active = TRUE AND id > $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT $2
+        """, cursor, new_limit)
         return [dict(row) for row in rows]
+
+
+async def advance_cognitive_draft_cursor(memory_ids) -> int:
+    """草稿成功生成后把书签推进到这批已展示记忆的最大 ID（只进不退）。
+
+    返回推进后的书签值；若这批没有比当前书签更新的记忆，则保持原值。
+    """
+    ids = [int(mid) for mid in (memory_ids or []) if mid and int(mid) > 0]
+    if not ids:
+        return int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
+    high = max(ids)
+    current = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
+    if high > current:
+        await set_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, str(high))
+        return high
+    return current
 
 
 async def reactivate_orphan_fragments_by_date_range(start_date, end_date):

@@ -1460,7 +1460,7 @@ async function generateCognitiveDraft() {
         renderCognitiveDrafts(data);
         status.textContent = pendingCognitiveDrafts.length
             ? `已生成 ${pendingCognitiveDrafts.length} 个认知区块草稿（模型：${data.model}）。请逐项确认保存。`
-            : '模型没有发现证据充分的实质变化。';
+            : `这 ${data.new_count || 0} 条新记忆里没有发现证据充分的实质变化。`;
     } catch (error) {
         status.textContent = error.message;
     } finally {
@@ -1473,8 +1473,10 @@ function renderCognitiveDrafts(meta = {}) {
     root.replaceChildren();
     root.style.display = '';
     const heading = document.createElement('h3');
-    const evidenceLabel = Number.isFinite(Number(meta.evidence_count))
-        ? `${meta.evidence_count} 条记忆` : '已有记忆';
+    const evidenceLabel = Number.isFinite(Number(meta.new_count))
+        ? `${meta.new_count} 条新记忆（自上次草稿后）`
+        : (Number.isFinite(Number(meta.evidence_count))
+            ? `${meta.evidence_count} 条记忆` : '已有记忆');
     heading.textContent = `整体审视草稿（证据来自 ${evidenceLabel}，尚未保存）`;
     root.appendChild(heading);
     if (!pendingCognitiveDrafts.length) {

@@ -12,6 +12,7 @@ venv/
 
 # 个人项目记忆/工程日志（不要提交到公开仓库）
 MEMORY.md
+*.docx
 
 # IDE
 .vscode/

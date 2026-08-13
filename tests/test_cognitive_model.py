@@ -3,7 +3,7 @@ import sys
 import types
 import unittest
 from datetime import date, datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 asyncpg = types.ModuleType("asyncpg")
@@ -648,14 +648,44 @@ class _FakeEvidenceConnection:
 
 
 class CognitiveEvidenceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_draft_evidence_uses_sixty_high_signal_plus_twenty_recent(self):
+    async def test_draft_evidence_is_new_since_cursor_only(self):
         conn = _FakeEvidenceConnection()
         with patch.object(database, "get_pool", return_value=_FakePool(conn)):
-            self.assertEqual(await database.get_memories_for_cognitive_draft(80), [])
-        self.assertEqual(conn.args, (60, 20, 80))
-        self.assertIn("WITH high_signal AS", conn.query)
-        self.assertIn("recent AS", conn.query)
-        self.assertIn("NOT EXISTS", conn.query)
+            with patch.object(database, "get_gateway_config",
+                             new=AsyncMock(return_value="137")):
+                self.assertEqual(await database.get_memories_for_cognitive_draft(80), [])
+        self.assertEqual(conn.args, (137, database.COGNITIVE_DRAFT_NEW_LIMIT))
+        self.assertIn("id > $1", conn.query)
+        self.assertNotIn("recent AS", conn.query)
+        self.assertNotIn("high_signal AS", conn.query)
+
+    async def test_draft_cursor_zero_when_no_bookmark(self):
+        conn = _FakeEvidenceConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            with patch.object(database, "get_gateway_config",
+                             new=AsyncMock(return_value="0")):
+                self.assertEqual(await database.get_memories_for_cognitive_draft(80), [])
+        self.assertEqual(conn.args, (0, database.COGNITIVE_DRAFT_NEW_LIMIT))
+
+    async def test_advance_cursor_moves_forward_only(self):
+        setter = AsyncMock()
+        with patch.object(database, "get_gateway_config",
+                         new=AsyncMock(return_value="137")):
+            with patch.object(database, "set_gateway_config", new=setter):
+                # 这批没有更新的记忆 → 书签保持 137，不写库
+                advanced = await database.advance_cognitive_draft_cursor([100, 50])
+                setter.assert_not_awaited()
+                self.assertEqual(advanced, 137)
+                # 有更新的记忆 → 书签推进到 180
+                advanced = await database.advance_cognitive_draft_cursor([180, 150, 137])
+                setter.assert_awaited_once_with(
+                    database.COGNITIVE_DRAFT_CURSOR_KEY, "180")
+                self.assertEqual(advanced, 180)
+
+    async def test_advance_cursor_ignores_empty(self):
+        with patch.object(database, "get_gateway_config",
+                         new=AsyncMock(return_value="0")):
+            self.assertEqual(await database.advance_cognitive_draft_cursor([]), 0)
 
 
 if __name__ == "__main__":
