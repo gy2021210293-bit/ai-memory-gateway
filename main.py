@@ -2570,6 +2570,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         f"type={type(chunk_error).__name__}, detail={chunk_error}",
                         flush=True,
                     )
+                    # chunk 是 _upstream_stream_error_event 生成的结构化错误事件（含 [DONE]）。
+                    # 必须转发给客户端，否则客户端收不到流结束标记会一直挂起直到超时取消。
+                    yield chunk
                     continue
                 
                 upstream_sse_buffer.extend(chunk)
@@ -2697,6 +2700,10 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             user_message_id=drives_user_message_id,
             run_id=drives_run_id,
         ))
+
+    if stream_error:
+        # 流中断的结构化错误事件（含 [DONE]）已在上方 chunk_error 分支转发，不再重复发截断事件。
+        return
 
     if upstream_sse_buffer.strip():
         print(f"❌ 上游 SSE 在事件边界前结束: session={session_id}", flush=True)
