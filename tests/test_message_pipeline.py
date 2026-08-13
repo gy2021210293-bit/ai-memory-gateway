@@ -3,6 +3,7 @@ import unittest
 from message_pipeline import (
     classify_request,
     combine_system_prompt,
+    extract_current_block,
     has_closed_tool_tail,
     make_persistence_plan,
     reconcile_partition_block,
@@ -607,6 +608,82 @@ class DbAssistantSuppliedTests(unittest.TestCase):
             [message["role"] for message in result.provider_messages],
             ["tool"],
         )
+
+
+class SelfContainedToolChainTests(unittest.TestCase):
+    """客户端以增量回传 [assistant(tool_calls), tool]（无前导 user）时的当前块识别。"""
+
+    def test_extract_self_contained_tool_chain(self):
+        block, is_tool_chain = extract_current_block([
+            _call("call-1"),
+            _result("call-1"),
+        ])
+
+        self.assertTrue(is_tool_chain)
+        self.assertEqual(
+            [message["role"] for message in block],
+            ["assistant", "tool"],
+        )
+
+    def test_extract_multi_step_self_contained_tool_chain(self):
+        block, is_tool_chain = extract_current_block([
+            _call("call-1"),
+            _result("call-1"),
+            _call("call-2"),
+            _result("call-2"),
+        ])
+
+        self.assertTrue(is_tool_chain)
+        self.assertEqual(
+            [message["role"] for message in block],
+            ["assistant", "tool", "assistant", "tool"],
+        )
+
+    def test_mismatched_self_contained_tool_chain_is_still_rejected(self):
+        block, is_tool_chain = extract_current_block([
+            _call("call-1"),
+            _result("call-x"),
+        ])
+
+        self.assertEqual(block, [])
+        self.assertFalse(is_tool_chain)
+
+    def test_reconcile_delta_tool_chain_without_user(self):
+        database = [
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": "older answer"},
+        ]
+        client = [
+            _call("call-1"),
+            _result("call-1"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertNotEqual(result.reason, "no_valid_current_block")
+        self.assertTrue(result.is_tool_chain)
+        self.assertEqual(
+            [message["role"] for message in result.provider_messages],
+            ["assistant", "tool"],
+        )
+        self.assertTrue(
+            validate_tool_sequence(database + list(result.provider_messages)).valid
+        )
+
+    def test_mismatched_delta_tool_chain_is_still_rejected(self):
+        database = [
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": "older answer"},
+        ]
+        client = [
+            _call("call-1"),
+            _result("call-x"),
+        ]
+
+        result = reconcile_partition_block(database, client)
+
+        self.assertEqual(result.provider_messages, ())
+        self.assertEqual(result.reason, "no_valid_current_block")
 
 
 if __name__ == "__main__":

@@ -447,7 +447,14 @@ def extract_current_block(messages: list[Message]) -> tuple[list[Message], bool]
             return [], False
         cursor -= 1
 
-    if cursor < 0 or non_system[cursor].get("role") != "user":
+    if cursor < 0:
+        # 自包含工具链（无前导 user）：客户端以增量回传 [assistant(tool_calls), tool]，
+        # 前导 user 在“完整回合才入库”的设计下尚未持久化，仍视为有效当前块。
+        return [
+            {key: deepcopy(value) for key, value in message.items() if key != "metadata"}
+            for message in non_system
+        ], True
+    if non_system[cursor].get("role") != "user":
         return [], False
     while cursor > 0 and non_system[cursor - 1].get("role") == "user":
         cursor -= 1
