@@ -879,6 +879,13 @@ def build_time_injection() -> str:
 # 前缀对比（与上次请求找分歧点）默认总是打印，直接指出缓存断点在哪条消息。
 DEBUG_DUMP_REQUEST = os.getenv("DEBUG_DUMP_REQUEST", "false").lower() == "true"
 _last_request_digest = None  # (model, [(role, content_md5), ...])
+# reasoning-only 空响应标记用：记录"上次请求相比本次，system 消息是否变化"。
+_last_system_change = {
+    "known": False,
+    "changed": False,
+    "current": "",
+    "previous": "",
+}
 
 
 def _message_content_digest(message: dict) -> str:
@@ -895,7 +902,7 @@ def dump_request_debug(model: str, messages: list) -> None:
     打印最终发给上游的请求摘要，并与上次请求对比找出缓存前缀断点。
     只读不修改。messages 为最终 body（含系统提示词）。
     """
-    global _last_request_digest
+    global _last_request_digest, _last_system_change
     digest = [
         (m.get("role", ""), _message_content_digest(m))
         for m in messages
@@ -930,6 +937,16 @@ def dump_request_debug(model: str, messages: list) -> None:
     # 与上次请求逐条对比：共同前缀长度 = 上游自动缓存最多能命中的部分
     if _last_request_digest and _last_request_digest[0] == model:
         prev_digests = _last_request_digest[1]
+        _last_system_change = {
+            "known": True,
+            "changed": bool(
+                digest and prev_digests
+                and digest[0][0] == "system"
+                and digest[0][1] != prev_digests[0][1]
+            ),
+            "current": digest[0][1] if digest else "",
+            "previous": prev_digests[0][1] if prev_digests else "",
+        }
         common = 0
         for a, b in zip(prev_digests, digest):
             if a == b:
@@ -957,7 +974,39 @@ def dump_request_debug(model: str, messages: list) -> None:
                 f"🔍 分歧消息: role={changed[0]} 本次={changed[1]} vs 上次={prev_changed[1]}",
                 flush=True,
             )
+    else:
+        _last_system_change = {
+            "known": False,
+            "changed": False,
+            "current": "",
+            "previous": "",
+        }
     _last_request_digest = (model, digest)
+
+
+def _warn_empty_reasoning_response(session_id: str, body: dict, reasoning_len: int) -> None:
+    """reasoning-only 空响应：上游只思考（reasoning_content）、没有正文、也没有工具调用。
+
+    这种响应客户端会一直等一个不存在的工具结果/正文——表现就是"工具调用没回传结果"。
+    醒目标记本次请求是否带 tools 定义、system 是否相比上次变化，方便抓到失败现场。
+    """
+    model = body.get("model", "")
+    tools = body.get("tools")
+    tools_desc = f"有（{len(tools)}个）" if tools else "无"
+    sys_info = _last_system_change
+    if sys_info["known"] and sys_info["changed"]:
+        sys_desc = f"是（本次={sys_info['current']} vs 上次={sys_info['previous']}）"
+    elif sys_info["known"]:
+        sys_desc = "否"
+    else:
+        sys_desc = "无法对比（首次请求/模型切换）"
+    print(
+        "🚨 reasoning-only 空响应：思考了"
+        f"{reasoning_len}字，但无正文且无工具调用\n"
+        f"    model={model} session={session_id} "
+        f"tools定义={tools_desc} system变化={sys_desc}",
+        flush=True,
+    )
 
 
 def _usage_cache_hit(usage: dict) -> int:
@@ -2280,7 +2329,11 @@ async def _chat_completions_inner(request: Request):
                         print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
                 except (KeyError, IndexError):
                     pass
-                
+
+                # reasoning-only 空响应：思考了但没正文也没工具调用（同上，非流式路径）
+                if assistant_reasoning and not assistant_msg and not assistant_tool_calls:
+                    _warn_empty_reasoning_response(session_id, body, len(assistant_reasoning))
+
                 if MEMORY_ENABLED and (user_message or tool_messages):
                     persistence_plan = make_persistence_plan(
                         session_id,
@@ -2662,7 +2715,12 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     
     if assistant_tool_calls:
         print(f"🔧 Stream response 包含 {len(assistant_tool_calls)} 个工具调用")
-    
+
+    # reasoning-only 空响应：思考了但没正文也没工具调用 → 客户端会干等一个不存在的
+    # 工具结果。醒目标记（含 tools 定义、system 是否变化）。
+    if assistant_reasoning and not assistant_msg and not assistant_tool_calls:
+        _warn_empty_reasoning_response(session_id, body, len(assistant_reasoning))
+
     if stream_usage:
         pt = stream_usage.get("prompt_tokens", 0)
         ct = stream_usage.get("completion_tokens", 0)
