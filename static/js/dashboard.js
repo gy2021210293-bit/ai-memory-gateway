@@ -1849,7 +1849,24 @@ async function renderCognitiveRevisions() {
             const time = rev.created_at ? new Date(rev.created_at) : null;
             const timeText = time && !Number.isNaN(time.getTime()) ? time.toLocaleDateString() : '';
             const section = cognitionSection(rev.cognitive_type)?.label || rev.cognitive_type;
-            row.textContent = `${timeText} · ${section} · ${label}：${detail}`;
+            const text = document.createElement('span');
+            text.textContent = `${timeText} · ${section} · ${label}：${detail}`;
+            row.appendChild(text);
+            const delBtn = document.createElement('button');
+            delBtn.className = 'btn btn-icon btn-sm';
+            delBtn.textContent = '✕';
+            delBtn.title = '从证据回喂中移除这条记录';
+            delBtn.onclick = async () => {
+                if (!confirm('从审计记录中删除这条？它将不再作为证据回喂下次审视。')) return;
+                const resp = await fetch(`/api/cognitive-items/revisions/${rev.id}`, { method: 'DELETE' });
+                const result = await resp.json();
+                if (!resp.ok || result.error) {
+                    alert(result.error || '删除失败');
+                    return;
+                }
+                await renderCognitiveRevisions();
+            };
+            row.appendChild(delBtn);
             list.appendChild(row);
         });
         root.appendChild(list);

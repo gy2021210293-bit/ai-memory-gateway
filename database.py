@@ -5294,17 +5294,14 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
             except (TypeError, ValueError):
                 confidence = 0.7
             level_label = COGNITIVE_LEVEL_LABELS.get(item.get("level", "explicit"), "明确陈述")
-            times = int(item.get("times_derived") or 1)
-            evidence = item.get("evidence_memory_ids") or []
-            evidence_text = "（证据 " + "、".join(f"#{e}" for e in evidence) + "）" if evidence else ""
             stale = ""
             if is_cognitive_item_stale(item, today=today):
                 stale = "（可能过时，只能作为背景）"
             elif item.get("review_after"):
                 stale = "（当前状态）"
             lines.append(
-                f"- [{level_label}·强化×{times}｜置信度{confidence:.2f}] "
-                f"{str(item.get('content', '')).strip()}{evidence_text}{stale}"
+                f"- [{level_label}·置信度{confidence:.2f}] "
+                f"{str(item.get('content', '')).strip()}{stale}"
             )
         sections.append(f"【{type_labels[cognitive_type]}】\n" + "\n".join(lines))
     if not sections:
@@ -5480,6 +5477,25 @@ async def record_cognitive_rejection(subject: str, cognitive_type: str, content:
                 conn, card_id=None, subject=subject, cognitive_type=cognitive_type,
                 action="reject", content_before=content,
             )
+    return {"status": "ok"}
+
+
+async def delete_cognitive_revision(revision_id: int):
+    """Remove one human-decision audit record from the evidence loop.
+
+    Lets the human drop trivial confirmations / corrections they do not want
+    fed back into the next 三元一场 review. The record is gone from both the
+    dashboard audit strip and the 30-row window used by draft generation.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id FROM cognitive_revision_log WHERE id = $1", revision_id
+            )
+            if not row:
+                return {"error": "记录不存在"}
+            await conn.execute("DELETE FROM cognitive_revision_log WHERE id = $1", revision_id)
     return {"status": "ok"}
 
 

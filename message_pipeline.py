@@ -82,6 +82,21 @@ class PersistencePlan:
     completed_round: bool
     skip: bool
 
+    @property
+    def user_leading(self) -> bool:
+        """Block starts with a durable user turn (vs. a pure tool delta)."""
+        return bool(self.messages) and self.messages[0].get("role") == "user"
+
+
+def leading_user_messages(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+    """The leading user messages of a persistence block (the trigger turn)."""
+    out = []
+    for message in messages:
+        if message.get("role") != "user":
+            break
+        out.append(message)
+    return tuple(out)
+
 
 @dataclass(frozen=True)
 class ReconciledBlock:
@@ -636,8 +651,11 @@ def make_persistence_plan(
     assistant_tool_calls: list | None,
     assistant_reasoning: str | None,
     skip: bool,
+    leading_user_messages: tuple[Message, ...] = (),
 ) -> PersistencePlan:
     messages = [deepcopy(message) for message in current_block]
+    if leading_user_messages:
+        messages = [deepcopy(message) for message in leading_user_messages] + messages
     assistant: Message = {"role": "assistant", "content": assistant_content or ""}
     if assistant_tool_calls:
         assistant["tool_calls"] = deepcopy(assistant_tool_calls)

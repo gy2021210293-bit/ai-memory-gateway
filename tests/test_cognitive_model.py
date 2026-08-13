@@ -151,8 +151,8 @@ class CognitiveModelTests(unittest.TestCase):
         ], today=date(2026, 7, 30))
         self.assertIn("三元一场认知模型", prompt)
         self.assertIn("【用户核心】", prompt)
-        self.assertIn("[明确陈述·强化×2｜置信度0.80] 偏好简短回答", prompt)
-        self.assertIn("[演绎推断·强化×1｜置信度0.90] 重视诚实", prompt)
+        self.assertIn("[明确陈述·置信度0.80] 偏好简短回答", prompt)
+        self.assertIn("[演绎推断·置信度0.90] 重视诚实", prompt)
         self.assertIn("【AI 自我核心】", prompt)
         self.assertIn("【关系核心】", prompt)
         self.assertNotIn("当前认知场", prompt)
@@ -617,6 +617,23 @@ class CognitiveRevisionLogTests(unittest.IsolatedAsyncioTestCase):
             items = await database.get_recent_cognitive_revisions(10)
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["action"], "reject")
+
+    async def test_delete_revision_removes_audit_record(self):
+        conn = _FakeDeleteConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.delete_cognitive_revision(42)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(any(
+            query.startswith("DELETE FROM cognitive_revision_log")
+            for query, _args in conn.executions
+        ))
+
+    async def test_delete_revision_missing_returns_error(self):
+        conn = _FakeDeleteConnection()
+        conn.row = None  # fetchrow 返回空 → 记录不存在
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.delete_cognitive_revision(999)
+        self.assertEqual(result["error"], "记录不存在")
 
 
 class _FakeEvidenceConnection:

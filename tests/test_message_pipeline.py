@@ -5,6 +5,7 @@ from message_pipeline import (
     combine_system_prompt,
     extract_current_block,
     has_closed_tool_tail,
+    leading_user_messages,
     make_persistence_plan,
     reconcile_partition_block,
     validate_tool_sequence,
@@ -608,6 +609,71 @@ class DbAssistantSuppliedTests(unittest.TestCase):
             [message["role"] for message in result.provider_messages],
             ["tool"],
         )
+
+
+class PersistenceRoundTests(unittest.TestCase):
+    """触发工具链的用户消息必须在整轮最终入库时保留在批次开头。"""
+
+    def test_user_leading_detects_a_user_started_round(self):
+        plan = make_persistence_plan(
+            "thread-a",
+            ({"role": "user", "content": "run tool"},),
+            "",
+            [{"id": "call-1"}],
+            None,
+            False,
+        )
+        self.assertTrue(plan.user_leading)
+        self.assertEqual(
+            leading_user_messages(plan.messages),
+            ({"role": "user", "content": "run tool"},),
+        )
+
+    def test_tool_delta_has_no_user_leading(self):
+        plan = make_persistence_plan(
+            "thread-a",
+            (
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ),
+            "final answer",
+            None,
+            None,
+            False,
+        )
+        self.assertFalse(plan.user_leading)
+        self.assertEqual(leading_user_messages(plan.messages), ())
+
+    def test_leading_user_messages_stops_at_first_non_user(self):
+        messages = (
+            {"role": "user", "content": "one"},
+            {"role": "user", "content": "two"},
+            {"role": "assistant", "content": "answer"},
+        )
+        self.assertEqual(
+            [m["content"] for m in leading_user_messages(messages)],
+            ["one", "two"],
+        )
+
+    def test_make_persistence_plan_prepends_stashed_trigger_user(self):
+        plan = make_persistence_plan(
+            "thread-a",
+            (
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ),
+            "final answer",
+            None,
+            None,
+            False,
+            leading_user_messages=({"role": "user", "content": "run tool"},),
+        )
+        self.assertTrue(plan.completed_round)
+        self.assertEqual(
+            [message["role"] for message in plan.messages],
+            ["user", "assistant", "tool", "assistant"],
+        )
+        self.assertEqual(plan.messages[0]["content"], "run tool")
 
 
 class SelfContainedToolChainTests(unittest.TestCase):

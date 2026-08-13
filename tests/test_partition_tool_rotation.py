@@ -228,5 +228,134 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.httpx.AsyncClient = original_client
 
+
+class PendingToolUserTests(unittest.TestCase):
+    """触发工具链的用户消息在整轮完成前暂存，最终入库时拼回批次开头。"""
+
+    def setUp(self):
+        main._pending_tool_user.clear()
+
+    def tearDown(self):
+        main._pending_tool_user.clear()
+
+    def _user_start_plan(self):
+        return main.make_persistence_plan(
+            "thread-a",
+            ({"role": "user", "content": "run tool"},),
+            "",
+            [{"id": "call-1"}],
+            None,
+            False,
+        )
+
+    def _delta_final_plan(self):
+        return main.make_persistence_plan(
+            "thread-a",
+            (
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ),
+            "final answer",
+            None,
+            None,
+            False,
+        )
+
+    def test_chain_start_stashes_user_and_defers_persistence(self):
+        plan = self._user_start_plan()
+        plan = main._reconcile_pending_tool_user(
+            "thread-a", plan, ({"role": "user", "content": "run tool"},),
+            "", [{"id": "call-1"}], None, False,
+        )
+        self.assertFalse(plan.completed_round)
+        self.assertEqual(
+            main._pending_tool_user["thread-a"],
+            ({"role": "user", "content": "run tool"},),
+        )
+
+    def test_chain_completion_prepends_stashed_user(self):
+        # round start: stash the trigger user
+        plan = self._user_start_plan()
+        main._reconcile_pending_tool_user(
+            "thread-a", plan, ({"role": "user", "content": "run tool"},),
+            "", [{"id": "call-1"}], None, False,
+        )
+        # tool delta comes back; assistant replies final -> full round batch
+        plan = self._delta_final_plan()
+        plan = main._reconcile_pending_tool_user(
+            "thread-a", plan,
+            (
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ),
+            "final answer", None, None, False,
+        )
+        self.assertTrue(plan.completed_round)
+        self.assertEqual(
+            [message["role"] for message in plan.messages],
+            ["user", "assistant", "tool", "assistant"],
+        )
+        self.assertEqual(plan.messages[0]["content"], "run tool")
+        self.assertNotIn("thread-a", main._pending_tool_user)
+
+    def test_mid_chain_delta_keeps_stash(self):
+        plan = self._user_start_plan()
+        main._reconcile_pending_tool_user(
+            "thread-a", plan, ({"role": "user", "content": "run tool"},),
+            "", [{"id": "call-1"}], None, False,
+        )
+        # another tool delta with more tool_calls: still incomplete, stash kept
+        plan = main.make_persistence_plan(
+            "thread-a",
+            (
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ),
+            "",
+            [{"id": "call-2"}],
+            None,
+            False,
+        )
+        plan = main._reconcile_pending_tool_user(
+            "thread-a", plan,
+            (
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ),
+            "", [{"id": "call-2"}], None, False,
+        )
+        self.assertFalse(plan.completed_round)
+        self.assertEqual(
+            main._pending_tool_user["thread-a"],
+            ({"role": "user", "content": "run tool"},),
+        )
+
+    def test_normal_complete_round_clears_stale_stash(self):
+        plan = self._user_start_plan()
+        main._reconcile_pending_tool_user(
+            "thread-a", plan, ({"role": "user", "content": "run tool"},),
+            "", [{"id": "call-1"}], None, False,
+        )
+        # a normal user->assistant round (no tool_calls) supersedes the chain
+        plan = main.make_persistence_plan(
+            "thread-a",
+            ({"role": "user", "content": "new message"},),
+            "plain answer",
+            None,
+            None,
+            False,
+        )
+        plan = main._reconcile_pending_tool_user(
+            "thread-a", plan, ({"role": "user", "content": "new message"},),
+            "plain answer", None, None, False,
+        )
+        self.assertTrue(plan.completed_round)
+        self.assertEqual(
+            [message["role"] for message in plan.messages],
+            ["user", "assistant"],
+        )
+        self.assertNotIn("thread-a", main._pending_tool_user)
+
+
 if __name__ == "__main__":
     unittest.main()

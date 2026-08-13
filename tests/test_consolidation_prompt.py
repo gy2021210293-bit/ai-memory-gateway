@@ -28,7 +28,7 @@ class ConsolidationPromptTests(unittest.TestCase):
         self.assertIn("按事件主题拆分，不按日期硬塞", formatted)
         self.assertIn("content不超过200个汉字", formatted)
         self.assertIn("保留不可替代的重要原话", formatted)
-        self.assertIn("我有点心疼她", formatted)
+        self.assertIn("我为她高兴", formatted)
         self.assertIn('"event_date":', formatted)
         self.assertIn('"merged_ids":', formatted)
         self.assertNotIn("建议上限350字", formatted)

@@ -71,6 +71,12 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertIn("/api/cognitive-items/draft/reject", self.js)
         self.assertIn("回喂", self.js)
 
+    def test_dashboard_can_delete_single_revision_record(self):
+        # 每条审计记录都有单独删除按钮，从证据回喂中移除
+        self.assertIn("/api/cognitive-items/revisions/${rev.id}", self.js)
+        self.assertIn("从证据回喂中移除这条记录", self.js)
+        self.assertIn("cognition-revision-list li", self.css)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,7 +33,7 @@ from database import init_tables, close_pool, search_memories, save_memory, get_
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
-from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK
@@ -43,6 +43,7 @@ from upstream_compat import normalize_chat_request
 from message_pipeline import (
     classify_request,
     combine_system_prompt,
+    leading_user_messages,
     make_persistence_plan,
     reconcile_partition_block,
     repair_stale_tool_chains,
@@ -1630,6 +1631,44 @@ async def apply_event_state_changes(memory_id: int, state_changes: list, default
         print(f"📇 事件实体状态写卡: {accepted} 条已入卡，{proposals} 条转待确认提案，{skipped} 条跳过")
     return {"accepted": accepted, "proposals": proposals, "skipped": skipped}
 
+
+# session_id -> 触发工具链的领先 user 消息（内存暂存，整轮完成前不落库）。
+# 单进程部署 + 单一活跃对话线，内存暂存无并发风险，也避免了中途写库。
+_pending_tool_user: dict[str, tuple] = {}
+
+
+def _reconcile_pending_tool_user(
+    session_id: str,
+    plan,
+    current_block: tuple,
+    assistant_msg: str,
+    assistant_tool_calls,
+    assistant_reasoning,
+    skip: bool,
+):
+    """
+    保留"整轮完成后一次入库"的设计，同时不让触发工具链的用户消息丢失。
+
+    - 本轮尚未完成且块以 user 开头（新回合触发工具链）：把领先 user 暂存到
+      内存，本轮仍不落库（与 7fd9b18 的延迟设计一致）。
+    - 本轮完成且块不以 user 开头（工具链 delta 收尾）：把暂存的 user 拼回批次，
+      最终一次原子写入 [user, assistant(tool_calls), tool, …, assistant(final)]。
+    - 其它情况：仅清理过期暂存（普通完整回合 / 继续回传工具结果的 delta）。
+    """
+    if plan.completed_round:
+        if not plan.user_leading and session_id in _pending_tool_user:
+            plan = make_persistence_plan(
+                session_id, current_block, assistant_msg,
+                assistant_tool_calls, assistant_reasoning, skip,
+                leading_user_messages=_pending_tool_user.pop(session_id),
+            )
+        else:
+            _pending_tool_user.pop(session_id, None)
+    elif plan.user_leading:
+        _pending_tool_user[session_id] = leading_user_messages(plan.messages)
+    return plan
+
+
 async def process_memories_background(
     session_id: str,
     user_msg: str,
@@ -1641,7 +1680,6 @@ async def process_memories_background(
 ):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
-    
     记忆提取受 MEMORY_EXTRACT_INTERVAL 控制：
     - 0: 禁用自动提取
     - 1: 每轮提取（默认）
@@ -2343,6 +2381,11 @@ async def _chat_completions_inner(request: Request):
                         assistant_reasoning,
                         skip_conversation_log,
                     )
+                    persistence_plan = _reconcile_pending_tool_user(
+                        session_id, persistence_plan, persistence_block,
+                        assistant_msg, assistant_tool_calls, assistant_reasoning,
+                        skip_conversation_log,
+                    )
                     if persistence_plan.completed_round:
                         asyncio.create_task(
                             process_memories_background(session_id, user_message, assistant_msg, model,
@@ -2744,6 +2787,11 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             assistant_reasoning,
             skip_conversation_log,
         )
+        persistence_plan = _reconcile_pending_tool_user(
+            session_id, persistence_plan, current_block,
+            assistant_msg, assistant_tool_calls, assistant_reasoning,
+            skip_conversation_log,
+        )
         if persistence_plan.completed_round:
             asyncio.create_task(
                 process_memories_background(session_id, user_message, assistant_msg, model,
@@ -2963,6 +3011,15 @@ async def api_generate_cognitive_draft():
 async def api_get_cognitive_revisions(limit: int = 12):
     """Recent human decisions on 三元一场 cards, for the dashboard audit strip."""
     return {"items": await get_recent_cognitive_revisions(max(0, min(limit, 50)))}
+
+
+@app.delete("/api/cognitive-items/revisions/{revision_id}")
+async def api_delete_cognitive_revision(revision_id: int):
+    """Drop one audit record so it no longer feeds back into the next review."""
+    result = await delete_cognitive_revision(revision_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
 
 
 @app.post("/api/cognitive-items/draft/reject")

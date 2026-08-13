@@ -2912,7 +2912,17 @@ details.entity-group[open] > summary {
 }
 
 .cognition-revision-list li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
     overflow-wrap: anywhere;
+}
+
+.cognition-revision-list li .btn {
+    flex: none;
+    align-self: center;
+    padding: 2px 6px;
+    line-height: 1.2;
 }
 
 .cognition-diff-pane {
