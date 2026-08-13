@@ -327,6 +327,35 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsNone(result)
 
+    async def test_cognitive_draft_retries_when_reasoning_has_no_json_array(self):
+        first = Mock()
+        first.status_code = 200
+        first.json.return_value = {
+            "choices": [{"message": {"content": "", "reasoning_content": "先整体审视三元一场，但最终 JSON 在思考中被截断"}}]
+        }
+        second = Mock()
+        second.status_code = 200
+        second.json.return_value = {
+            "choices": [{"message": {"content": '[{"subject":"user","cognitive_type":"user_core","content":"晏晏重视工作与生活的平衡","level":"inductive","confidence":0.5,"evidence_memory_ids":[1],"action":"create"}]'}}]
+        }
+        client = AsyncMock()
+        client.post.side_effect = [first, second]
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_cognitive_draft(
+                [{"id": 1, "content": "证据", "layer": 1, "importance": 8,
+                  "created_at": "2026-07-30T08:00:00+00:00"}],
+                [],
+            )
+
+        self.assertEqual(result[0]["action"], "create")
+        self.assertEqual(client.post.await_count, 2)
+        for call in client.post.await_args_list:
+            self.assertNotIn("max_tokens", call.kwargs["json"])
+        self.assertIn("只返回最终 JSON 数组", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

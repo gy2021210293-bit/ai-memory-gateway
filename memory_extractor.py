@@ -1319,18 +1319,54 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
   {{"subject":"user","cognitive_type":"user_core","content":"...","level":"inductive","confidence":0.5,"evidence_memory_ids":[20],"action":"create","review_after":"2026-08-27"}}
 ]
 """
+    # 与记忆提取/实体概况一致：不发送 max_tokens（推理模型的思考会吃光预算导致 content 为空或被截断），
+    # 解析失败时用 llm_json 扫描器 + 重试一次并强制只返回 JSON。
+    request_messages = [{"role": "user", "content": prompt}]
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
+            headers = {
+                "Authorization": f"Bearer {get_memory_api_key()}",
+                "Content-Type": "application/json",
+            }
             response = await client.post(
                 get_memory_api_base_url(),
-                headers={"Authorization": f"Bearer {get_memory_api_key()}", "Content-Type": "application/json"},
-                json={"model": MEMORY_MODEL, "temperature": 0, "max_tokens": 2400,
-                      "messages": [{"role": "user", "content": prompt}]},
+                headers=headers,
+                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
             )
-        if response.status_code != 200:
-            print(f"⚠️ 三元一场认知草稿生成失败: {response.status_code} {response.text[:200]}")
-            return None
-        return parse_json_array(_extract_response_content(response.json()))
+            if response.status_code != 200:
+                print(f"⚠️ 三元一场认知草稿生成失败: {response.status_code} {response.text[:200]}")
+                return None
+            text = _extract_response_content(response.json()).strip()
+            try:
+                return parse_json_array(text)
+            except ValueError as first_error:
+                print(f"⚠️ 三元一场认知草稿解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_messages = request_messages + [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": "上一次输出没有给出可解析的最终结果。请重新检查证据，只返回最终 JSON 数组，不要分析、解释或使用 Markdown。",
+                    },
+                ]
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers=headers,
+                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": retry_messages},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️ 三元一场认知草稿重试失败: {retry_response.status_code} {retry_response.text[:200]}")
+                    return None
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                if not retry_text:
+                    print("⚠️ 三元一场认知草稿重试返回空内容")
+                    return None
+                try:
+                    return parse_json_array(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️ 三元一场认知草稿重试结果仍无法解析: {retry_error}")
+                    print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
+                    return None
     except Exception as exc:
         print(f"⚠️ 三元一场认知草稿解析失败: {exc}")
         return None
