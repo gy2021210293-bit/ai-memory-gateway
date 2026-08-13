@@ -88,8 +88,19 @@ COGNITIVE_TYPE_SUBJECTS = {
     "relationship_core": "relationship",
     "current_field": "context",
 }
-COGNITIVE_ITEM_RECOMMENDED_CHARS = 240
+COGNITIVE_ITEM_RECOMMENDED_CHARS = 120
 COGNITIVE_FIELD_REVIEW_DAYS = 14
+# 原子认知卡分层：明确陈述 > 演绎推断 > 归纳推断（编译注入时按此优先级展示）
+COGNITIVE_LEVELS = ("explicit", "deductive", "inductive")
+COGNITIVE_LEVEL_LABELS = {
+    "explicit": "明确陈述",
+    "deductive": "演绎推断",
+    "inductive": "归纳推断",
+}
+COGNITIVE_LEVEL_RANK = {"explicit": 0, "deductive": 1, "inductive": 2}
+COGNITIVE_ACTIONS = ("create", "reinforce", "supersede")
+COGNITIVE_PER_TYPE_LIMIT = 3   # 编译注入时每格最多展示的 active 卡数
+COGNITIVE_DRAFT_TOTAL_LIMIT = 12  # 单次草稿最多返回的候选卡数
 
 
 # ============================================================
@@ -249,6 +260,70 @@ async def _migrate_cognitive_model_v2(conn) -> int:
             WHERE status = 'active';
         """)
     return migrated
+
+
+async def _migrate_cognitive_model_v3(conn) -> int:
+    """Allow multiple atomic cards per 三元一场 section.
+
+    Adds layering (level), reinforcement counting (times_derived) and the
+    supersede lifecycle pointers (supersedes / superseded_by), and drops the
+    one-active-per-type unique index so a section can accumulate several cards.
+    Idempotent: each statement is guarded for existing installs and fresh ones.
+    """
+    async with conn.transaction():
+        await conn.execute("""
+            ALTER TABLE cognitive_items
+            ADD COLUMN IF NOT EXISTS level TEXT NOT NULL DEFAULT 'explicit'
+                CHECK (level IN ('explicit', 'deductive', 'inductive'))
+        """)
+        await conn.execute("""
+            ALTER TABLE cognitive_items
+            ADD COLUMN IF NOT EXISTS times_derived INTEGER NOT NULL DEFAULT 1
+                CHECK (times_derived >= 1)
+        """)
+        await conn.execute("""
+            ALTER TABLE cognitive_items
+            ADD COLUMN IF NOT EXISTS supersedes INTEGER DEFAULT NULL
+                REFERENCES cognitive_items (id)
+        """)
+        await conn.execute("""
+            ALTER TABLE cognitive_items
+            ADD COLUMN IF NOT EXISTS superseded_by INTEGER DEFAULT NULL
+                REFERENCES cognitive_items (id)
+        """)
+        await conn.execute("DROP INDEX IF EXISTS idx_cognitive_items_one_active_type;")
+    return 0
+
+
+async def _migrate_cognitive_model_v4(conn) -> int:
+    """Add a human decision / correction audit log for cognitive cards.
+
+    Every human action on the 三元一场 panel (confirm, reinforce, supersede,
+    manual edit, delete, draft reject) is recorded with before/after content so
+    later draft generations can feed those decisions back as evidence.
+    """
+    async with conn.transaction():
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cognitive_revision_log (
+                id              SERIAL PRIMARY KEY,
+                card_id         INTEGER DEFAULT NULL,
+                subject         TEXT NOT NULL,
+                cognitive_type  TEXT NOT NULL,
+                action          TEXT NOT NULL
+                    CHECK (action IN ('create', 'reinforce', 'supersede',
+                                      'edit', 'delete', 'reject')),
+                content_before  TEXT DEFAULT NULL,
+                content_after   TEXT DEFAULT NULL,
+                level_before    TEXT DEFAULT NULL,
+                level_after     TEXT DEFAULT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cognitive_revision_log_type_time
+            ON cognitive_revision_log (cognitive_type, created_at)
+        """)
+    return 0
 
 
 # ============================================================
@@ -666,13 +741,19 @@ async def init_tables():
                 status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
                 created_by          TEXT NOT NULL DEFAULT 'manual',
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                level               TEXT NOT NULL DEFAULT 'explicit' CHECK (level IN ('explicit', 'deductive', 'inductive')),
+                times_derived       INTEGER NOT NULL DEFAULT 1 CHECK (times_derived >= 1),
+                supersedes          INTEGER DEFAULT NULL REFERENCES cognitive_items (id),
+                superseded_by       INTEGER DEFAULT NULL REFERENCES cognitive_items (id)
             );
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cognitive_items_subject_status ON cognitive_items (subject, status);")
         migrated_cognitive_items = await _migrate_cognitive_model_v2(conn)
         if migrated_cognitive_items:
             print(f"✅ 三元一场认知模型已迁移 {migrated_cognitive_items} 个区块")
+        await _migrate_cognitive_model_v3(conn)
+        await _migrate_cognitive_model_v4(conn)
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -5063,6 +5144,22 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.7))))
     except (TypeError, ValueError):
         raise ValueError("confidence 必须是 0 到 1 之间的数字")
+    level = str(data.get("level", "explicit")).strip().lower()
+    if level not in COGNITIVE_LEVELS:
+        raise ValueError("level 必须是 explicit、deductive 或 inductive")
+    action = str(data.get("action", "create")).strip().lower()
+    if action not in COGNITIVE_ACTIONS:
+        raise ValueError("action 必须是 create、reinforce 或 supersede")
+    target_id = data.get("target_id")
+    if target_id in (None, ""):
+        target_id = None
+    else:
+        try:
+            target_id = int(target_id)
+        except (TypeError, ValueError):
+            raise ValueError("target_id 必须是卡片 ID")
+    if action != "create" and target_id is None:
+        raise ValueError("reinforce / supersede 必须指定 target_id")
     evidence_ids = []
     for value in data.get("evidence_memory_ids", []) or []:
         try:
@@ -5092,6 +5189,9 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         "confidence": confidence,
         "evidence_memory_ids": evidence_ids[:50],
         "review_after": review_after,
+        "level": level,
+        "action": action,
+        "target_id": target_id,
     }
 
 
@@ -5116,40 +5216,56 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
         "relationship_core": "关系核心",
         "current_field": "当前认知场",
     }
-    items_by_type = {}
+    by_type = {}
     for item in items:
         cognitive_type = item.get("cognitive_type")
-        if (item.get("status", "active") == "active" and item.get("subject") in COGNITIVE_SUBJECTS
-                and cognitive_type in COGNITIVE_TYPES
-                and COGNITIVE_TYPE_SUBJECTS[cognitive_type] == item.get("subject")
-                and cognitive_type not in items_by_type):
-            items_by_type[cognitive_type] = item
+        if (item.get("status", "active") != "active"
+                or item.get("subject") not in COGNITIVE_SUBJECTS
+                or cognitive_type not in COGNITIVE_TYPES
+                or COGNITIVE_TYPE_SUBJECTS[cognitive_type] != item.get("subject")):
+            continue
+        by_type.setdefault(cognitive_type, []).append(item)
+
+    # 每格内按“分层优先级 → 强化次数 → 新近度”排序，取最多 COGNITIVE_PER_TYPE_LIMIT 张卡。
+    # 只限制卡片数量，不截断任何单卡内容。
+    def sort_key(item):
+        level = item.get("level", "explicit")
+        return (
+            COGNITIVE_LEVEL_RANK.get(level, COGNITIVE_LEVEL_RANK["explicit"]),
+            -int(item.get("times_derived") or 1),
+            -int(item.get("id") or 0),
+        )
 
     sections = []
     for cognitive_type in COGNITIVE_TYPE_ORDER:
-        if cognitive_type in items_by_type:
-            item = items_by_type[cognitive_type]
+        selected = sorted(by_type.get(cognitive_type, []), key=sort_key)[:COGNITIVE_PER_TYPE_LIMIT]
+        if not selected:
+            continue
+        lines = []
+        for item in selected:
             try:
                 confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
             except (TypeError, ValueError):
                 confidence = 0.7
-            metadata = [f"置信度 {confidence:.2f}"]
-            if cognitive_type == "current_field":
-                review_after = item.get("review_after")
-                if review_after:
-                    metadata.append(f"复核日 {review_after}")
-                if is_cognitive_item_stale(item, today=today):
-                    metadata.append("可能过时，只能作为背景")
-            sections.append(
-                f"【{type_labels[cognitive_type]}｜{'｜'.join(metadata)}】\n"
-                f"{str(item.get('content', '')).strip()}"
+            level_label = COGNITIVE_LEVEL_LABELS.get(item.get("level", "explicit"), "明确陈述")
+            times = int(item.get("times_derived") or 1)
+            evidence = item.get("evidence_memory_ids") or []
+            evidence_text = "（证据 " + "、".join(f"#{e}" for e in evidence) + "）" if evidence else ""
+            stale = ""
+            if cognitive_type == "current_field" and is_cognitive_item_stale(item, today=today):
+                stale = "（可能过时，只能作为背景）"
+            lines.append(
+                f"- [{level_label}·强化×{times}｜置信度{confidence:.2f}] "
+                f"{str(item.get('content', '')).strip()}{evidence_text}{stale}"
             )
+        sections.append(f"【{type_labels[cognitive_type]}】\n" + "\n".join(lines))
     if not sections:
         return ""
     return "【三元一场认知模型】\n" + "\n\n".join(sections) + (
         "\n\n使用规则：当前用户消息，以及其中更明确、更新的日期或状态，始终优先于以上认知；"
         "置信度较低的内容只能保守参考；标记为“可能过时”的当前认知场只能作为背景，"
-        "不得当作当前事实；自然体现相关认知，不要向用户展示内部字段。"
+        "不得当作当前事实；“明确陈述”优先于“演绎推断”，“归纳推断”仅为倾向；"
+        "自然体现相关认知，不要向用户展示内部字段。"
     )
 
 
@@ -5160,7 +5276,8 @@ async def list_cognitive_items(active_only: bool = False):
         rows = await conn.fetch(f"""
             SELECT id, subject, cognitive_type, content, confidence,
                    evidence_memory_ids, review_after, status, created_by,
-                   created_at, updated_at
+                   created_at, updated_at,
+                   level, times_derived, supersedes, superseded_by
             FROM cognitive_items {where}
             ORDER BY CASE cognitive_type
                          WHEN 'user_core' THEN 1
@@ -5187,38 +5304,143 @@ async def save_cognitive_item(data: dict, item_id: int = None):
                 rows = await conn.fetch("SELECT id FROM memories WHERE id = ANY($1::int[])", evidence_ids)
                 if {row["id"] for row in rows} != set(evidence_ids):
                     return {"error": "包含不存在的证据记忆 ID"}
-            if item_id is not None:
-                existing = await conn.fetchrow("""
-                    SELECT id, subject, cognitive_type, status
+
+            # 编辑既有卡 == 以新版本取代它；否则按 action 处理 create / reinforce / supersede。
+            action = "supersede" if item_id is not None else item["action"]
+            target_id = item_id if item_id is not None else item["target_id"]
+
+            target = None
+            if target_id is not None:
+                target = await conn.fetchrow("""
+                    SELECT id, subject, cognitive_type, content, level, times_derived,
+                           confidence, evidence_memory_ids, review_after, status
                     FROM cognitive_items
                     WHERE id = $1 AND status = 'active'
                     FOR UPDATE
-                """, item_id)
-                if not existing:
-                    return {"error": "认知项不存在"}
-                if (existing["subject"] != item["subject"]
-                        or existing["cognitive_type"] != item["cognitive_type"]):
-                    return {"error": "不能通过编辑改变认知区块"}
-            await conn.execute("""
-                UPDATE cognitive_items
-                SET status = 'superseded', updated_at = NOW()
-                WHERE cognitive_type = $1 AND status = 'active'
-            """, item["cognitive_type"])
-            row = await conn.fetchrow("""
-                INSERT INTO cognitive_items
-                    (subject, cognitive_type, content, confidence,
-                     evidence_memory_ids, review_after, created_by)
-                VALUES ($1, $2, $3, $4, $5, $6, 'manual')
-                RETURNING *
-            """, item["subject"], item["cognitive_type"], item["content"],
-                 item["confidence"], evidence_ids, item["review_after"])
+                """, target_id)
+                if not target:
+                    return {"error": "目标认知卡不存在或已失效"}
+                if (target["subject"] != item["subject"]
+                        or target["cognitive_type"] != item["cognitive_type"]):
+                    return {"error": "目标认知卡与新建认知不属于同一区块"}
+
+            if action == "reinforce":
+                # 强化 = 新证据再次支持同一条卡：仅累计次数并合并证据，不新增卡。
+                if str(item["content"]).strip() != str(target["content"]).strip():
+                    return {"error": "强化需保持内容一致，如需修改请用取代"}
+                merged = list(dict.fromkeys([*target["evidence_memory_ids"], *evidence_ids]))[:50]
+                await conn.execute("""
+                    UPDATE cognitive_items
+                    SET times_derived = times_derived + 1,
+                        evidence_memory_ids = $2,
+                        updated_at = NOW()
+                    WHERE id = $1
+                """, target["id"], merged)
+                row = await conn.fetchrow("""
+                    SELECT id, subject, cognitive_type, content, confidence,
+                           evidence_memory_ids, review_after, status, created_by,
+                           created_at, updated_at,
+                           level, times_derived, supersedes, superseded_by
+                    FROM cognitive_items
+                    WHERE id = $1
+                """, target["id"])
+                await _record_cognitive_revision(
+                    conn, card_id=target["id"], subject=target["subject"],
+                    cognitive_type=target["cognitive_type"], action="reinforce",
+                    content_before=target["content"], content_after=target["content"],
+                    level_before=target["level"], level_after=target["level"],
+                )
+            else:
+                # create 或 supersede：插入新卡；supersede 保留旧卡为历史并记录指针。
+                review_after = item["review_after"]
+                if (not review_after and item["cognitive_type"] == "current_field"
+                        and target and target["review_after"]):
+                    review_after = target["review_after"]
+                carry = int(target["times_derived"]) if target else 1
+                row = await conn.fetchrow("""
+                    INSERT INTO cognitive_items
+                        (subject, cognitive_type, content, confidence,
+                         evidence_memory_ids, review_after, created_by,
+                         level, times_derived, supersedes)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7, $8, $9)
+                    RETURNING *
+                """, item["subject"], item["cognitive_type"], item["content"],
+                     item["confidence"], evidence_ids, review_after,
+                     item["level"], carry, target["id"] if target else None)
+                if target:
+                    await conn.execute("""
+                        UPDATE cognitive_items
+                        SET status = 'superseded', superseded_by = $2, updated_at = NOW()
+                        WHERE id = $1
+                    """, target["id"], row["id"])
+                log_action = "edit" if item_id is not None else ("supersede" if target else "create")
+                await _record_cognitive_revision(
+                    conn, card_id=row["id"], subject=row["subject"],
+                    cognitive_type=row["cognitive_type"], action=log_action,
+                    content_before=target["content"] if target else None,
+                    content_after=row["content"],
+                    level_before=target["level"] if target else None,
+                    level_after=row["level"],
+                )
     saved_item = dict(row)
     saved_item["is_stale"] = is_cognitive_item_stale(saved_item)
     return {"status": "ok", "item": saved_item}
 
 
+async def _record_cognitive_revision(conn, *, card_id, subject, cognitive_type,
+                                     action, content_before=None, content_after=None,
+                                     level_before=None, level_after=None):
+    """Append one human decision to cognitive_revision_log inside a transaction."""
+    await conn.execute("""
+        INSERT INTO cognitive_revision_log
+            (card_id, subject, cognitive_type, action,
+             content_before, content_after, level_before, level_after)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    """, card_id, subject, cognitive_type, action,
+        content_before, content_after, level_before, level_after)
+
+
+async def get_recent_cognitive_revisions(limit: int = 30) -> list:
+    """Most recent human confirm / correct / reject decisions, newest first."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, card_id, subject, cognitive_type, action,
+                   content_before, content_after, level_before, level_after,
+                   created_at
+            FROM cognitive_revision_log
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+        """, max(0, min(int(limit), 100)))
+        return [dict(row) for row in rows]
+
+
+async def record_cognitive_rejection(subject: str, cognitive_type: str, content: str):
+    """Record that a human rejected a draft candidate so it is not re-proposed."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _record_cognitive_revision(
+                conn, card_id=None, subject=subject, cognitive_type=cognitive_type,
+                action="reject", content_before=content,
+            )
+    return {"status": "ok"}
+
+
 async def delete_cognitive_item(item_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM cognitive_items WHERE id = $1", item_id)
-    return {"status": "ok"} if result != "DELETE 0" else {"error": "认知项不存在"}
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id, subject, cognitive_type, content, level FROM cognitive_items WHERE id = $1",
+                item_id,
+            )
+            if not row:
+                return {"error": "认知项不存在"}
+            await conn.execute("DELETE FROM cognitive_items WHERE id = $1", item_id)
+            await _record_cognitive_revision(
+                conn, card_id=row["id"], subject=row["subject"],
+                cognitive_type=row["cognitive_type"], action="delete",
+                content_before=row["content"], level_before=row["level"],
+            )
+    return {"status": "ok"}

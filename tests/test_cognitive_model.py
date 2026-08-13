@@ -84,6 +84,44 @@ class CognitiveModelTests(unittest.TestCase):
         })
         self.assertEqual(len(item["content"]), 300)
 
+    def test_normalize_accepts_level_and_defaults_action_to_create(self):
+        item = database.normalize_cognitive_item_input({
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "偏好记录", "level": "inductive", "confidence": 0.5,
+        })
+        self.assertEqual(item["level"], "inductive")
+        self.assertEqual(item["action"], "create")
+        self.assertIsNone(item["target_id"])
+
+    def test_normalize_rejects_invalid_level_and_action(self):
+        with self.assertRaises(ValueError):
+            database.normalize_cognitive_item_input({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "x", "level": "invented",
+            })
+        with self.assertRaises(ValueError):
+            database.normalize_cognitive_item_input({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "x", "action": "bogus",
+            })
+
+    def test_normalize_requires_target_id_for_reinforce_or_supersede(self):
+        with self.assertRaises(ValueError):
+            database.normalize_cognitive_item_input({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "x", "action": "reinforce",
+            })
+        with self.assertRaises(ValueError):
+            database.normalize_cognitive_item_input({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "x", "action": "supersede", "target_id": "bad",
+            })
+        item = database.normalize_cognitive_item_input({
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "x", "action": "supersede", "target_id": 7,
+        })
+        self.assertEqual(item["target_id"], 7)
+
     def test_prompt_does_not_truncate_a_selected_item(self):
         content = "详细认知" * 80
         prompt = database.format_cognitive_items_for_prompt([{
@@ -95,19 +133,24 @@ class CognitiveModelTests(unittest.TestCase):
     def test_prompt_groups_three_cores_and_current_field(self):
         prompt = database.format_cognitive_items_for_prompt([
             {"subject": "user", "cognitive_type": "user_core",
-             "content": "偏好简短回答", "confidence": 0.8},
+             "content": "偏好简短回答", "confidence": 0.8,
+             "level": "explicit", "times_derived": 2},
             {"subject": "self", "cognitive_type": "self_core",
-             "content": "重视诚实", "confidence": 0.9},
+             "content": "重视诚实", "confidence": 0.9,
+             "level": "deductive", "times_derived": 1},
             {"subject": "relationship", "cognitive_type": "relationship_core",
-             "content": "共同检查证据"},
+             "content": "共同检查证据", "confidence": 0.95},
             {"subject": "context", "cognitive_type": "current_field",
-             "content": "正在准备旅行", "review_after": date(2026, 8, 13)},
+             "content": "正在准备旅行", "confidence": 0.8,
+             "review_after": date(2026, 8, 13)},
         ], today=date(2026, 7, 30))
         self.assertIn("三元一场认知模型", prompt)
-        self.assertIn("用户核心｜置信度 0.80", prompt)
-        self.assertIn("AI 自我核心", prompt)
-        self.assertIn("关系核心", prompt)
-        self.assertIn("当前认知场", prompt)
+        self.assertIn("【用户核心】", prompt)
+        self.assertIn("[明确陈述·强化×2｜置信度0.80] 偏好简短回答", prompt)
+        self.assertIn("[演绎推断·强化×1｜置信度0.90] 重视诚实", prompt)
+        self.assertIn("【AI 自我核心】", prompt)
+        self.assertIn("【关系核心】", prompt)
+        self.assertIn("【当前认知场】", prompt)
         self.assertIn("当前用户消息", prompt)
 
     def test_prompt_uses_fixed_order_without_total_budget(self):
@@ -126,15 +169,22 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertGreater(len(prompt), 1200)
 
-    def test_prompt_keeps_only_one_item_per_section(self):
+    def test_prompt_keeps_top_cards_per_section_and_drops_lowest_ranked(self):
         prompt = database.format_cognitive_items_for_prompt([
             {"subject": "context", "cognitive_type": "current_field",
-             "content": "较早状态", "status": "active"},
+             "content": "较早状态", "level": "explicit", "times_derived": 1, "id": 1},
             {"subject": "context", "cognitive_type": "current_field",
-             "content": "重复状态", "status": "active"},
+             "content": "重复状态", "level": "explicit", "times_derived": 1, "id": 2},
+            {"subject": "context", "cognitive_type": "current_field",
+             "content": "第四状态", "level": "explicit", "times_derived": 1, "id": 4},
+            {"subject": "context", "cognitive_type": "current_field",
+             "content": "推断状态", "level": "inductive", "times_derived": 9, "id": 3},
         ])
+        # 每格最多 COGNITIVE_PER_TYPE_LIMIT 张：明确陈述优先，归纳推断被挤出
         self.assertIn("较早状态", prompt)
-        self.assertNotIn("重复状态", prompt)
+        self.assertIn("重复状态", prompt)
+        self.assertIn("第四状态", prompt)
+        self.assertNotIn("推断状态", prompt)
 
     def test_stale_current_field_is_still_injected_with_warning(self):
         item = {
@@ -266,6 +316,24 @@ class CognitiveMigrationTests(unittest.IsolatedAsyncioTestCase):
             await database._migrate_cognitive_model_v2(conn)
         self.assertIs(conn.transaction_context.exc_type, RuntimeError)
 
+    async def test_v3_migration_adds_layering_columns_and_drops_unique_index(self):
+        conn = _FakeMigrationConnection([])
+        await database._migrate_cognitive_model_v3(conn)
+        combined = " ".join(query for query, _args in conn.executions)
+        self.assertIn("ADD COLUMN IF NOT EXISTS level", combined)
+        self.assertIn("ADD COLUMN IF NOT EXISTS times_derived", combined)
+        self.assertIn("ADD COLUMN IF NOT EXISTS supersedes", combined)
+        self.assertIn("ADD COLUMN IF NOT EXISTS superseded_by", combined)
+        self.assertIn("DROP INDEX IF EXISTS idx_cognitive_items_one_active_type", combined)
+
+    async def test_v4_migration_creates_revision_log(self):
+        conn = _FakeMigrationConnection([])
+        await database._migrate_cognitive_model_v4(conn)
+        combined = " ".join(query for query, _args in conn.executions)
+        self.assertIn("CREATE TABLE IF NOT EXISTS cognitive_revision_log", combined)
+        self.assertIn("'create', 'reinforce', 'supersede'", combined)
+        self.assertIn("idx_cognitive_revision_log_type_time", combined)
+
 
 class _FakeAcquire:
     def __init__(self, conn):
@@ -286,10 +354,21 @@ class _FakePool:
         return _FakeAcquire(self.conn)
 
 
+TARGET_CARD = {
+    "id": 5, "subject": "user", "cognitive_type": "user_core",
+    "content": "用户核心", "level": "explicit", "times_derived": 3,
+    "confidence": 0.8, "evidence_memory_ids": [1],
+    "review_after": None, "status": "active",
+}
+
+
 class _FakeSaveConnection:
-    def __init__(self):
+    """Minimal stand-in for the save_cognitive_item query flow."""
+
+    def __init__(self, target=None):
         self.transaction_context = _FakeTransaction()
         self.executions = []
+        self.target = target
 
     def transaction(self):
         return self.transaction_context
@@ -299,17 +378,27 @@ class _FakeSaveConnection:
 
     async def fetchrow(self, query, *args):
         normalized = " ".join(query.split())
-        if normalized.startswith("SELECT id, subject"):
-            return {
-                "id": args[0], "subject": "user",
-                "cognitive_type": "user_core", "status": "active",
-            }
+        if "FOR UPDATE" in normalized:
+            return dict(self.target) if self.target else None
         if normalized.startswith("INSERT INTO cognitive_items"):
             return {
                 "id": 99, "subject": args[0], "cognitive_type": args[1],
                 "content": args[2], "confidence": args[3],
                 "evidence_memory_ids": args[4], "review_after": args[5],
                 "status": "active", "created_by": "manual",
+                "level": args[6], "times_derived": args[7], "supersedes": args[8],
+                "superseded_by": None,
+            }
+        if normalized.startswith("SELECT id, subject, cognitive_type, content, confidence"):
+            base = self.target or TARGET_CARD
+            merged = list(dict.fromkeys([*base["evidence_memory_ids"], *[2, 3]]))
+            return {
+                "id": base["id"], "subject": base["subject"],
+                "cognitive_type": base["cognitive_type"], "content": base["content"],
+                "confidence": base["confidence"], "evidence_memory_ids": merged,
+                "review_after": None, "status": "active", "created_by": "manual",
+                "level": "explicit", "times_derived": base["times_derived"] + 1,
+                "supersedes": None, "superseded_by": None,
             }
         raise AssertionError(normalized)
 
@@ -319,22 +408,172 @@ class _FakeSaveConnection:
 
 
 class CognitiveSaveTests(unittest.IsolatedAsyncioTestCase):
-    async def test_update_supersedes_active_row_and_inserts_new_revision(self):
+    def supersede_executions(self, conn):
+        return [
+            args for query, args in conn.executions
+            if "SET status = 'superseded'" in query
+        ]
+
+    def revision_inserts(self, conn):
+        return [
+            args for query, args in conn.executions
+            if query.startswith("INSERT INTO cognitive_revision_log")
+        ]
+
+    async def test_create_inserts_new_card_without_superseding_others(self):
         conn = _FakeSaveConnection()
         with patch.object(database, "get_pool", return_value=_FakePool(conn)):
             result = await database.save_cognitive_item({
-                "subject": "user",
-                "cognitive_type": "user_core",
-                "content": "新的用户核心",
-                "confidence": 0.8,
-                "evidence_memory_ids": [2, 3],
-            }, item_id=12)
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "新的用户核心", "level": "explicit",
+                "confidence": 0.8, "evidence_memory_ids": [2, 3],
+            })
         self.assertEqual(result["item"]["id"], 99)
-        self.assertTrue(any(
-            "SET status = 'superseded'" in query and args == ("user_core",)
-            for query, args in conn.executions
+        self.assertIsNone(result["item"]["supersedes"])
+        # 新建不再整格替换同类型的旧卡
+        self.assertEqual(self.supersede_executions(conn), [])
+        # 新建被记录为一次人工确认
+        self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["create"])
+        self.assertEqual(self.revision_inserts(conn)[0][5], "新的用户核心")
+
+    async def test_reinforce_increments_times_derived_and_merges_evidence(self):
+        conn = _FakeSaveConnection(target=TARGET_CARD)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "用户核心", "level": "explicit",
+                "confidence": 0.8, "evidence_memory_ids": [2, 3],
+                "action": "reinforce", "target_id": 5,
+            })
+        self.assertEqual(result["item"]["times_derived"], 4)
+        self.assertEqual(result["item"]["evidence_memory_ids"], [1, 2, 3])
+        self.assertFalse(any(
+            query.startswith("INSERT INTO cognitive_items")
+            for query, _args in conn.executions
         ))
-        self.assertIsNone(result["item"]["review_after"])
+        self.assertEqual(self.supersede_executions(conn), [])
+        # 强化被记录，action=reinforce
+        self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["reinforce"])
+
+    async def test_reinforce_rejects_content_mismatch(self):
+        conn = _FakeSaveConnection(target=TARGET_CARD)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "内容被改写", "confidence": 0.8,
+                "evidence_memory_ids": [2, 3],
+                "action": "reinforce", "target_id": 5,
+            })
+        self.assertEqual(result["error"], "强化需保持内容一致，如需修改请用取代")
+
+    async def test_supersede_marks_target_and_links_history(self):
+        conn = _FakeSaveConnection(target=TARGET_CARD)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "新的用户核心", "level": "deductive",
+                "confidence": 0.7, "evidence_memory_ids": [2, 3],
+                "action": "supersede", "target_id": 5,
+            })
+        self.assertEqual(result["item"]["id"], 99)
+        self.assertEqual(result["item"]["supersedes"], 5)
+        # 新卡沿用旧卡的强化次数
+        self.assertEqual(result["item"]["times_derived"], 3)
+        self.assertEqual(self.supersede_executions(conn), [(5, 99)])
+        # 取代被记录，保留旧→新内容
+        rev = self.revision_inserts(conn)[0]
+        self.assertEqual(rev[3], "supersede")
+        self.assertEqual(rev[4], "用户核心")     # content_before
+        self.assertEqual(rev[5], "新的用户核心")  # content_after
+        self.assertEqual(rev[6], "explicit")     # level_before
+        self.assertEqual(rev[7], "deductive")    # level_after
+
+    async def test_edit_supersedes_only_the_target_card(self):
+        conn = _FakeSaveConnection(target=TARGET_CARD)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "编辑后的用户核心", "confidence": 0.8,
+                "evidence_memory_ids": [2, 3],
+            }, item_id=5)
+        self.assertEqual(result["item"]["id"], 99)
+        self.assertEqual(result["item"]["supersedes"], 5)
+        # 只取代被编辑的这一张，不碰同区块的其他卡
+        self.assertEqual(self.supersede_executions(conn), [(5, 99)])
+        # 手动编辑被记录为 action=edit
+        self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["edit"])
+
+
+class _FakeDeleteConnection:
+    def __init__(self, row=None):
+        self.transaction_context = _FakeTransaction()
+        self.executions = []
+        self.row = row or {
+            "id": 5, "subject": "user", "cognitive_type": "user_core",
+            "content": "要删除的认知", "level": "explicit",
+        }
+
+    def transaction(self):
+        return self.transaction_context
+
+    async def fetchrow(self, _query, _item_id):
+        return self.row
+
+    async def execute(self, query, *args):
+        self.executions.append((" ".join(query.split()), args))
+        return "DELETE 1"
+
+
+class _FakeRevisionsConnection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def fetch(self, _query, _limit):
+        return self.rows
+
+
+class CognitiveRevisionLogTests(unittest.IsolatedAsyncioTestCase):
+    def revision_inserts(self, conn):
+        return [
+            args for query, args in conn.executions
+            if query.startswith("INSERT INTO cognitive_revision_log")
+        ]
+
+    async def test_delete_records_human_delete_decision(self):
+        conn = _FakeDeleteConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.delete_cognitive_item(5)
+        self.assertEqual(result["status"], "ok")
+        rev = self.revision_inserts(conn)[0]
+        self.assertEqual(rev[0], 5)                 # card_id
+        self.assertEqual(rev[3], "delete")
+        self.assertEqual(rev[4], "要删除的认知")     # content_before
+        self.assertEqual(rev[6], "explicit")        # level_before
+
+    async def test_rejection_is_recorded_for_feedback(self):
+        conn = _FakeDeleteConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.record_cognitive_rejection("user", "user_core", "被拒绝的候选")
+        self.assertEqual(result["status"], "ok")
+        rev = self.revision_inserts(conn)[0]
+        self.assertIsNone(rev[0])                    # 无 card_id
+        self.assertEqual(rev[3], "reject")
+        self.assertEqual(rev[4], "被拒绝的候选")
+
+    async def test_recent_revisions_fetch_newest_first(self):
+        conn = _FakeRevisionsConnection([
+            {
+                "id": 2, "card_id": None, "subject": "user",
+                "cognitive_type": "user_core", "action": "reject",
+                "content_before": "被拒", "content_after": None,
+                "level_before": None, "level_after": None,
+                "created_at": "2026-08-13T00:00:00+00:00",
+            },
+        ])
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            items = await database.get_recent_cognitive_revisions(10)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "reject")
 
 
 class _FakeEvidenceConnection:

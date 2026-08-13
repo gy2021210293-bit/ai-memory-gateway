@@ -14,6 +14,7 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+import re
 import traceback
 import hashlib
 from llm_json import parse_json_array, valid_merged_ids
@@ -32,7 +33,7 @@ from database import init_tables, close_pool, search_memories, save_memory, get_
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
-from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK
@@ -2829,18 +2830,22 @@ async def api_get_cognitive_items():
 
 @app.post("/api/cognitive-items/draft")
 async def api_generate_cognitive_draft():
-    """Review all four cognition sections without persisting any candidate."""
+    """Review cognitive sections without persisting any candidate."""
     allowed_rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES
     memories = await get_memories_for_cognitive_draft(80)
     if not memories:
         return JSONResponse(status_code=400, content={"error": "没有可用于生成认知草稿的活跃记忆"})
-    raw_draft = await generate_cognitive_draft(
-        memories, await list_cognitive_items(active_only=True)
-    )
+    current_items = await list_cognitive_items(active_only=True)
+    revisions = await get_recent_cognitive_revisions(30)
+    raw_draft = await generate_cognitive_draft(memories, current_items, revisions)
     if raw_draft is None:
         return JSONResponse(status_code=502, content={"error": "认知草稿模型调用失败，现有认知未改变"})
     allowed_memory_ids = {int(memory["id"]) for memory in memories}
-    draft, seen_types = [], set()
+    active_by_id = {
+        int(item["id"]): item for item in current_items
+        if item.get("id") is not None
+    }
+    draft, seen_counts = [], {}
     for raw_item in raw_draft:
         if not isinstance(raw_item, dict):
             continue
@@ -2852,13 +2857,56 @@ async def api_generate_cognitive_draft():
             item = normalize_cognitive_item_input(raw_item)
         except ValueError:
             continue
-        item["evidence_memory_ids"] = [item_id for item_id in item["evidence_memory_ids"] if item_id in allowed_memory_ids]
-        if not item["evidence_memory_ids"] or cognitive_type in seen_types:
+        item["evidence_memory_ids"] = [
+            item_id for item_id in item["evidence_memory_ids"]
+            if item_id in allowed_memory_ids
+        ]
+        if not item["evidence_memory_ids"]:
             continue
+        # reinforce / supersede 必须指向同一区块的现有 active 卡；无效引用降级为 create，
+        # 避免丢失模型已提取的认知内容。
+        if item["action"] != "create":
+            target = active_by_id.get(item["target_id"])
+            if (not target
+                    or target["cognitive_type"] != cognitive_type
+                    or target.get("subject") != item["subject"]):
+                item["action"] = "create"
+                item["target_id"] = None
+        if seen_counts.get(cognitive_type, 0) >= COGNITIVE_PER_TYPE_LIMIT:
+            continue
+        seen_counts[cognitive_type] = seen_counts.get(cognitive_type, 0) + 1
         draft.append(item)
-        seen_types.add(cognitive_type)
+        if len(draft) >= COGNITIVE_DRAFT_TOTAL_LIMIT:
+            break
     return {"status": "draft", "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
             "evidence_count": len(memories)}
+
+
+@app.get("/api/cognitive-items/revisions")
+async def api_get_cognitive_revisions(limit: int = 12):
+    """Recent human decisions on 三元一场 cards, for the dashboard audit strip."""
+    return {"items": await get_recent_cognitive_revisions(max(0, min(limit, 50)))}
+
+
+@app.post("/api/cognitive-items/draft/reject")
+async def api_reject_cognitive_draft(request: Request):
+    """Record a human rejection of a draft candidate so it is not re-proposed."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "无效请求"})
+    subject = str(body.get("subject", "")).strip().lower()
+    cognitive_type = str(body.get("cognitive_type", "")).strip().lower()
+    content = re.sub(r"\s+", " ", str(body.get("content", "")).strip())
+    if (cognitive_type not in _db_module.COGNITIVE_TYPES
+            or _db_module.COGNITIVE_TYPE_SUBJECTS.get(cognitive_type) != subject):
+        return JSONResponse(status_code=400, content={"error": "无效的认知区块"})
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "拒绝记录需要候选内容"})
+    result = await record_cognitive_rejection(subject, cognitive_type, content)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
 
 
 @app.post("/api/cognitive-items")

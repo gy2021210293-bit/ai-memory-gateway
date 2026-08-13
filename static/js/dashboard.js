@@ -1284,6 +1284,15 @@ async function backfillEntityCards() {
 let cognitiveItems = [];
 let editingCognitiveId = null;
 let pendingCognitiveDrafts = [];
+let editingAction = 'create';
+let editingTargetId = null;
+let editingDraftIndex = null;
+
+const COGNITIVE_LEVEL_LABELS = {
+    explicit: '明确陈述',
+    deductive: '演绎推断',
+    inductive: '归纳推断',
+};
 
 const COGNITION_SECTIONS = [
     {
@@ -1319,6 +1328,7 @@ async function loadCognitiveItems() {
         if (!response.ok || data.error) throw new Error(data.error || '加载失败');
         cognitiveItems = data.items || [];
         renderCognitiveItems();
+        renderCognitiveRevisions();
         status.textContent = `${cognitiveItems.length} 条认知`;
     } catch (error) {
         status.textContent = error.message;
@@ -1329,58 +1339,82 @@ function renderCognitiveItems() {
     const root = document.getElementById('cognition-groups');
     root.replaceChildren();
     COGNITION_SECTIONS.forEach(section => {
-        const item = cognitiveItems.find(candidate => candidate.cognitive_type === section.cognitive_type);
+        const sectionItems = cognitiveItems.filter(candidate => candidate.cognitive_type === section.cognitive_type);
         const card = document.createElement('div');
         card.className = 'card cognition-card';
         const heading = document.createElement('h3');
-        heading.textContent = section.label;
+        heading.textContent = sectionItems.length
+            ? `${section.label}（${sectionItems.length} 张认知卡）`
+            : section.label;
         const description = document.createElement('p');
         description.className = 'section-desc';
         description.textContent = section.description;
         card.append(heading, description);
-        if (!item) {
+        if (!sectionItems.length) {
             const empty = document.createElement('p');
             empty.className = 'section-desc';
             empty.textContent = '尚未建立认知。';
             card.appendChild(empty);
         } else {
-            const content = document.createElement('div');
-            content.className = 'cognition-content';
-            content.textContent = item.content;
-            const meta = document.createElement('div');
-            meta.className = 'section-desc';
-            const evidenceText = item.evidence_memory_ids?.length
-                ? `证据记忆：${item.evidence_memory_ids.map(id => `#${id}`).join('、')}`
-                : '暂无关联证据';
-            const reviewText = item.cognitive_type === 'current_field' && item.review_after
-                ? ` · 下次复核：${item.review_after}` : '';
-            meta.textContent = `置信度 ${Number(item.confidence).toFixed(2)} · ${evidenceText}${reviewText}`;
-            card.append(content, meta);
-            if (item.is_stale) {
-                const stale = document.createElement('div');
-                stale.className = 'cognition-stale';
-                stale.textContent = '此认知场已到复核日期，聊天中仍会作为“可能过时”的背景使用。';
-                card.appendChild(stale);
-            }
+            sectionItems.forEach(item => card.appendChild(cognitiveCardRow(item)));
         }
         const actions = document.createElement('div');
         actions.className = 'toolbar';
         actions.style.marginTop = '12px';
-        const edit = document.createElement('button');
-        edit.className = 'btn btn-sm';
-        edit.textContent = item ? '编辑' : '建立';
-        edit.onclick = () => startCognitiveEdit(section, item || null);
-        actions.appendChild(edit);
-        if (item) {
-            const remove = document.createElement('button');
-            remove.className = 'btn btn-sm btn-danger';
-            remove.textContent = '删除';
-            remove.onclick = () => removeCognitiveItem(item.id);
-            actions.appendChild(remove);
-        }
+        const add = document.createElement('button');
+        add.className = 'btn btn-sm';
+        add.textContent = sectionItems.length ? '新建认知' : '建立认知';
+        add.onclick = () => startCognitiveEdit(section, null);
+        actions.appendChild(add);
         card.appendChild(actions);
         root.appendChild(card);
     });
+}
+
+function cognitiveCardRow(item) {
+    const row = document.createElement('div');
+    row.className = 'cognition-item';
+    const level = document.createElement('span');
+    level.className = `cognition-level level-${item.level || 'explicit'}`;
+    level.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
+    const content = document.createElement('div');
+    content.className = 'cognition-content';
+    content.textContent = item.content;
+    const meta = document.createElement('div');
+    meta.className = 'section-desc';
+    const evidenceText = item.evidence_memory_ids?.length
+        ? `证据：${item.evidence_memory_ids.map(id => `#${id}`).join('、')}`
+        : '暂无关联证据';
+    const parts = [
+        `置信度 ${Number(item.confidence).toFixed(2)}`,
+        `强化×${item.times_derived || 1}`,
+        evidenceText,
+    ];
+    if (item.cognitive_type === 'current_field' && item.review_after) {
+        parts.push(`下次复核：${item.review_after}`);
+    }
+    meta.textContent = parts.join(' · ');
+    row.append(level, content, meta);
+    if (item.is_stale) {
+        const stale = document.createElement('div');
+        stale.className = 'cognition-stale';
+        stale.textContent = '此认知场已到复核日期，聊天中仍会作为“可能过时”的背景使用。';
+        row.appendChild(stale);
+    }
+    const rowActions = document.createElement('div');
+    rowActions.className = 'toolbar';
+    rowActions.style.marginTop = '8px';
+    const edit = document.createElement('button');
+    edit.className = 'btn btn-sm';
+    edit.textContent = '编辑';
+    edit.onclick = () => startCognitiveEdit(cognitionSection(item.cognitive_type), item);
+    const remove = document.createElement('button');
+    remove.className = 'btn btn-sm btn-danger';
+    remove.textContent = '删除';
+    remove.onclick = () => removeCognitiveItem(item.id);
+    rowActions.append(edit, remove);
+    row.appendChild(rowActions);
+    return row;
 }
 
 async function generateCognitiveDraft() {
@@ -1423,63 +1457,187 @@ function renderCognitiveDrafts(meta = {}) {
     pendingCognitiveDrafts.forEach((item, index) => {
         const section = cognitionSection(item.cognitive_type);
         if (!section) return;
-        const current = cognitiveItems.find(candidate => candidate.cognitive_type === item.cognitive_type);
+        const target = item.target_id != null
+            ? cognitiveItems.find(candidate => candidate.id === item.target_id)
+            : null;
         const row = document.createElement('div');
         row.className = 'memory-item';
         row.style.marginTop = '10px';
-        const title = document.createElement('strong');
-        title.textContent = section.label;
-        const diff = document.createElement('div');
-        diff.className = 'cognition-diff-grid';
-        diff.style.marginTop = '10px';
-        const oldPane = document.createElement('div');
-        oldPane.className = 'cognition-diff-pane';
-        const oldLabel = document.createElement('strong');
-        oldLabel.textContent = '当前版本';
-        const oldContent = document.createElement('div');
-        oldContent.className = 'cognition-content';
-        oldContent.textContent = current?.content || '尚未建立';
-        oldPane.append(oldLabel, oldContent);
-        const newPane = document.createElement('div');
-        newPane.className = 'cognition-diff-pane';
-        const newLabel = document.createElement('strong');
-        newLabel.textContent = '建议版本';
-        const newContent = document.createElement('div');
-        newContent.className = 'cognition-content';
-        newContent.textContent = item.content;
-        newPane.append(newLabel, newContent);
-        diff.append(oldPane, newPane);
+        const title = document.createElement('div');
+        title.className = 'cognition-draft-title';
+        const label = document.createElement('strong');
+        label.textContent = section.label;
+        const badge = document.createElement('span');
+        badge.className = `cognition-level level-${item.level || 'explicit'}`;
+        badge.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
+        const actionTag = document.createElement('span');
+        actionTag.className = 'cognition-action';
+        if (item.action === 'reinforce') {
+            actionTag.textContent = target ? `强化 #${target.id}` : '强化';
+        } else if (item.action === 'supersede') {
+            actionTag.textContent = target ? `取代 #${target.id}` : '取代';
+        } else {
+            actionTag.textContent = '新建';
+        }
+        title.append(label, badge, actionTag);
+        row.appendChild(title);
+
+        if (item.action === 'supersede' && target) {
+            const diff = document.createElement('div');
+            diff.className = 'cognition-diff-grid';
+            diff.style.marginTop = '10px';
+            const oldPane = document.createElement('div');
+            oldPane.className = 'cognition-diff-pane';
+            const oldLabel = document.createElement('strong');
+            oldLabel.textContent = `当前版本 #${target.id}`;
+            const oldContent = document.createElement('div');
+            oldContent.className = 'cognition-content';
+            oldContent.textContent = target.content;
+            oldPane.append(oldLabel, oldContent);
+            const newPane = document.createElement('div');
+            newPane.className = 'cognition-diff-pane';
+            const newLabel = document.createElement('strong');
+            newLabel.textContent = '建议版本';
+            const newContent = document.createElement('div');
+            newContent.className = 'cognition-content';
+            newContent.textContent = item.content;
+            newPane.append(newLabel, newContent);
+            diff.append(oldPane, newPane);
+            row.appendChild(diff);
+        } else {
+            const content = document.createElement('div');
+            content.className = 'cognition-content';
+            content.textContent = item.content;
+            row.appendChild(content);
+        }
+
         const evidence = document.createElement('div');
         evidence.className = 'section-desc';
         const reviewText = item.review_after ? ` · 下次复核：${item.review_after}` : '';
         evidence.textContent = `置信度 ${Number(item.confidence).toFixed(2)} · 证据记忆：${item.evidence_memory_ids.map(id => `#${id}`).join('、')}${reviewText}`;
-        const action = document.createElement('button');
-        action.className = 'btn btn-primary btn-sm';
-        action.style.marginTop = '8px';
-        action.textContent = '编辑并保存';
-        action.onclick = () => useCognitiveDraft(index);
-        row.append(title, diff, evidence, action);
+        row.appendChild(evidence);
+
+        const actions = document.createElement('div');
+        actions.className = 'toolbar';
+        actions.style.marginTop = '8px';
+        const confirm = document.createElement('button');
+        confirm.className = 'btn btn-primary btn-sm';
+        if (item.action === 'reinforce') {
+            confirm.textContent = target ? `确认强化 #${target.id}` : '确认';
+            confirm.onclick = () => confirmCognitiveReinforce(index);
+        } else {
+            confirm.textContent = item.action === 'supersede' ? '编辑并保存（取代）' : '编辑并保存';
+            confirm.onclick = () => useCognitiveDraft(index);
+        }
+        const reject = document.createElement('button');
+        reject.className = 'btn btn-sm';
+        reject.textContent = '拒绝';
+        reject.title = '记录这次拒绝，后续审视不会重新提出类似认知';
+        reject.onclick = () => rejectCognitiveDraft(index);
+        actions.append(confirm, reject);
+        row.appendChild(actions);
         root.appendChild(row);
     });
+}
+
+async function rejectCognitiveDraft(index) {
+    const item = pendingCognitiveDrafts[index];
+    if (!item) return;
+    const status = document.getElementById('cognition-status');
+    const response = await fetch('/api/cognitive-items/draft/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            subject: item.subject,
+            cognitive_type: item.cognitive_type,
+            content: item.content,
+        }),
+    });
+    const result = await response.json();
+    if (!response.ok || result.error) {
+        status.textContent = result.error || '拒绝记录失败';
+        return;
+    }
+    pendingCognitiveDrafts = pendingCognitiveDrafts.filter((_, i) => i !== index);
+    renderCognitiveDrafts();
+    await renderCognitiveRevisions();
+    status.textContent = '已记录拒绝，后续审视将避免重新提出类似认知。';
+}
+
+async function confirmCognitiveReinforce(index) {
+    const item = pendingCognitiveDrafts[index];
+    if (!item) return;
+    const target = item.target_id != null
+        ? cognitiveItems.find(candidate => candidate.id === item.target_id)
+        : null;
+    if (!target) {
+        useCognitiveDraft(index);
+        return;
+    }
+    const status = document.getElementById('cognition-status');
+    const data = {
+        subject: target.subject,
+        cognitive_type: target.cognitive_type,
+        content: target.content,
+        level: target.level || 'explicit',
+        confidence: target.confidence,
+        evidence_memory_ids: target.evidence_memory_ids || [],
+        review_after: target.review_after || null,
+        action: 'reinforce',
+        target_id: target.id,
+    };
+    const response = await fetch('/api/cognitive-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    });
+    const result = await response.json();
+    if (!response.ok || result.error) {
+        status.textContent = result.error || '强化失败';
+        return;
+    }
+    pendingCognitiveDrafts = pendingCognitiveDrafts.filter((_, i) => i !== index);
+    renderCognitiveDrafts();
+    await loadCognitiveItems();
+    status.textContent = `认知 #${target.id} 已强化，累计次数 +1。`;
 }
 
 function useCognitiveDraft(index) {
     const item = pendingCognitiveDrafts[index];
     if (!item) return;
     const section = cognitionSection(item.cognitive_type);
-    const current = cognitiveItems.find(candidate => candidate.cognitive_type === item.cognitive_type);
-    startCognitiveEdit(section, { ...item, id: current?.id || null }, '确认保存草稿');
+    editingDraftIndex = index;
+    if (item.action === 'supersede') {
+        startCognitiveEdit(section, { ...item, id: null }, '确认取代保存', { action: 'supersede', target_id: item.target_id });
+    } else {
+        startCognitiveEdit(section, { ...item, id: null }, '确认保存草稿', { action: 'create' });
+    }
 }
 
-function startCognitiveEdit(section, item = null, saveLabel = '保存认知') {
+function startCognitiveEdit(section, item = null, saveLabel = '保存认知', actionContext = null) {
     if (!section) return;
     editingCognitiveId = item?.id || null;
+    editingAction = actionContext?.action || 'create';
+    editingTargetId = actionContext?.target_id ?? null;
     document.getElementById('cognition-subject').value = section.subject;
     document.getElementById('cognition-type').value = section.cognitive_type;
     document.getElementById('cognition-editor-title').textContent = `编辑${section.label}`;
     document.getElementById('cognition-content').value = item?.content || '';
     document.getElementById('cognition-confidence').value = item?.confidence ?? '0.7';
     document.getElementById('cognition-evidence').value = (item?.evidence_memory_ids || []).join(', ');
+    document.getElementById('cognition-level').value = item?.level || 'explicit';
+    const actionHint = document.getElementById('cognition-action-hint');
+    if (actionHint) {
+        if (editingCognitiveId) {
+            actionHint.textContent = '正在编辑既有认知卡：保存后将以新版本取代旧卡（旧卡留档可追溯）。';
+        } else if (editingAction === 'supersede' && editingTargetId) {
+            actionHint.textContent = `将保存为新认知卡，并取代 #${editingTargetId}（旧卡留档可追溯）。`;
+        } else if (editingAction === 'reinforce' && editingTargetId) {
+            actionHint.textContent = `将强化 #${editingTargetId}：累计次数 +1，仅合并证据，不新增卡。`;
+        } else {
+            actionHint.textContent = '将新建一张认知卡。';
+        }
+    }
     const reviewWrap = document.getElementById('cognition-review-wrap');
     reviewWrap.style.display = section.cognitive_type === 'current_field' ? '' : 'none';
     document.getElementById('cognition-review-after').value = item?.review_after || '';
@@ -1493,11 +1651,11 @@ function startCognitiveEdit(section, item = null, saveLabel = '保存认知') {
 function updateCognitiveCharHint() {
     const content = document.getElementById('cognition-content').value;
     const hint = document.getElementById('cognition-char-hint');
-    if (hint) hint.textContent = `${content.length} 字；建议控制在 240 字左右，超过仍可保存。`;
+    if (hint) hint.textContent = `${content.length} 字；建议每条认知卡 30-120 字，长文仍可保存。`;
 }
 
 function cognitiveFormData() {
-    return {
+    const data = {
         subject: document.getElementById('cognition-subject').value,
         cognitive_type: document.getElementById('cognition-type').value,
         content: document.getElementById('cognition-content').value.trim(),
@@ -1507,7 +1665,15 @@ function cognitiveFormData() {
         review_after: document.getElementById('cognition-type').value === 'current_field'
             ? document.getElementById('cognition-review-after').value || null
             : null,
+        level: document.getElementById('cognition-level').value || 'explicit',
     };
+    if (editingAction !== 'create' && editingTargetId != null) {
+        data.action = editingAction;
+        data.target_id = editingTargetId;
+    } else {
+        data.action = 'create';
+    }
+    return data;
 }
 
 async function saveCognitiveItem() {
@@ -1528,9 +1694,10 @@ async function saveCognitiveItem() {
         status.textContent = result.error || '保存失败';
         return;
     }
-    pendingCognitiveDrafts = pendingCognitiveDrafts.filter(
-        item => item.cognitive_type !== data.cognitive_type
-    );
+    if (editingDraftIndex != null) {
+        pendingCognitiveDrafts = pendingCognitiveDrafts.filter((_, i) => i !== editingDraftIndex);
+        editingDraftIndex = null;
+    }
     renderCognitiveDrafts();
     cancelCognitiveEdit();
     await loadCognitiveItems();
@@ -1539,6 +1706,9 @@ async function saveCognitiveItem() {
 
 function cancelCognitiveEdit() {
     editingCognitiveId = null;
+    editingAction = 'create';
+    editingTargetId = null;
+    editingDraftIndex = null;
     document.getElementById('cognition-subject').value = '';
     document.getElementById('cognition-type').value = '';
     document.getElementById('cognition-content').value = '';
@@ -1548,6 +1718,8 @@ function cancelCognitiveEdit() {
     document.getElementById('cognition-review-wrap').style.display = 'none';
     document.getElementById('cognition-save').textContent = '保存认知';
     document.getElementById('cognition-editor').style.display = 'none';
+    const actionHint = document.getElementById('cognition-action-hint');
+    if (actionHint) actionHint.textContent = '';
     updateCognitiveCharHint();
 }
 
@@ -1563,6 +1735,48 @@ async function removeCognitiveItem(itemId) {
     if (editingCognitiveId === itemId) cancelCognitiveEdit();
     await loadCognitiveItems();
     status.textContent = '认知已删除。';
+}
+
+async function renderCognitiveRevisions() {
+    const root = document.getElementById('cognition-revision-log');
+    if (!root) return;
+    root.replaceChildren();
+    try {
+        const response = await fetch('/api/cognitive-items/revisions?limit=12');
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '加载失败');
+        const revisions = data.items || [];
+        if (!revisions.length) {
+            root.style.display = 'none';
+            return;
+        }
+        root.style.display = '';
+        const heading = document.createElement('h3');
+        heading.textContent = '最近人工确认 / 修正记录（会作为证据回喂下次审视）';
+        root.appendChild(heading);
+        const list = document.createElement('ul');
+        list.className = 'cognition-revision-list';
+        const actionLabels = {
+            create: '确认·新建', reinforce: '确认·强化', supersede: '确认·取代',
+            edit: '修正', delete: '删除', reject: '拒绝',
+        };
+        revisions.forEach(rev => {
+            const row = document.createElement('li');
+            const label = actionLabels[rev.action] || rev.action;
+            const before = rev.content_before || '';
+            const after = rev.content_after || '';
+            let detail = after || before;
+            if (rev.action === 'edit' && before && after) detail = `${before} → ${after}`;
+            const time = rev.created_at ? new Date(rev.created_at) : null;
+            const timeText = time && !Number.isNaN(time.getTime()) ? time.toLocaleDateString() : '';
+            const section = cognitionSection(rev.cognitive_type)?.label || rev.cognitive_type;
+            row.textContent = `${timeText} · ${section} · ${label}：${detail}`;
+            list.appendChild(row);
+        });
+        root.appendChild(list);
+    } catch (_error) {
+        root.style.display = 'none';
+    }
 }
 
 // ============================================

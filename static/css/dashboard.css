@@ -2817,6 +2817,72 @@ details.entity-group[open] > summary {
     font-size: 13px;
 }
 
+.cognition-item {
+    margin-top: 12px;
+    padding: 12px;
+    border: 1px solid rgba(150, 132, 164, 0.16);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.24);
+}
+
+.cognition-item .cognition-content {
+    margin: 8px 0;
+}
+
+.cognition-level,
+.cognition-action {
+    display: inline-block;
+    margin-right: 8px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    vertical-align: middle;
+}
+
+.cognition-level.level-explicit {
+    color: #2e7d5b;
+    background: rgba(46, 125, 91, 0.14);
+    border: 1px solid rgba(46, 125, 91, 0.28);
+}
+
+.cognition-level.level-deductive {
+    color: #7a5cb5;
+    background: rgba(122, 92, 181, 0.14);
+    border: 1px solid rgba(122, 92, 181, 0.28);
+}
+
+.cognition-level.level-inductive {
+    color: #a0682c;
+    background: rgba(160, 104, 44, 0.14);
+    border: 1px solid rgba(160, 104, 44, 0.28);
+}
+
+.cognition-action {
+    color: #5b7bd5;
+    background: rgba(91, 123, 213, 0.12);
+    border: 1px solid rgba(91, 123, 213, 0.3);
+}
+
+.cognition-draft-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.cognition-revision-list {
+    margin: 10px 0 0;
+    padding-left: 20px;
+    color: var(--muted, #7a6f8f);
+    font-size: 13px;
+    line-height: 1.8;
+}
+
+.cognition-revision-list li {
+    overflow-wrap: anywhere;
+}
+
 .cognition-diff-pane {
     min-width: 0;
     padding: 12px;

@@ -233,8 +233,10 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
                 [{"id": 1, "content": "证据", "layer": 1, "importance": 8,
                   "created_at": "2026-07-30T08:00:00+00:00"}],
                 [
-                    {"subject": "user", "cognitive_type": "user_core", "content": "用户旧认知"},
-                    {"subject": "self", "cognitive_type": "self_core", "content": "自我旧认知"},
+                    {"subject": "user", "cognitive_type": "user_core", "content": "用户旧认知",
+                     "level": "explicit", "times_derived": 1, "evidence_memory_ids": [1], "id": 10},
+                    {"subject": "self", "cognitive_type": "self_core", "content": "自我旧认知",
+                     "level": "deductive", "times_derived": 2, "evidence_memory_ids": [1], "id": 11},
                 ],
             )
 
@@ -244,10 +246,50 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("self_core", prompt)
         self.assertIn("relationship_core", prompt)
         self.assertIn("current_field", prompt)
+        self.assertIn("card_id=10", prompt)
+        self.assertIn("card_id=11", prompt)
         self.assertIn("自我旧认知", prompt)
         self.assertIn("用户旧认知", prompt)
-        self.assertIn("只有在证据足以形成新认知", prompt)
+        self.assertIn("原子化：每条候选只陈述一个自包含的认知", prompt)
+        self.assertIn("action 为 reinforce / supersede 时，target_id 必须指向同一区块的 active 卡", prompt)
         self.assertIn("不能提出删除", prompt)
+
+    async def test_cognitive_draft_prompt_feeds_back_human_revisions(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_cognitive_draft(
+                [{"id": 1, "content": "证据", "layer": 1, "importance": 8,
+                  "created_at": "2026-07-30T08:00:00+00:00"}],
+                [],
+                [
+                    {"id": 2, "card_id": None, "subject": "user",
+                     "cognitive_type": "user_core", "action": "reject",
+                     "content_before": "被拒绝的认知", "content_after": None,
+                     "level_before": None, "level_after": None,
+                     "created_at": "2026-08-01T08:00:00+00:00"},
+                    {"id": 3, "card_id": 7, "subject": "user",
+                     "cognitive_type": "user_core", "action": "edit",
+                     "content_before": "旧版本", "content_after": "修正后版本",
+                     "level_before": "explicit", "level_after": "deductive",
+                     "created_at": "2026-08-02T08:00:00+00:00"},
+                ],
+            )
+
+        self.assertEqual(result, [])
+        prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("人工近期确认/修正记录", prompt)
+        self.assertIn("人工拒绝", prompt)
+        self.assertIn("被拒绝的认知", prompt)
+        self.assertIn("人工修正", prompt)
+        self.assertIn("旧版本 → 修正后版本", prompt)
+        self.assertIn("不得重新提出已被人工删除或拒绝的认知", prompt)
 
     async def test_cognitive_draft_requires_memories(self):
         with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"):

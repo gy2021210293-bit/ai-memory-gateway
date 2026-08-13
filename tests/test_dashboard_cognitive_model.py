@@ -33,6 +33,29 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertIn("grid-template-columns: minmax(0, 1fr)", self.css)
         self.assertIn("min-width: 0", self.css)
 
+    def test_dashboard_supports_atomic_cards_with_levels_and_lifecycle(self):
+        # 层级下拉
+        self.assertIn('id="cognition-level"', self.html)
+        self.assertIn('<option value="explicit">', self.html)
+        self.assertIn('<option value="inductive">', self.html)
+        self.assertIn("COGNITIVE_LEVEL_LABELS", self.js)
+        # action 提示与强化确认路径
+        self.assertIn("cognition-action-hint", self.html)
+        self.assertIn("confirmCognitiveReinforce", self.js)
+        self.assertIn("强化×", self.js)
+        self.assertIn("取代 #", self.js)
+        # 多卡渲染不再依赖单条 find
+        self.assertIn("filter(candidate => candidate.cognitive_type", self.js)
+
+    def test_dashboard_records_and_shows_human_decisions(self):
+        # 拒绝按钮 + 修订历史条
+        self.assertIn("cognition-revision-log", self.html)
+        self.assertIn("renderCognitiveRevisions", self.js)
+        self.assertIn("/api/cognitive-items/revisions", self.js)
+        self.assertIn("rejectCognitiveDraft", self.js)
+        self.assertIn("/api/cognitive-items/draft/reject", self.js)
+        self.assertIn("回喂", self.js)
+
 
 if __name__ == "__main__":
     unittest.main()

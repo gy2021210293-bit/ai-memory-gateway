@@ -617,11 +617,11 @@
             <section id="section-cognition" class="section">
                 <div class="section-header">
                     <h1>三元一场认知模型</h1>
-                    <p class="section-desc">维护用户核心、AI 自我核心、关系核心与当前认知场。草稿只供预览，逐项确认后才会进入聊天上下文。</p>
+                    <p class="section-desc">以原子认知卡维护用户核心、AI 自我核心、关系核心与当前认知场；每条卡标注明确陈述/演绎推断/归纳推断，草稿只供预览，逐项确认后才会进入聊天上下文。</p>
                 </div>
                 <div class="card">
                     <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
-                        <span class="section-desc">综合最多60条高信号记忆与20条最新记忆，一次审视四个区块；不会自动保存。</span>
+                        <span class="section-desc">综合最多60条高信号记忆与20条最新记忆，一次提出新建 / 强化 / 取代的原子认知卡；不会自动保存。</span>
                         <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft()">重新审视认知</button>
                     </div>
                     <div id="cognition-status" class="section-desc" style="margin-top:10px"></div>
@@ -631,7 +631,15 @@
                     <input id="cognition-subject" type="hidden">
                     <input id="cognition-type" type="hidden">
                     <h3 id="cognition-editor-title">编辑认知</h3>
+                    <small id="cognition-action-hint" class="section-desc" style="display:block;margin-top:4px"></small>
                     <div class="toolbar" style="align-items:flex-end;flex-wrap:wrap">
+                        <label>层级
+                            <select id="cognition-level" class="input" style="width:130px">
+                                <option value="explicit">明确陈述</option>
+                                <option value="deductive">演绎推断</option>
+                                <option value="inductive">归纳推断</option>
+                            </select>
+                        </label>
                         <label>置信度
                             <input id="cognition-confidence" class="input" type="number" min="0" max="1" step="0.05" value="0.7" style="width:100px">
                         </label>
@@ -643,8 +651,8 @@
                         </label>
                     </div>
                     <label style="display:block;margin-top:14px">认知内容
-                        <textarea id="cognition-content" class="textarea" rows="3" placeholder="写下简洁、可验证、适合长期使用的认知（建议约240字，不会被截断）"></textarea>
-                        <small id="cognition-char-hint" class="section-desc">建议控制在 240 字左右，超过仍可保存。</small>
+                        <textarea id="cognition-content" class="textarea" rows="3" placeholder="写下原子化的单条认知（建议 30-120 字，长文仍可保存）"></textarea>
+                        <small id="cognition-char-hint" class="section-desc">建议每条认知卡 30-120 字，长文仍可保存。</small>
                     </label>
                     <div class="toolbar" style="margin-top:12px">
                         <button class="btn btn-primary" id="cognition-save" onclick="saveCognitiveItem()">保存认知</button>
@@ -652,6 +660,7 @@
                     </div>
                 </div>
                 <div id="cognition-groups" class="cognition-grid"></div>
+                <div id="cognition-revision-log" class="card" style="display:none;margin-top:16px"></div>
             </section>
 
             <section id="section-settings" class="section">

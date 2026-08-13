@@ -1212,12 +1212,19 @@ COGNITIVE_DRAFT_RULES = {
 }
 
 
-async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict]) -> Optional[List[Dict]]:
-    """Generate evidence-backed review candidates across 三元一场 without saving."""
+async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict],
+                                   revisions: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
+    """Generate atomic evidence-backed review candidates across 三元一场 without saving.
+
+    Candidates carry a `level` (explicit / deductive / inductive) and a lifecycle
+    `action` (create / reinforce / supersede) so the human can confirm each card.
+    `revisions` are recent human decisions (confirm / correct / reject) that are
+    fed back as evidence so the model learns from corrections.
+    """
     if not memories or not get_memory_api_key():
         return None
-    evidence_lines = []
     fallback_time = datetime.now(timezone.utc)
+    evidence_lines = []
     for memory in memories:
         layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(memory.get("layer", 1), "记忆")
         memory_time = _format_message_time(memory.get("created_at"), fallback_time)
@@ -1230,11 +1237,41 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
         cognitive_type = item.get("cognitive_type")
         if cognitive_type not in COGNITIVE_DRAFT_RULES or item.get("status", "active") != "active":
             continue
+        if item.get("id") is None:
+            continue  # reinforce / supersede 需要稳定 card_id 引用
         review_text = f"[复核日={item.get('review_after')}]" if item.get("review_after") else ""
-        current_lines.append(
-            f"[{item.get('subject')}][{cognitive_type}][置信度={item.get('confidence', 0.7)}]"
-            f"{review_text} {item.get('content')}"
+        evidence_text = (
+            "[" + ",".join(f"#{e}" for e in item.get("evidence_memory_ids") or []) + "]"
+            if item.get("evidence_memory_ids") else ""
         )
+        current_lines.append(
+            f"[card_id={item.get('id')}][{item.get('subject')}][{cognitive_type}]"
+            f"[level={item.get('level', 'explicit')}][置信度={item.get('confidence', 0.7)}]"
+            f"[强化×{item.get('times_derived', 1)}]{evidence_text}{review_text} {item.get('content')}"
+        )
+    revision_lines = []
+    if revisions:
+        action_labels = {
+            "create": "人工确认·新建",
+            "reinforce": "人工确认·强化",
+            "supersede": "人工确认·取代",
+            "edit": "人工修正",
+            "delete": "人工删除",
+            "reject": "人工拒绝",
+        }
+        for rev in revisions:
+            rev_action = rev.get("action")
+            label = action_labels.get(rev_action, str(rev_action))
+            before = str(rev.get("content_before") or "").strip()
+            after = str(rev.get("content_after") or "").strip()
+            if rev_action == "edit" and before and after:
+                detail = f"{before} → {after}"
+            else:
+                detail = after or before
+            rev_time = _format_message_time(rev.get("created_at"), fallback_time)
+            revision_lines.append(
+                f"[{rev_time}][{rev.get('cognitive_type')}][{label}] {detail}"
+            )
     rule_lines = [
         f"{index}. {subject} / {cognitive_type}：{description}"
         for index, (cognitive_type, (subject, description)) in enumerate(
@@ -1243,19 +1280,38 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
     ]
     prompt = f"""我是栖，正在根据已有记忆整体审视“三元一场”认知模型。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
 
-当前已保存认知（四部分必须相互一致；新证据与其矛盾时可提出更正候选）：
+当前已保存认知卡（status 均为 active；reinforce / supersede 时必须用 card_id 引用它们）：
 {chr(10).join(current_lines) or '无'}
 
 证据记忆：
 {chr(10).join(evidence_lines)}
 
-只允许生成以下四种候选，每种最多一条：
+人工近期确认/修正记录（这些是人类做出的决策：被确认的认知更可信；被人工删除或拒绝的内容不要重新提出；被修正的认知以修正后版本为准）：
+{chr(10).join(revision_lines) or '无'}
+
+只允许在以下四个区块内生成候选：
 {chr(10).join(rule_lines)}
 
-只有在证据足以形成新认知，或足以实质更正当前认知时才输出该部分；没有实质变化就省略。不能提出删除，也不能把生日、账号、航班号等原始事实机械复制为认知。每条 content 建议120-240字，以简洁为主但不要为凑字数遗漏关键信息；confidence 为0到1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。current_field 可额外返回 review_after，格式为 YYYY-MM-DD；缺省时系统会使用14天后的日期。只返回 JSON 数组：
+生成规则：
+1. 原子化：每条候选只陈述一个自包含的认知，不要写成长段落；每条 content 建议 30-120 字。
+2. 分层（level，只能取其一）：
+   - explicit 明确陈述：晏晏直接陈述、或证据直接支持的稳定事实。
+   - deductive 演绎推断：由已有明确前提直接推出的结论。
+   - inductive 归纳推断：由 ≥2 个独立事件归纳出的倾向，建议 confidence ≤ 0.6；单次事件不得归纳为倾向。
+3. 与现有卡片的关系（action，只能取其一）：
+   - create 新建：证据支持、但现有卡未覆盖的新认知。
+   - reinforce 强化：与某条现有卡内容实质相同、只是多了佐证 → 指定该卡 card_id 为 target_id。
+   - supersede 取代：新证据更正或取代某条现有卡 → 指定该卡 card_id 为 target_id。
+   action 为 reinforce / supersede 时，target_id 必须指向同一区块的 active 卡。
+4. confidence 为 0 到 1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。
+5. current_field 可额外返回 review_after，格式为 YYYY-MM-DD；缺省时系统会使用 14 天后的日期。
+6. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；每类最多 3 条。
+7. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
+
+只返回 JSON 数组：
 [
-  {{"subject":"user","cognitive_type":"user_core","content":"...","confidence":0.8,"evidence_memory_ids":[12]}},
-  {{"subject":"context","cognitive_type":"current_field","content":"...","confidence":0.8,"evidence_memory_ids":[18],"review_after":"2026-08-13"}}
+  {{"subject":"user","cognitive_type":"user_core","content":"...","level":"explicit","confidence":0.8,"evidence_memory_ids":[12],"action":"create"}},
+  {{"subject":"context","cognitive_type":"current_field","content":"...","level":"deductive","confidence":0.6,"evidence_memory_ids":[18],"action":"supersede","target_id":8,"review_after":"2026-08-13"}}
 ]
 """
     try:
