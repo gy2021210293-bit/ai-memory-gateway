@@ -1740,7 +1740,7 @@ async def process_memories_background(
                 extraction_claim["claim_token"],
             )
             extraction_claim = None
-            print(f"⚠️ 对话线 {session_id} 提取失败，进度保留，等待下轮重试")
+            print(f"⚠️ 对话线 {session_id} 提取失败（{_memory_extractor_module.MEMORY_EXTRACTION_LAST_ERROR or '原因未知'}），进度保留，等待下轮重试")
             return
         
         # 过滤垃圾记忆（不靠模型自觉，硬过滤）

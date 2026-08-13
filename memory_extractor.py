@@ -21,6 +21,7 @@ import re
 import asyncio
 import unicodedata
 import httpx
+import traceback
 from llm_json import parse_json_array, parse_json_object
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
@@ -42,6 +43,8 @@ MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
 ENTITY_RELATION_MODEL = os.getenv("ENTITY_RELATION_MODEL", "")
 # 关系描述最近一次失败的具体原因（供 Dashboard 直接展示，替代笼统的"调用失败"）
 RELATION_LAST_ERROR = ""
+# 记忆提取最近一次失败的具体原因（供 main.py 在"提取失败"日志里内联展示，替代空泛文案）
+MEMORY_EXTRACTION_LAST_ERROR = ""
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 USER_ENTITY_NAMES = {
     re.sub(r"\s+", " ", name.strip()).casefold()
@@ -450,8 +453,11 @@ async def extract_memories(
     返回：
         成功时返回记忆列表（可以为空）；请求或解析失败时返回 None
     """
+    global MEMORY_EXTRACTION_LAST_ERROR
+    MEMORY_EXTRACTION_LAST_ERROR = ""
     api_key = get_memory_api_key()
     if not api_key:
+        MEMORY_EXTRACTION_LAST_ERROR = "未配置记忆模型的 API Key"
         print("⚠️  API_KEY 未设置，跳过记忆提取")
         return None
 
@@ -488,7 +494,8 @@ async def extract_memories(
 
     # 调用 LLM 提取记忆
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        # 提取批次含已有记忆 + 实体清单，推理模型可能较慢，超时放宽到 180s 避免被掐断
+        async with httpx.AsyncClient(timeout=180) as client:
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -504,6 +511,7 @@ async def extract_memories(
             )
 
             if response.status_code != 200:
+                MEMORY_EXTRACTION_LAST_ERROR = f"HTTP {response.status_code}: {response.text[:300]}"
                 print(f"⚠️  记忆提取请求失败: {response.status_code} {response.text[:300]}")
                 return None
 
@@ -539,12 +547,14 @@ async def extract_memories(
                     json={"model": MEMORY_MODEL, "messages": retry_messages},
                 )
                 if retry_response.status_code != 200:
+                    MEMORY_EXTRACTION_LAST_ERROR = f"重试 HTTP {retry_response.status_code}: {retry_response.text[:300]}"
                     print(f"⚠️  记忆提取重试失败: {retry_response.status_code} {retry_response.text[:300]}")
                     return None
                 retry_text = _extract_response_content(retry_response.json())
                 try:
                     memories = parse_json_array(retry_text)
                 except ValueError as retry_error:
+                    MEMORY_EXTRACTION_LAST_ERROR = f"模型两次返回都解析不出 JSON 数组：{retry_text[:200]}"
                     print(f"⚠️  记忆提取重试结果仍无法解析: {retry_error}")
                     print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
                     return None
@@ -568,10 +578,14 @@ async def extract_memories(
             return valid_memories
 
     except json.JSONDecodeError as e:
+        MEMORY_EXTRACTION_LAST_ERROR = f"JSON 解析失败: {e}"
         print(f"⚠️  记忆提取结果解析失败: {e}")
         return None
     except Exception as e:
-        print(f"⚠️  记忆提取出错: {e}")
+        exc_name = type(e).__name__
+        MEMORY_EXTRACTION_LAST_ERROR = f"{exc_name}: {repr(e)}"
+        print(f"⚠️  记忆提取出错: {exc_name}: {repr(e)}", flush=True)
+        print(traceback.format_exc(), flush=True)
         return None
 
 
