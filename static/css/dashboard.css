@@ -2033,10 +2033,11 @@ details.entity-group[open] > summary {
     border: 1px solid rgba(214, 158, 0, .35);
 }
 
-.entity-badge-card {
-    color: #1b7a4f;
-    background: rgba(46, 204, 113, .18);
-    border: 1px solid rgba(27, 122, 79, .32);
+.entity-badge-nostate,
+.entity-badge-notrait {
+    color: #8a8f98;
+    background: rgba(107, 114, 128, .08);
+    border: 1px dashed rgba(107, 114, 128, .35);
 }
 
 .entity-badge-date {

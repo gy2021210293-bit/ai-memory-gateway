@@ -3966,6 +3966,9 @@ async def list_entities():
             entity["card_has_description"] = _card_has_description(
                 entity.get("entity_card_json")
             )
+            entity["card_has_active_traits"] = _card_has_active_traits(
+                entity.get("entity_card_json")
+            )
         entities.sort(key=lambda item: (
             item["retrieval_status"] != "active",
             -int(item.get("evidence_count") or 0),
@@ -4206,6 +4209,9 @@ async def get_entity_detail(entity_id: int):
             entity["card_has_description"] = _card_has_description(
                 entity.get("entity_card_json")
             )
+            entity["card_has_active_traits"] = _card_has_active_traits(
+                entity.get("entity_card_json")
+            )
         return entity
 
 
@@ -4431,6 +4437,20 @@ def _card_has_description(card_json) -> bool:
     """
     card = _parse_entity_card(card_json)
     return bool((card.get("description") or "").strip())
+
+
+def _card_has_active_traits(card_json) -> bool:
+    """True when the entity card has at least one active stable trait.
+
+    Retired traits don't count: the 无特征 badge mirrors the traits actually
+    injected into chat (the Dashboard's 长期稳定特征 section), so only
+    status='active' elements suppress it.
+    """
+    card = _parse_entity_card(card_json)
+    return any(
+        trait.get("status") == "active"
+        for trait in card.get("stable_traits") or []
+    )
 
 
 def _sort_snapshots(snapshots: list) -> list:

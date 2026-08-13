@@ -455,17 +455,26 @@ function renderEntities() {
                 dorm.textContent = '休眠' + (idle !== null ? ` · ${idle}天未提及` : '');
                 badges.appendChild(dorm);
             }
+            // 快照徽标：有快照不再显示「有卡」，仅保留状态日期；无快照显示「无状态」。
             if (entity.card_has_snapshots) {
-                const hasCard = document.createElement('span');
-                hasCard.className = 'entity-badge entity-badge-card';
-                hasCard.textContent = '有卡';
-                badges.appendChild(hasCard);
                 if (entity.card_last_state_date) {
                     const date = document.createElement('span');
                     date.className = 'entity-badge entity-badge-date';
                     date.textContent = `状态至 ${entity.card_last_state_date}`;
                     badges.appendChild(date);
                 }
+            } else {
+                const noState = document.createElement('span');
+                noState.className = 'entity-badge entity-badge-nostate';
+                noState.textContent = '无状态';
+                badges.appendChild(noState);
+            }
+            // 稳定特征徽标：有活跃特征不显示，无特征显示「无特征」。
+            if (!entity.card_has_active_traits) {
+                const noTrait = document.createElement('span');
+                noTrait.className = 'entity-badge entity-badge-notrait';
+                noTrait.textContent = '无特征';
+                badges.appendChild(noTrait);
             }
             if (!entity.card_has_description) {
                 const noDesc = document.createElement('span');
@@ -484,10 +493,15 @@ function renderEntities() {
             arrow.textContent = '›';
 
             row.append(identity, metrics, badges, aliases, arrow);
-            row.onclick = () => {
+            row.onclick = async () => {
                 list.querySelectorAll('.entity-item.is-selected').forEach(item => item.classList.remove('is-selected'));
                 row.classList.add('is-selected');
-                loadEntityMemories(entity);
+                const loaded = await loadEntityMemories(entity);
+                // 有待确认提案时直接定位到下方实体卡的提案区，省去在长详情里手动翻页
+                if (loaded && entity.pending_proposal_count > 0) {
+                    const proposals = document.getElementById('entity-card-proposals');
+                    if (proposals) proposals.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
             };
             grid.appendChild(row);
         });

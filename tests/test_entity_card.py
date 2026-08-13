@@ -172,6 +172,24 @@ class EntityCardTests(unittest.TestCase):
         self.assertFalse(database._card_has_description(None))
         self.assertFalse(database._card_has_description("not json"))
 
+    def test_card_has_active_traits_only_counts_active(self):
+        # 至少一条活跃特征 → True
+        self.assertTrue(database._card_has_active_traits({
+            "stable_traits": [
+                {"id": "t1", "text": "爱喝咖啡", "status": "active"},
+                {"id": "t2", "text": "旧爱好", "status": "retired"},
+            ],
+        }))
+        # 只有退休特征 → False（退休特征不再注入聊天，卡面显示 无特征）
+        self.assertFalse(database._card_has_active_traits({
+            "stable_traits": [{"id": "t1", "text": "旧爱好", "status": "retired"}],
+        }))
+        # 无 stable_traits 字段 / 非数组 / 缺卡 → False（兼容旧卡与空卡）
+        self.assertFalse(database._card_has_active_traits({"description": "x", "snapshots": []}))
+        self.assertFalse(database._card_has_active_traits({"stable_traits": "not-an-array"}))
+        self.assertFalse(database._card_has_active_traits(None))
+        self.assertFalse(database._card_has_active_traits("not json"))
+
     def test_parse_entity_card_parses_stable_traits(self):
         payload = {
             "description": "朋友",
@@ -269,6 +287,7 @@ class EntityCardTests(unittest.TestCase):
         self.assertFalse(entities[0]["card_has_snapshots"])
         self.assertIsNone(entities[0]["card_last_state_date"])
         self.assertFalse(entities[0]["card_has_description"])
+        self.assertFalse(entities[0]["card_has_active_traits"])
 
     def test_list_entities_without_card_filters_empty_cards(self):
         calls = []
