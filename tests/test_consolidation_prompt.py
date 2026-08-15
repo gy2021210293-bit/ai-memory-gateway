@@ -68,6 +68,25 @@ class ConsolidationPromptTests(unittest.TestCase):
     def test_fragment_input_includes_importance(self):
         self.assertIn("[重要度：{fragment.get('importance', 5)}/10]", self.source)
 
+    def test_consolidation_does_not_shadow_date_class(self):
+        # 回归：先验知识渲染循环曾把变量命名为 date，遮蔽了 from datetime import date 的类，
+        # 导致下方 date.fromisoformat(...) 抛 AttributeError: 'str' object has no attribute 'fromisoformat'
+        tree = ast.parse(self.source)
+        func = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "consolidate_memories_for_date_range"
+        )
+        shadowing = [
+            node
+            for node in ast.walk(func)
+            if isinstance(node, ast.Name) and node.id == "date" and isinstance(node.ctx, ast.Store)
+        ]
+        self.assertEqual(shadowing, [], "consolidate_memories_for_date_range 内不得把 date 用作局部变量名")
+        # 且仍在使用 datetime.date.fromisoformat 解析 event_date
+        self.assertIn("date.fromisoformat(str(event.get(\"event_date\", \"\")))", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

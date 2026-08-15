@@ -4217,9 +4217,10 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             snapshots.sort(key=lambda s: (str(s.get("fact_date") or ""), str(s.get("recorded_at") or "")))
             snap_parts = []
             for snap in snapshots[-ENTITY_PRIOR_SNAPSHOT_LIMIT:]:
-                date = str(snap.get("fact_date") or "未知日期")
+                # 注意：不要用变量名 date，否则会把下方 date.fromisoformat 的 datetime.date 类遮蔽成字符串
+                fact_date_label = str(snap.get("fact_date") or "未知日期")
                 state = re.sub(r"\s+", " ", str(snap.get("state") or "")).strip()
-                snap_parts.append(f"{date}：{state}")
+                snap_parts.append(f"{fact_date_label}：{state}")
             snap_text = "；".join(snap_parts) or "（无）"
             # 活跃稳定特征：用户已确认的长期特质
             traits = [
@@ -4279,6 +4280,15 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     wait_time = (attempt + 1) * 10
                     print(f"⚠️ 整理API 429限流，{wait_time}秒后重试（第{attempt+1}次）")
                     last_error = f"429 Too Many Requests (重试{attempt+1}次)"
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # 上游 5xx（网关/负载均衡/推理服务瞬时故障）同样按退避重试，
+                # 避免一次瞬时 500/503 直接让整个整理任务失败
+                if response.status_code in (500, 502, 503, 504):
+                    wait_time = (attempt + 1) * 10
+                    print(f"⚠️ 整理API {response.status_code}上游错误，{wait_time}秒后重试（第{attempt+1}次）")
+                    last_error = f"HTTP {response.status_code}: {response.text[:200]} (重试{attempt+1}次)"
                     await asyncio.sleep(wait_time)
                     continue
 
