@@ -148,5 +148,52 @@ class AutoReviewRunTests(unittest.IsolatedAsyncioTestCase):
             queue_mock.assert_awaited_once_with(queued)
 
 
+class CognitiveInjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_cognitive_text_passes_context(self):
+        with (
+            patch.object(main, "list_cognitive_items", AsyncMock(return_value=[])),
+            patch.object(main, "format_cognitive_items_for_prompt",
+                         return_value="X") as fmt_mock,
+        ):
+            text = await main.build_cognitive_text("旅行", [10, 11])
+        self.assertEqual(text, "X")
+        kwargs = fmt_mock.call_args.kwargs
+        self.assertEqual(kwargs["context"]["query"], "旅行")
+        self.assertEqual(kwargs["context"]["related_memory_ids"], [10, 11])
+
+    async def test_build_cognitive_text_without_context_is_legacy(self):
+        with (
+            patch.object(main, "list_cognitive_items", AsyncMock(return_value=[])),
+            patch.object(main, "format_cognitive_items_for_prompt",
+                         return_value="Y") as fmt_mock,
+        ):
+            text = await main.build_cognitive_text()
+        self.assertEqual(text, "Y")
+        self.assertIsNone(fmt_mock.call_args.kwargs.get("context"))
+
+    async def test_build_memory_text_returns_text_and_ids(self):
+        with (
+            patch.object(main, "find_directly_mentioned_entities",
+                         AsyncMock(return_value=[])),
+            patch.object(main, "search_memories", AsyncMock(return_value=[
+                {"id": 3, "content": "第一条", "layer": 1,
+                 "created_at": None, "entities": []},
+                {"id": 7, "content": "第二条", "layer": 2,
+                 "created_at": None, "entities": []},
+            ])),
+            patch.object(main, "_build_entity_overview",
+                         AsyncMock(return_value="")),
+        ):
+            result = await main.build_memory_text("你好")
+        self.assertEqual(result["memory_ids"], [3, 7])
+        self.assertIn("retrieved_memories", result["text"])
+
+    async def test_build_memory_text_failure_returns_empty_dict(self):
+        with patch.object(main, "find_directly_mentioned_entities",
+                          AsyncMock(side_effect=RuntimeError("db down"))):
+            result = await main.build_memory_text("你好")
+        self.assertEqual(result, {"text": "", "memory_ids": []})
+
+
 if __name__ == "__main__":
     unittest.main()

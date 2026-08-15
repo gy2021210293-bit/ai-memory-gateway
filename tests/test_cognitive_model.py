@@ -207,6 +207,99 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertIn("可能过时，只能作为背景", prompt)
         self.assertNotIn("evidence_memory_ids", prompt)
 
+    def test_context_evidence_hit_ranks_first(self):
+        # 证据关联是最强信号：当前检索到的记忆命中了卡 B 的证据 → B 入选并标注相关
+        prompt = database.format_cognitive_items_for_prompt([
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "不相关的卡", "level": "explicit",
+             "times_derived": 9, "confidence": 0.9, "id": 1,
+             "evidence_memory_ids": [99]},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "话题相关的卡", "level": "inductive",
+             "times_derived": 1, "confidence": 0.5, "id": 2,
+             "evidence_memory_ids": [10, 11]},
+        ], context={"query": "zzz不命中词", "related_memory_ids": [10]})
+        self.assertIn("话题相关的卡", prompt)
+        self.assertIn("与当前话题相关", prompt)
+        self.assertNotIn("不相关的卡", prompt)  # 相关才多给：无关卡不注入
+
+    def test_context_keyword_hit_ranks_above_irrelevant(self):
+        # 无证据命中时，关键词命中的卡入选，完全不相关的卡被过滤
+        prompt = database.format_cognitive_items_for_prompt([
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "喜欢周末去爬山", "level": "explicit",
+             "times_derived": 1, "confidence": 0.5, "id": 1},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "完全无关的另一个话题", "level": "explicit",
+             "times_derived": 1, "confidence": 0.5, "id": 2},
+        ], context={"query": "爬山", "related_memory_ids": []})
+        self.assertIn("喜欢周末去爬山", prompt)
+        self.assertNotIn("完全无关的另一个话题", prompt)
+
+    def test_context_tie_breaker_is_deterministic_by_id(self):
+        # 证据命中数、强化次数、置信度、分层全部相同 → 按 ID 稳定裁决，绝不随机
+        items = [
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": f"同分卡{i}", "level": "explicit",
+             "times_derived": 1, "confidence": 0.5, "id": i,
+             "evidence_memory_ids": [10]}
+            for i in range(1, 5)
+        ]
+        context = {"query": "zzz不命中词", "related_memory_ids": [10]}
+        first = database.format_cognitive_items_for_prompt(list(items), context=context)
+        second = database.format_cognitive_items_for_prompt(list(items), context=context)
+        self.assertEqual(first, second)  # 可复现
+        # 只选 3 张且是最新（id 大）的 3 张
+        self.assertIn("同分卡2", first)
+        self.assertIn("同分卡3", first)
+        self.assertIn("同分卡4", first)
+        self.assertNotIn("同分卡1", first)
+
+    def test_context_relevant_only_dynamic_count(self):
+        # 相关才多给：3 张里只有 1 张相关 → 只注入那 1 张，不灌无关背景板
+        prompt = database.format_cognitive_items_for_prompt([
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "相关的那张", "level": "explicit",
+             "times_derived": 1, "confidence": 0.5, "id": 1,
+             "evidence_memory_ids": [10]},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "无关甲", "level": "explicit",
+             "times_derived": 3, "confidence": 0.9, "id": 2},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "无关乙", "level": "explicit",
+             "times_derived": 2, "confidence": 0.8, "id": 3},
+        ], context={"query": "zzz不命中词", "related_memory_ids": [10]})
+        self.assertIn("相关的那张", prompt)
+        self.assertNotIn("无关甲", prompt)
+        self.assertNotIn("无关乙", prompt)
+
+    def test_context_all_irrelevant_falls_back_to_one_core_card(self):
+        # 全部不相关 → 每格只保底 1 张最核心卡，标注"长期核心，保留参考"
+        prompt = database.format_cognitive_items_for_prompt([
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "核心甲", "level": "explicit",
+             "times_derived": 2, "confidence": 0.8, "id": 1},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "核心乙", "level": "explicit",
+             "times_derived": 1, "confidence": 0.7, "id": 2},
+        ], context={"query": "完全无关的话题词", "related_memory_ids": []})
+        self.assertIn("按当前话题筛选，仅供参考", prompt)
+        self.assertIn("长期核心，保留参考", prompt)
+        self.assertIn("核心甲", prompt)
+        self.assertNotIn("核心乙", prompt)
+
+    def test_without_context_keeps_legacy_behavior(self):
+        # 无 context（旧调用）→ 排序与输出和以前完全一致：无筛选标注、无相关性标记
+        prompt = database.format_cognitive_items_for_prompt([
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "旧行为卡", "level": "explicit",
+             "times_derived": 1, "confidence": 0.5, "id": 1},
+        ])
+        self.assertIn("【三元一场认知模型】", prompt)
+        self.assertNotIn("按当前话题筛选", prompt)
+        self.assertNotIn("与当前话题相关", prompt)
+        self.assertNotIn("长期核心", prompt)
+
 
 class _FakeTransaction:
     def __init__(self):

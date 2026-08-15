@@ -643,7 +643,13 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
     try:
         direct_entities = await find_directly_mentioned_entities(user_message)
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
-        cognitive_text = format_cognitive_items_for_prompt(await list_cognitive_items(active_only=True))
+        cognitive_text = format_cognitive_items_for_prompt(
+            await list_cognitive_items(active_only=True),
+            context={
+                "query": user_message,
+                "related_memory_ids": [mem["id"] for mem in memories],
+            },
+        )
 
         if not memories and not cognitive_text and not direct_entities:
             return base_system_prompt
@@ -1443,13 +1449,17 @@ async def _build_basic_cached(
     return result
 
 
-async def build_memory_text(user_message: str) -> str:
-    """搜索记忆并格式化为注入文本（分区缓存模式用）"""
+async def build_memory_text(user_message: str) -> dict:
+    """搜索记忆并格式化为注入文本（分区缓存模式用）。
+
+    返回 {"text": 注入文本, "memory_ids": 本次检索到的记忆 ID}，
+    供认知注入按当前话题做证据关联筛选（零额外检索成本）。
+    """
     try:
         direct_entities = await find_directly_mentioned_entities(user_message)
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
         if not memories and not direct_entities:
-            return ""
+            return {"text": "", "memory_ids": []}
         
         entity_map = {
             mem["id"]: [
@@ -1477,22 +1487,37 @@ async def build_memory_text(user_message: str) -> str:
         entity_overview = await _build_entity_overview(memories, user_message, direct_entities)
         entity_block = f"<matched_entities>\n{entity_overview}\n</matched_entities>\n" if entity_overview else ""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
-        return (
-            "<retrieved_memories>\n"
-            "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
-            + entity_block
-            + "\n".join(memory_lines)
-            + "\n</retrieved_memories>"
-        )
+        return {
+            "text": (
+                "<retrieved_memories>\n"
+                "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
+                + entity_block
+                + "\n".join(memory_lines)
+                + "\n</retrieved_memories>"
+            ),
+            "memory_ids": [mem["id"] for mem in memories],
+        }
     except Exception as e:
         print(f"⚠️ 记忆检索失败: {e}")
-        return ""
+        return {"text": "", "memory_ids": []}
 
 
-async def build_cognitive_text() -> str:
-    """Format manually confirmed active cognition for partitioned chat requests."""
+async def build_cognitive_text(user_message: str = "", related_memory_ids=None) -> str:
+    """Format confirmed active cognition for partitioned chat requests.
+
+    带当前话题上下文时按相关度筛选注入（证据关联 + 关键词命中，卡片从
+    "固定 top-N" 变为"聊什么带什么"）；无上下文时保持旧的固定排序行为。
+    """
     try:
-        return format_cognitive_items_for_prompt(await list_cognitive_items(active_only=True))
+        context = None
+        if user_message or related_memory_ids:
+            context = {
+                "query": user_message or "",
+                "related_memory_ids": list(related_memory_ids or []),
+            }
+        return format_cognitive_items_for_prompt(
+            await list_cognitive_items(active_only=True), context=context
+        )
     except Exception as e:
         print(f"⚠️ 认知模型读取失败: {e}")
         return ""
@@ -2052,7 +2077,6 @@ async def _chat_completions_inner(request: Request):
         history_task = asyncio.create_task(
             get_conversation_messages(session_id, limit=10000)
         )
-        cognitive_task = asyncio.create_task(build_cognitive_text())
         try:
             db_history = await history_task
             db_msgs = []
@@ -2078,14 +2102,9 @@ async def _chat_completions_inner(request: Request):
             flush=True,
         )
         if not reconciled.provider_messages:
-            for task in (system_task, cognitive_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(
-                system_task,
-                cognitive_task,
-                return_exceptions=True,
-            )
+            if not system_task.done():
+                system_task.cancel()
+            await asyncio.gather(system_task, return_exceptions=True)
             return JSONResponse(
                 status_code=400,
                 content={
@@ -2106,7 +2125,7 @@ async def _chat_completions_inner(request: Request):
         memory_task = asyncio.create_task(
             build_memory_text(user_message)
             if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message
-            else asyncio.sleep(0, result="")
+            else asyncio.sleep(0, result={"text": "", "memory_ids": []})
         )
         drives_task = (
             asyncio.create_task(drives.fetch_context())
@@ -2115,18 +2134,29 @@ async def _chat_completions_inner(request: Request):
         )
         gathered = await asyncio.gather(
             system_task,
-            cognitive_task,
             memory_task,
             *(tuple([drives_task]) if drives_task else tuple()),
             return_exceptions=True,
         )
         effective_system_prompt = gathered[0] if not isinstance(gathered[0], Exception) else ""
-        cognitive_text = gathered[1] if not isinstance(gathered[1], Exception) else ""
-        memory_text = gathered[2] if not isinstance(gathered[2], Exception) else ""
+        memory_result = gathered[1] if not isinstance(gathered[1], Exception) else {}
+        memory_text = memory_result.get("text", "") if isinstance(memory_result, dict) else ""
         if drives_task:
             prepared_drives_text = (
-                gathered[3] if not isinstance(gathered[3], Exception) else ""
+                gathered[2] if not isinstance(gathered[2], Exception) else ""
             )
+        # 认知按当前话题筛选：记忆检索已拿到关联记忆 ID，认知构建只做 DB 读 + 内存排序，
+        # 零额外 LLM/向量成本，串行等待可接受。
+        try:
+            related_memory_ids = (
+                memory_result.get("memory_ids")
+                if isinstance(memory_result, dict)
+                else None
+            )
+            cognitive_text = await build_cognitive_text(user_message, related_memory_ids)
+        except Exception as exc:
+            print(f"⚠️ 认知注入构建失败: {exc}")
+            cognitive_text = ""
 
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
         db_last = db_msgs[-1] if db_msgs else None

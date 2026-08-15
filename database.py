@@ -5440,7 +5440,40 @@ def is_cognitive_item_stale(item: dict, today: date = None) -> bool:
     return review_after <= (today or _local_today())
 
 
-def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
+def _cognitive_query_words(query: str) -> list:
+    """Extract meaningful 2+ char keywords from the user message for relevance.
+
+    优先用 jieba.analyse 提取关键词（生产环境），失败则退回正则取 2+ 字词。
+    """
+    query = str(query or "").strip()
+    if len(query) < 2:
+        return []
+    words = []
+    try:
+        raw = jieba.analyse.extract_tags(query, topK=8)
+        words = [str(w).strip() for w in raw if len(str(w).strip()) >= 2]
+    except Exception:
+        words = []
+    if not words:
+        words = list({w for w in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", query)})
+    return words[:8]
+
+
+def format_cognitive_items_for_prompt(items: list, today: date = None,
+                                      context: dict = None) -> str:
+    """Format active cognition for chat injection.
+
+    无 context（旧行为，完全兼容）：每格按"分层优先级 → 强化次数 → 新近度"排序，
+    取最多 COGNITIVE_PER_TYPE_LIMIT 张卡。
+
+    有 context（当前对话感知）：context = {"query": 用户消息,
+    "related_memory_ids": 当前检索到的记忆 ID 集合}。排序改为
+    "相关分 → 证据命中数 → 强化次数 → 置信度 → 分层 → 过期 → ID"：
+    - 相关分 = 证据关联命中（强信号，卡由哪些检索到的记忆总结而来）+ 关键词命中（弱）；
+    - 同分时逐级裁决，最后以 ID 兜底，保证完全确定、可复现；
+    - 相关才多给：相关分 > 0 的按序取前 COGNITIVE_PER_TYPE_LIMIT 张；
+      全部不相关时每格只保底 1 张最核心卡，避免冷场也不灌背景板。
+    """
     if not items:
         return ""
     type_labels = {
@@ -5458,19 +5491,62 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
             continue
         by_type.setdefault(cognitive_type, []).append(item)
 
-    # 每格内按“分层优先级 → 强化次数 → 新近度”排序，取最多 COGNITIVE_PER_TYPE_LIMIT 张卡。
-    # 只限制卡片数量，不截断任何单卡内容。
-    def sort_key(item):
-        level = item.get("level", "explicit")
-        return (
-            COGNITIVE_LEVEL_RANK.get(level, COGNITIVE_LEVEL_RANK["explicit"]),
-            -int(item.get("times_derived") or 1),
-            -int(item.get("id") or 0),
-        )
+    related_ids = set()
+    query_words = []
+    if context:
+        raw_ids = context.get("related_memory_ids") or []
+        related_ids = {int(mid) for mid in raw_ids if mid is not None}
+        query_words = _cognitive_query_words(context.get("query") or "")
+
+    def relevance(item):
+        """0..N 相关分：证据关联为主，关键词命中为辅。"""
+        hits = 0
+        score = 0.0
+        if related_ids:
+            ev = set(item.get("evidence_memory_ids") or [])
+            hits = len(ev & related_ids)
+            if hits:
+                score += 1.0 + 0.4 * hits
+        if query_words:
+            content = str(item.get("content") or "")
+            hit = sum(1 for word in query_words if word in content)
+            if hit:
+                score += 0.3 * (hit / len(query_words))
+        return score, hits
+
+    if context:
+        def sort_key(item):
+            rel, hits = relevance(item)
+            level = item.get("level", "explicit")
+            return (
+                -rel, -hits,
+                -int(item.get("times_derived") or 1),
+                -float(item.get("confidence") or 0),
+                COGNITIVE_LEVEL_RANK.get(level, COGNITIVE_LEVEL_RANK["explicit"]),
+                is_cognitive_item_stale(item, today=today),
+                -int(item.get("id") or 0),
+            )
+
+        def pick(pool):
+            ranked = sorted(pool, key=sort_key)
+            relevant = [item for item in ranked if relevance(item)[0] > 0]
+            selected = relevant[:COGNITIVE_PER_TYPE_LIMIT]
+            return selected or ranked[:1]  # 全不相关 → 保底 1 张最核心卡
+    else:
+        def sort_key(item):
+            level = item.get("level", "explicit")
+            return (
+                COGNITIVE_LEVEL_RANK.get(level, COGNITIVE_LEVEL_RANK["explicit"]),
+                -int(item.get("times_derived") or 1),
+                -int(item.get("id") or 0),
+            )
+
+        def pick(pool):
+            return sorted(pool, key=sort_key)[:COGNITIVE_PER_TYPE_LIMIT]
 
     sections = []
     for cognitive_type in COGNITIVE_TYPE_ORDER:
-        selected = sorted(by_type.get(cognitive_type, []), key=sort_key)[:COGNITIVE_PER_TYPE_LIMIT]
+        selected = pick(by_type.get(cognitive_type, []))
         if not selected:
             continue
         lines = []
@@ -5480,6 +5556,9 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
             except (TypeError, ValueError):
                 confidence = 0.7
             level_label = COGNITIVE_LEVEL_LABELS.get(item.get("level", "explicit"), "明确陈述")
+            tag = ""
+            if context:
+                tag = "（与当前话题相关）" if relevance(item)[0] > 0 else "（长期核心，保留参考）"
             stale = ""
             if is_cognitive_item_stale(item, today=today):
                 stale = "（可能过时，只能作为背景）"
@@ -5487,17 +5566,24 @@ def format_cognitive_items_for_prompt(items: list, today: date = None) -> str:
                 stale = "（当前状态）"
             lines.append(
                 f"- [{level_label}·置信度{confidence:.2f}] "
-                f"{str(item.get('content', '')).strip()}{stale}"
+                f"{str(item.get('content', '')).strip()}{tag}{stale}"
             )
         sections.append(f"【{type_labels[cognitive_type]}】\n" + "\n".join(lines))
     if not sections:
         return ""
-    return "【三元一场认知模型】\n" + "\n\n".join(sections) + (
+    header = "【三元一场认知模型（按当前话题筛选，仅供参考）】" if context else "【三元一场认知模型】"
+    usage = (
         "\n\n使用规则：当前用户消息，以及其中更明确、更新的日期或状态，始终优先于以上认知；"
         "置信度较低的内容只能保守参考；标记为“可能过时”的认知只能作为背景，不得当作当前事实；"
         "“明确陈述”优先于“演绎推断”，“归纳推断”仅为倾向；"
         "自然体现相关认知，不要向用户展示内部字段。"
     )
+    if context:
+        usage += (
+            "\n以下认知按与本次话题的相关度筛选注入：与当前话题关联的认知优先，"
+            "无关联时仅保留长期核心作参考。"
+        )
+    return header + "\n" + "\n\n".join(sections) + usage
 
 
 async def list_cognitive_items(active_only: bool = False):
