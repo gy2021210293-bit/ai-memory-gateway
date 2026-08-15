@@ -3116,6 +3116,70 @@ async def cleanup_old_fragments(days: int = 30):
         return deleted
 
 
+async def cleanup_low_importance_fragments(days: int = 14, max_importance: int = 3, dry_run: bool = False) -> int:
+    """清理指定天数前、重要度低且仍活跃的原始碎片（layer=1）。
+
+    只清理满足以下条件的记忆：
+    - layer = 1（原始碎片）
+    - is_active = TRUE（尚未被整理合并，仍占用召回/展示空间）
+    - importance <= max_importance（低评分，默认1-3）
+    - created_at 在 days 天之前（默认14天）
+
+    dry_run=True 时只统计不删除，方便前端先展示数量让用户确认。
+
+    Returns:
+        将删除/已删除的记忆数量
+    """
+    from datetime import datetime, timedelta
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        cutoff_date = datetime.now() - timedelta(days=days)
+
+        count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories
+            WHERE layer = 1
+              AND is_active = TRUE
+              AND importance <= $1
+              AND created_at < $2
+        """, max_importance, cutoff_date)
+
+        if dry_run or count == 0:
+            return count
+
+        async with conn.transaction():
+            # 先撤销实体证据计数（与 delete_memory 一致，避免实体证据数虚高）
+            rows = await conn.fetch("""
+                SELECT entity_id, COUNT(DISTINCT memory_id)::INTEGER AS removed
+                FROM memory_entities
+                WHERE source <> 'inherited'
+                  AND memory_id IN (
+                      SELECT id FROM memories
+                      WHERE layer = 1
+                        AND is_active = TRUE
+                        AND importance <= $1
+                        AND created_at < $2
+                  )
+                GROUP BY entity_id
+            """, max_importance, cutoff_date)
+            for row in rows:
+                await conn.execute("""
+                    UPDATE entities
+                    SET evidence_count = GREATEST(0, evidence_count - $3), updated_at = NOW()
+                    WHERE id = $1
+                """, row["entity_id"], row["removed"])
+            # memory_entities / memory_evidence 均为 ON DELETE CASCADE，随主表删除自动清理
+            await conn.execute("""
+                DELETE FROM memories
+                WHERE layer = 1
+                  AND is_active = TRUE
+                  AND importance <= $1
+                  AND created_at < $2
+            """, max_importance, cutoff_date)
+
+        return count
+
+
 async def revert_merge(memory_id: int):
     """撤回合并操作
     

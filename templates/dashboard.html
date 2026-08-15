@@ -140,6 +140,14 @@
                     </div>
                 </div>
 
+                <!-- 清理低评分活跃碎片 -->
+                <div class="card" style="margin-top: 16px; padding: 16px;">
+                    <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                        <span style="color: var(--text-light); font-size: 14px;">清理14天前、重要度≤3的活跃碎片（尚未整理的低价值琐事）：</span>
+                        <button class="btn btn-cleanup" onclick="cleanupLowImportanceFragments()">清理</button>
+                    </div>
+                </div>
+
                 <!-- 记忆向量补算 -->
                 <div class="card" style="margin-top: 16px; padding: 16px;">
                     <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">

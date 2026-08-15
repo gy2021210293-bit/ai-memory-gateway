@@ -219,6 +219,56 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deleted, 1)
         self.assertFalse(any("UPDATE entities" in sql for sql, _args in conn.execute_calls))
 
+    async def test_low_importance_cleanup_dry_run_only_counts(self):
+        class DryRunConnection:
+            def transaction(self):
+                return AsyncContext()
+
+            async def fetchval(self, _sql, *_args):
+                return 3
+
+            async def fetch(self, _sql, *_args):
+                return []
+
+            async def execute(self, sql, *args):
+                raise AssertionError(f"dry_run 不应执行写入: {sql}")
+
+        conn = DryRunConnection()
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            deleted = await database.cleanup_low_importance_fragments(14, 3, dry_run=True)
+        self.assertEqual(deleted, 3)
+
+    async def test_low_importance_cleanup_decrements_evidence_and_deletes(self):
+        class LowImportanceConnection:
+            def __init__(self):
+                self.execute_calls = []
+
+            def transaction(self):
+                return AsyncContext()
+
+            async def fetchval(self, _sql, *_args):
+                return 2
+
+            async def fetch(self, _sql, *_args):
+                return [{"entity_id": 7, "removed": 1}]
+
+            async def execute(self, sql, *args):
+                self.execute_calls.append((sql, args))
+                return "DELETE 2" if "DELETE FROM memories" in sql else "UPDATE 1"
+
+        conn = LowImportanceConnection()
+        with patch.object(database, "get_pool", AsyncMock(return_value=FakePool(conn))):
+            deleted = await database.cleanup_low_importance_fragments(14, 3)
+        self.assertEqual(deleted, 2)
+        self.assertTrue(any(
+            "evidence_count = GREATEST(0, evidence_count - $3)" in sql
+            for sql, _args in conn.execute_calls
+        ))
+        self.assertTrue(any(
+            "DELETE FROM memories" in sql and "is_active = TRUE" in sql
+            for sql, _args in conn.execute_calls
+        ))
+
     async def test_status_override_validation_and_readback(self):
         self.assertIn("error", await database.set_entity_status(7, "invalid"))
         conn = DeleteConnection()

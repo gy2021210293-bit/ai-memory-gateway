@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, cleanup_low_importance_fragments, revert_merge
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
@@ -4561,6 +4561,36 @@ async def api_cleanup_fragments(request: Request):
     try:
         deleted = await cleanup_old_fragments(days)
         return {"status": "ok", "deleted": deleted, "days": days}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/memories/cleanup-low-fragments")
+async def api_cleanup_low_importance_fragments(request: Request):
+    """清理指定天数前、重要度低的活跃碎片（layer=1, is_active=TRUE）
+
+    Body:
+        days: 多少天之前（默认14）
+        max_importance: 重要度上限（默认3，即1-3低评分）
+        dry_run: 仅统计不删除（默认false），用于前端先展示数量再确认
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    data = await request.json()
+    days = int(data.get("days", 14))
+    max_importance = int(data.get("max_importance", 3))
+    dry_run = bool(data.get("dry_run", False))
+    
+    try:
+        deleted = await cleanup_low_importance_fragments(days, max_importance, dry_run)
+        return {
+            "status": "ok",
+            "deleted": deleted,
+            "days": days,
+            "max_importance": max_importance,
+            "dry_run": dry_run,
+        }
     except Exception as e:
         return {"error": str(e)}
 

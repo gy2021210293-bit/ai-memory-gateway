@@ -2711,6 +2711,48 @@ async function cleanupOldFragments() {
 }
 
 // ============================================
+// 清理14天前低评分活跃碎片
+// ============================================
+async function cleanupLowImportanceFragments() {
+    const body = {days: 14, max_importance: 3};
+    showManageMsg('info', '正在统计可清理的碎片...');
+    try {
+        // 先 dry-run 统计数量，让用户确认后再真正删除
+        const previewResp = await fetch('/api/memories/cleanup-low-fragments', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({...body, dry_run: true})
+        });
+        const preview = await previewResp.json();
+        if (preview.error) {
+            showManageMsg('error', '❌ ' + preview.error);
+            return;
+        }
+        if (preview.deleted === 0) {
+            showManageMsg('info', '📝 没有14天前重要度≤3的活跃碎片需要清理');
+            return;
+        }
+        if (!confirm('将永久删除 ' + preview.deleted + ' 条14天前、重要度≤3的活跃碎片（尚未整理合并的低价值琐事）。此操作不可撤销，确定？')) return;
+
+        showManageMsg('info', '正在清理...');
+        const resp = await fetch('/api/memories/cleanup-low-fragments', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            showManageMsg('success', '✅ 已清理 ' + data.deleted + ' 条低评分活跃碎片');
+            loadMemories();
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+// ============================================
 // 导入功能
 // ============================================
 async function doTextImport() {
