@@ -1304,6 +1304,9 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
             "edit": "人工修正",
             "delete": "人工删除",
             "reject": "人工拒绝",
+            "auto_create": "自动应用·新建",
+            "auto_reinforce": "自动应用·强化",
+            "auto_supersede": "自动应用·取代",
         }
         for rev in revisions:
             rev_action = rev.get("action")
@@ -1332,7 +1335,7 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 证据记忆：
 {chr(10).join(evidence_lines)}
 
-人工近期确认/修正记录（这些是人类做出的决策：被确认的认知更可信；被人工删除或拒绝的内容不要重新提出；被修正的认知以修正后版本为准）：
+人工近期确认/修正记录（这些是人类做出的决策：被确认的认知更可信；被人工删除或拒绝的内容不要重新提出；被修正的认知以修正后版本为准；带“自动应用”前缀的是系统半自动写入的记录，可信度低于人工确认，仍需人工复核）：
 {chr(10).join(revision_lines) or '无'}
 
 只允许在以下三个区块内生成候选（每个区块内的卡还要区分稳定度：stable=长期不变，current=近期/待办、需 review_after）：

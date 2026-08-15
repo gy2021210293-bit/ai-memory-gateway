@@ -458,7 +458,8 @@ class _FakeSaveConnection:
                 "id": 99, "subject": args[0], "cognitive_type": args[1],
                 "content": args[2], "confidence": args[3],
                 "evidence_memory_ids": args[4], "review_after": args[5],
-                "status": "active", "created_by": "manual",
+                "status": "active",
+                "created_by": args[9] if len(args) > 9 else "manual",
                 "level": args[6], "times_derived": args[7], "supersedes": args[8],
                 "superseded_by": None,
             }
@@ -737,6 +738,182 @@ class CognitiveEvidenceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(database, "get_gateway_config",
                          new=AsyncMock(return_value="0")):
             self.assertEqual(await database.advance_cognitive_draft_cursor([]), 0)
+
+
+class _FakePendingConnection:
+    """Fake conn for cognitive_pending queue flows.
+
+    claim_row: row returned by the atomic claim UPDATE ... RETURNING *;
+    fetch_rows: rows returned by list_cognitive_pending / get_cognitive_item.
+    """
+
+    def __init__(self, claim_row=None, fetch_rows=None):
+        self.claim_row = claim_row
+        self.fetch_rows = fetch_rows or []
+        self.executions = []
+
+    def transaction(self):
+        return _FakeTransaction()
+
+    async def fetch(self, _query, *_args):
+        return self.fetch_rows
+
+    async def fetchrow(self, query, *_args):
+        normalized = " ".join(query.split())
+        if normalized.startswith("INSERT INTO cognitive_pending"):
+            return {"id": 77}
+        if "UPDATE cognitive_pending SET status = 'accepted'" in normalized:
+            return dict(self.claim_row) if self.claim_row else None
+        if "UPDATE cognitive_pending SET status = 'rejected'" in normalized:
+            if self.claim_row:
+                return {
+                    "subject": self.claim_row["subject"],
+                    "cognitive_type": self.claim_row["cognitive_type"],
+                    "content": self.claim_row["content"],
+                }
+            return None
+        if normalized.startswith("SELECT id, subject, cognitive_type, content, confidence"):
+            return dict(self.claim_row) if self.claim_row else None
+        return None
+
+    async def execute(self, query, *args):
+        self.executions.append((" ".join(query.split()), args))
+        return "UPDATE 1"
+
+
+def _pending_row(action="create", target_id=None, confidence=0.6, level="inductive"):
+    return {
+        "id": 7, "subject": "user", "cognitive_type": "user_core",
+        "content": "低置信度的候选认知", "confidence": confidence,
+        "level": level, "action": action, "target_id": target_id,
+        "evidence_memory_ids": [12], "review_after": None,
+        "source": "auto", "status": "pending",
+    }
+
+
+class CognitivePendingQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_persists_normalized_candidate(self):
+        conn = _FakePendingConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            pending_id = await database.queue_cognitive_pending({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "待确认候选", "level": "inductive",
+                "confidence": 0.5, "evidence_memory_ids": [12],
+                "action": "create",
+            })
+        self.assertEqual(pending_id, 77)
+
+    async def test_list_returns_pending_rows(self):
+        conn = _FakePendingConnection(fetch_rows=[_pending_row()])
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            items = await database.list_cognitive_pending()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], 7)
+
+    async def test_accept_applies_as_manual_and_marks_accepted(self):
+        conn = _FakePendingConnection(claim_row=_pending_row())
+        save_mock = AsyncMock(return_value={"status": "ok", "item": {"id": 99}})
+        with (
+            patch.object(database, "get_pool", return_value=_FakePool(conn)),
+            patch.object(database, "save_cognitive_item", new=save_mock),
+        ):
+            result = await database.accept_cognitive_pending(7)
+        self.assertEqual(result["status"], "ok")
+        save_mock.assert_awaited_once()
+        self.assertEqual(save_mock.await_args.kwargs["created_by"], "manual")
+        payload = save_mock.await_args.args[0]
+        self.assertEqual(payload["action"], "create")
+
+    async def test_accept_conflict_requires_resolve(self):
+        conn = _FakePendingConnection(claim_row=_pending_row(action="conflict", target_id=5))
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.accept_cognitive_pending(7)
+        self.assertIn("error", result)
+        self.assertIn("supersede", result["error"])
+        # 裁决参数非法 → 退回 pending
+        self.assertTrue(any(
+            "SET status = 'pending'" in query for query, _args in conn.executions
+        ))
+
+    async def test_accept_conflict_keep_rejects_and_records(self):
+        conn = _FakePendingConnection(claim_row=_pending_row(action="conflict", target_id=5))
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.accept_cognitive_pending(7, resolve="keep")
+        self.assertEqual(result["decision"], "kept_old")
+        revisions = [
+            args for query, args in conn.executions
+            if query.startswith("INSERT INTO cognitive_revision_log")
+        ]
+        self.assertEqual(revisions[0][3], "reject")
+
+    async def test_accept_conflict_supersede_routes_action(self):
+        conn = _FakePendingConnection(claim_row=_pending_row(action="conflict", target_id=5))
+        save_mock = AsyncMock(return_value={"status": "ok", "item": {"id": 99}})
+        with (
+            patch.object(database, "get_pool", return_value=_FakePool(conn)),
+            patch.object(database, "save_cognitive_item", new=save_mock),
+        ):
+            result = await database.accept_cognitive_pending(7, resolve="supersede")
+        self.assertEqual(result["status"], "ok")
+        payload = save_mock.await_args.args[0]
+        self.assertEqual(payload["action"], "supersede")
+        self.assertEqual(payload["target_id"], 5)
+
+    async def test_accept_apply_failure_reverts_to_pending(self):
+        conn = _FakePendingConnection(claim_row=_pending_row())
+        save_mock = AsyncMock(return_value={"error": "该区块已存在相同内容的认知"})
+        with (
+            patch.object(database, "get_pool", return_value=_FakePool(conn)),
+            patch.object(database, "save_cognitive_item", new=save_mock),
+        ):
+            result = await database.accept_cognitive_pending(7)
+        self.assertIn("error", result)
+        self.assertTrue(any(
+            "SET status = 'pending'" in query for query, _args in conn.executions
+        ))
+
+    async def test_reject_records_rejection_and_marks_decided(self):
+        conn = _FakePendingConnection(claim_row=_pending_row())
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.reject_cognitive_pending(7)
+        self.assertEqual(result["status"], "ok")
+        revisions = [
+            args for query, args in conn.executions
+            if query.startswith("INSERT INTO cognitive_revision_log")
+        ]
+        self.assertEqual(revisions[0][3], "reject")
+        self.assertEqual(revisions[0][4], "低置信度的候选认知")
+
+    async def test_reject_missing_returns_error(self):
+        conn = _FakePendingConnection(claim_row=None)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.reject_cognitive_pending(999)
+        self.assertIn("error", result)
+
+    async def test_auto_save_records_auto_create_revision(self):
+        conn = _FakeSaveConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "自动应用的新卡", "level": "explicit",
+                "confidence": 0.85, "evidence_memory_ids": [2, 3],
+            }, created_by="auto")
+        self.assertEqual(result["item"]["created_by"], "auto")
+        self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["auto_create"])
+
+    def revision_inserts(self, conn):
+        return [
+            args for query, args in conn.executions
+            if query.startswith("INSERT INTO cognitive_revision_log")
+        ]
+
+    async def test_get_cognitive_item_returns_row(self):
+        row = {"id": 5, "created_by": "auto", "subject": "user",
+               "cognitive_type": "user_core", "content": "x"}
+        conn = _FakePendingConnection(claim_row=row)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            item = await database.get_cognitive_item(5)
+        self.assertEqual(item["created_by"], "auto")
 
 
 if __name__ == "__main__":

@@ -631,11 +631,18 @@
                 </div>
                 <div class="card">
                     <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
-                        <span class="section-desc">综合最多60条高信号记忆与20条最新记忆，一次提出新建 / 强化 / 取代的原子认知卡；不会自动保存。</span>
+                        <span class="section-desc">综合最多60条高信号记忆与20条最新记忆，一次提出新建 / 强化 / 取代的原子认知卡；手动模式不会自动保存，自动模式安全项直接应用、拿不准的挂起待确认。</span>
                         <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft()">重新审视认知</button>
                     </div>
                     <div id="cognition-status" class="section-desc" style="margin-top:10px"></div>
                     <div id="cognition-draft-list" style="display:none;margin-top:16px"></div>
+                </div>
+                <div class="card" id="cognition-pending-card" style="display:none;margin-top:16px">
+                    <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
+                        <h4 style="margin:0">待确认的自动候选</h4>
+                        <span class="section-desc">自动审视生成的拿不准候选：低置信度 / 取代人工确认过的卡 / 冲突，等你裁决。</span>
+                    </div>
+                    <div id="cognition-pending-list" style="margin-top:12px"></div>
                 </div>
                 <div class="card" id="cognition-editor" style="display:none">
                     <input id="cognition-subject" type="hidden">
@@ -738,6 +745,19 @@
                         <label>提取间隔轮数 (MEMORY_EXTRACT_INTERVAL)</label>
                         <input type="number" id="set-MEMORY_EXTRACT_INTERVAL" class="input" min="0" max="20">
                         <small class="form-hint">0=关闭提取，1=每轮，N=每N轮</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>认知模型自动审视 (COGNITIVE_AUTO_MODE)</label>
+                        <select id="set-COGNITIVE_AUTO_MODE" class="input">
+                            <option value="manual">手动（现状，草稿需逐条确认）</option>
+                            <option value="auto">自动应用（安全项直接应用，拿不准的挂起待确认）</option>
+                        </select>
+                        <small class="form-hint">自动模式：reinforce 全部应用；高置信度明确/演绎新建自动保存；取代只动自动建的卡；低置信度、归纳推断、取代人工确认的卡、冲突 → 挂起待确认</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>自动审视间隔小时 (COGNITIVE_AUTO_INTERVAL_HOURS)</label>
+                        <input type="number" id="set-COGNITIVE_AUTO_INTERVAL_HOURS" class="input" min="1" max="168">
+                        <small class="form-hint">仅自动模式生效；书签之后无新记忆时不调用模型，零成本</small>
                     </div>
                 </div>
 
@@ -873,6 +893,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=7.3"></script>
+    <script src="/static/js/dashboard.js?v=7.5"></script>
 </body>
 </html>

@@ -33,7 +33,7 @@ from database import init_tables, close_pool, search_memories, save_memory, get_
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
-from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
@@ -86,6 +86,11 @@ MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
+
+# 认知模型自动审视（半自动分级：安全项自动应用，拿不准的挂起待确认）
+COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | auto
+COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "6"))  # 每轮间隔（小时）
+AUTO_COGNITIVE_CREATE_CONFIDENCE = 0.7  # create 自动应用的置信度门槛（低于此值挂起待确认）
 
 # 特征定时重确认（P3 后台任务）
 TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
@@ -343,12 +348,23 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"⚠️ 实体关系发现启动失败: {exc}")
 
+    # 认知模型自动审视（后台调度；模式在面板热切换，循环常驻）
+    cognitive_auto_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            cognitive_auto_task = asyncio.create_task(_cognitive_auto_loop())
+            print(f"🧠 认知自动审视已启动（间隔 {COGNITIVE_AUTO_INTERVAL_HOURS}h，模式 {COGNITIVE_AUTO_MODE}）")
+        except Exception as exc:
+            print(f"⚠️ 认知自动审视启动失败: {exc}")
+
     yield
 
     if trait_timer_task is not None:
         trait_timer_task.cancel()
     if relation_timer_task is not None:
         relation_timer_task.cancel()
+    if cognitive_auto_task is not None:
+        cognitive_auto_task.cancel()
     await close_pool()
 
 
@@ -2934,23 +2950,22 @@ async def api_get_cognitive_items():
     return {"items": await list_cognitive_items(active_only=True)}
 
 
-@app.post("/api/cognitive-items/draft")
-async def api_generate_cognitive_draft():
-    """Review cognitive sections without persisting any candidate.
+async def _build_cognitive_draft() -> dict:
+    """共享草稿管线：手动按钮与自动审视循环共用。
 
-    Incremental: only new memories since the last successful draft (cursor) are
-    read as evidence. The cursor advances only after generation succeeds, so a
-    failed run never skips a batch.
+    只读书签之后的新记忆；草稿生成成功才推进书签（失败不丢批）。
+    返回 {"ok": True, "items": [...], "memories": [...], "cursor": int, "model": str}
+    或 {"ok": False, "error": str}。
     """
     allowed_rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES
     memories = await get_memories_for_cognitive_draft(80)
     if not memories:
-        return JSONResponse(status_code=400, content={"error": "没有新的记忆可审视（自上次草稿后无新增）"})
+        return {"ok": False, "error": "没有新的记忆可审视（自上次草稿后无新增）"}
     current_items = await list_cognitive_items(active_only=True)
     revisions = await get_recent_cognitive_revisions(30)
     raw_draft = await generate_cognitive_draft(memories, current_items, revisions)
     if raw_draft is None:
-        return JSONResponse(status_code=502, content={"error": "认知草稿模型调用失败，现有认知未改变"})
+        return {"ok": False, "error": "认知草稿模型调用失败，现有认知未改变"}
     # 生成成功才推进书签：这批记忆已展示过，下次只看更新的；失败则保持原位。
     cursor = await advance_cognitive_draft_cursor([m["id"] for m in memories])
     allowed_memory_ids = {int(memory["id"]) for memory in memories}
@@ -3010,8 +3025,154 @@ async def api_generate_cognitive_draft():
         draft.append(item)
         if len(draft) >= COGNITIVE_DRAFT_TOTAL_LIMIT:
             break
-    return {"status": "draft", "items": draft, "model": _memory_extractor_module.MEMORY_MODEL,
-            "evidence_count": len(memories), "new_count": len(memories), "cursor": cursor}
+    return {"ok": True, "items": draft, "memories": memories,
+            "cursor": cursor, "model": _memory_extractor_module.MEMORY_MODEL}
+
+
+@app.post("/api/cognitive-items/draft")
+async def api_generate_cognitive_draft():
+    """Review cognitive sections without persisting any candidate.
+
+    Incremental: only new memories since the last successful draft (cursor) are
+    read as evidence. The cursor advances only after generation succeeds, so a
+    failed run never skips a batch. Shared pipeline with the auto-review loop.
+    """
+    result = await _build_cognitive_draft()
+    if not result["ok"]:
+        status_code = 400 if "没有新的记忆" in result["error"] else 502
+        return JSONResponse(status_code=status_code, content={"error": result["error"]})
+    return {"status": "draft", "items": result["items"], "model": result["model"],
+            "evidence_count": len(result["memories"]), "new_count": len(result["memories"]),
+            "cursor": result["cursor"]}
+
+
+# ============================================================
+# 认知模型自动审视（半自动分级）：后台调度 + 待确认队列
+# ============================================================
+_cognitive_draft_lock = asyncio.Lock()
+
+
+async def _auto_apply_or_queue_candidate(item: dict) -> str:
+    """半自动分级决策：安全项自动应用，拿不准的挂起待确认。
+
+    返回 'applied' / 'queued' / 'skipped'。
+    - reinforce：非破坏性，全部自动应用；内容不匹配等异常跳过（不占队列）。
+    - supersede：仅当被取代的卡本身是自动建的且置信度达标才自动；否则挂起。
+    - conflict：永远挂起，等人工裁决。
+    - create：置信度 >= AUTO_COGNITIVE_CREATE_CONFIDENCE 且非归纳推断才自动；否则挂起。
+    """
+    action = item["action"]
+    if action == "reinforce":
+        try:
+            result = await save_cognitive_item(item, created_by="auto")
+        except Exception:
+            return "skipped"
+        return "applied" if not result.get("error") else "skipped"
+    if action == "supersede":
+        target = None
+        try:
+            target = await get_cognitive_item(item["target_id"])
+        except Exception:
+            target = None
+        if (target is not None and target.get("created_by") == "auto"
+                and float(item.get("confidence") or 0) >= AUTO_COGNITIVE_CREATE_CONFIDENCE):
+            try:
+                result = await save_cognitive_item(item, created_by="auto")
+            except Exception:
+                return "queued"
+            return "applied" if not result.get("error") else "queued"
+        return "queued"
+    if action == "conflict":
+        return "queued"
+    # create
+    if (float(item.get("confidence") or 0) >= AUTO_COGNITIVE_CREATE_CONFIDENCE
+            and item.get("level") != "inductive"):
+        try:
+            result = await save_cognitive_item(item, created_by="auto")
+        except Exception:
+            return "queued"
+        return "applied" if not result.get("error") else "queued"
+    return "queued"
+
+
+async def run_cognitive_auto_review_once() -> dict:
+    """一轮认知自动审视（后台调度调用；只建议自动应用，从不覆盖人工决策）。
+
+    - 模式须为 auto（gateway_config 热切换，无需重启）；
+    - 与手动生成草稿共用 _cognitive_draft_lock，避免并发重复调模型；
+    - 有书签之后的新记忆才生成（零新记忆 = 零 LLM 成本）；
+    - 安全项自动应用，其余落 cognitive_pending 待人工确认。
+    """
+    mode = str(await get_gateway_config("COGNITIVE_AUTO_MODE", COGNITIVE_AUTO_MODE) or COGNITIVE_AUTO_MODE).strip().lower()
+    if mode != "auto":
+        return {"status": "disabled", "mode": mode}
+    if _cognitive_draft_lock.locked():
+        return {"status": "already_running"}
+    async with _cognitive_draft_lock:
+        result = await _build_cognitive_draft()
+        if not result["ok"]:
+            return {"status": "noop", "reason": result["error"]}
+        applied = queued = skipped = 0
+        for item in result["items"]:
+            outcome = await _auto_apply_or_queue_candidate(item)
+            if outcome == "applied":
+                applied += 1
+            elif outcome == "queued":
+                try:
+                    await queue_cognitive_pending(item)
+                except Exception as exc:
+                    print(f"⚠️ 认知候选落库失败: {exc}")
+                    skipped += 1
+                    continue
+                queued += 1
+            else:
+                skipped += 1
+        print(f"🧠 认知自动审视: 草稿 {len(result['items'])} · 自动应用 {applied} · 待确认 {queued} · 跳过 {skipped}")
+        return {"status": "ok", "draft": len(result["items"]),
+                "applied": applied, "queued": queued, "skipped": skipped}
+
+
+async def _cognitive_auto_loop():
+    """Background scheduler: 半自动分级认知审视。模式在面板热切换，循环常驻。"""
+    while True:
+        try:
+            await asyncio.sleep(COGNITIVE_AUTO_INTERVAL_HOURS * 3600)
+            await run_cognitive_auto_review_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 认知自动审视任务异常: {exc}")
+
+
+@app.get("/api/cognitive-items/pending")
+async def api_list_cognitive_pending(limit: int = 50):
+    """自动审视产生的待人工确认候选。"""
+    return {"items": await list_cognitive_pending(limit)}
+
+
+@app.post("/api/cognitive-items/pending/{pending_id}/accept")
+async def api_accept_cognitive_pending(pending_id: int, request: Request):
+    """确认一条待确认候选；conflict 项需带 resolve=supersede/create/keep。"""
+    resolve = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            resolve = str(body.get("resolve", "")).strip() or None
+    except Exception:
+        resolve = None
+    result = await accept_cognitive_pending(pending_id, resolve)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/cognitive-items/pending/{pending_id}/reject")
+async def api_reject_cognitive_pending(pending_id: int):
+    """拒绝一条待确认候选（拒绝记录回喂模型，避免重复提出）。"""
+    result = await reject_cognitive_pending(pending_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
 
 
 @app.get("/api/cognitive-items/revisions")
@@ -5267,6 +5428,10 @@ async def get_settings():
             "MIN_SCORE_THRESHOLD":     float(db.get("MIN_SCORE_THRESHOLD") or _db_module.MIN_SCORE_THRESHOLD),
             "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
 
+            # 认知模型自动审视
+            "COGNITIVE_AUTO_MODE": db.get("COGNITIVE_AUTO_MODE") or COGNITIVE_AUTO_MODE,
+            "COGNITIVE_AUTO_INTERVAL_HOURS": int(db.get("COGNITIVE_AUTO_INTERVAL_HOURS") or COGNITIVE_AUTO_INTERVAL_HOURS),
+
             # 缓存分区
             "CACHE_PARTITION_ENABLED": _parse_bool(db.get("CACHE_PARTITION_ENABLED"), CACHE_PARTITION_ENABLED),
             "CACHE_PARTITION_X":       int(db.get("CACHE_PARTITION_X") or CACHE_PARTITION_X),
@@ -5322,6 +5487,8 @@ async def save_settings(request: Request):
             "MEMORY_ENABLED":        lambda v: _parse_bool(v),
             "MAX_MEMORIES_INJECT":   int,
             "MEMORY_EXTRACT_INTERVAL": int,
+            "COGNITIVE_AUTO_MODE":       str,
+            "COGNITIVE_AUTO_INTERVAL_HOURS": int,
             "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_X":     int,
             "CACHE_PARTITION_TRIGGER": str,

@@ -1361,6 +1361,7 @@ async function backfillEntityTraits() {
 let cognitiveItems = [];
 let editingCognitiveId = null;
 let pendingCognitiveDrafts = [];
+let pendingCognitiveItems = [];
 let editingAction = 'create';
 let editingTargetId = null;
 let editingDraftIndex = null;
@@ -1413,14 +1414,21 @@ async function loadCognitiveItems() {
     renderCognitiveItems();
     status.textContent = '加载中…';
     try {
-        const response = await fetch('/api/cognitive-items');
-        const data = await response.json();
-        if (!response.ok || data.error) throw new Error(data.error || '加载失败');
-        cognitiveItems = data.items || [];
+        const [itemsResp, pendingResp] = await Promise.all([
+            fetch('/api/cognitive-items'),
+            fetch('/api/cognitive-items/pending'),
+        ]);
+        const itemsData = await itemsResp.json();
+        const pendingData = await pendingResp.json();
+        if (!itemsResp.ok || itemsData.error) throw new Error(itemsData.error || '加载失败');
+        cognitiveItems = itemsData.items || [];
+        pendingCognitiveItems = (pendingData.items || []).filter(item => item.status === 'pending');
         renderCognitiveItems();
+        renderCognitivePending();
         renderCognitiveRevisions();
         updateCognitiveDueBadge();
-        status.textContent = `${cognitiveItems.length} 条认知`;
+        status.textContent = `${cognitiveItems.length} 条认知` +
+            (pendingCognitiveItems.length ? `，${pendingCognitiveItems.length} 条待确认` : '');
     } catch (error) {
         status.textContent = error.message;
     }
@@ -1430,11 +1438,166 @@ function updateCognitiveDueBadge() {
     const badge = document.getElementById('cognition-due-badge');
     if (!badge) return;
     const due = cognitiveItems.filter(item => item.is_stale).length;
-    if (due > 0) {
-        badge.textContent = `待复核 ${due}`;
+    const parts = [];
+    if (pendingCognitiveItems.length > 0) parts.push(`待确认 ${pendingCognitiveItems.length}`);
+    if (due > 0) parts.push(`待复核 ${due}`);
+    if (parts.length > 0) {
+        badge.textContent = parts.join(' · ');
         badge.style.display = '';
     } else {
         badge.style.display = 'none';
+    }
+}
+
+function renderCognitivePending() {
+    const card = document.getElementById('cognition-pending-card');
+    const root = document.getElementById('cognition-pending-list');
+    if (!card || !root) return;
+    if (!pendingCognitiveItems.length) {
+        card.style.display = 'none';
+        root.replaceChildren();
+        return;
+    }
+    card.style.display = '';
+    root.replaceChildren();
+    pendingCognitiveItems.forEach((item, index) => {
+        const section = cognitionSection(item.cognitive_type);
+        if (!section) return;
+        const target = item.target_id != null
+            ? cognitiveItems.find(candidate => candidate.id === item.target_id)
+            : null;
+        const row = document.createElement('div');
+        row.className = 'memory-item';
+        row.style.marginTop = '10px';
+        const title = document.createElement('div');
+        title.className = 'cognition-draft-title';
+        const label = document.createElement('strong');
+        label.textContent = section.label;
+        const badge = document.createElement('span');
+        badge.className = `cognition-level level-${item.level || 'explicit'}`;
+        badge.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
+        const actionTag = document.createElement('span');
+        actionTag.className = 'cognition-action';
+        if (item.action === 'reinforce') {
+            actionTag.textContent = target ? `强化 #${target.id}` : '强化';
+        } else if (item.action === 'supersede') {
+            actionTag.textContent = target ? `取代 #${target.id}` : '取代';
+        } else if (item.action === 'conflict') {
+            actionTag.textContent = target ? `冲突 #${target.id}` : '冲突';
+        } else {
+            actionTag.textContent = '新建';
+        }
+        title.append(label, badge, actionTag);
+        row.appendChild(title);
+        if ((item.action === 'supersede' || item.action === 'conflict') && target) {
+            const diff = document.createElement('div');
+            diff.className = 'cognition-diff-grid';
+            diff.style.marginTop = '10px';
+            const oldPane = document.createElement('div');
+            oldPane.className = 'cognition-diff-pane';
+            const oldLabel = document.createElement('strong');
+            oldLabel.textContent = item.action === 'conflict' ? `现有认知 #${target.id}` : `当前版本 #${target.id}`;
+            const oldContent = document.createElement('div');
+            oldContent.className = 'cognition-content';
+            oldContent.textContent = target.content;
+            oldPane.append(oldLabel, oldContent);
+            const newPane = document.createElement('div');
+            newPane.className = 'cognition-diff-pane';
+            const newLabel = document.createElement('strong');
+            newLabel.textContent = item.action === 'conflict' ? '新证据' : '建议版本';
+            const newContent = document.createElement('div');
+            newContent.className = 'cognition-content';
+            newContent.textContent = item.content;
+            newPane.append(newLabel, newContent);
+            diff.append(oldPane, newPane);
+            row.appendChild(diff);
+        } else {
+            const content = document.createElement('div');
+            content.className = 'cognition-content';
+            content.textContent = item.content;
+            row.appendChild(content);
+        }
+        const evidence = document.createElement('div');
+        evidence.className = 'section-desc';
+        const reviewText = item.review_after ? ` · 下次复核：${item.review_after}` : '';
+        evidence.textContent = `置信度 ${Number(item.confidence).toFixed(2)} · 证据记忆：${(item.evidence_memory_ids || []).map(id => `#${id}`).join('、')}${reviewText}`;
+        row.appendChild(evidence);
+        const actions = document.createElement('div');
+        actions.className = 'toolbar';
+        actions.style.marginTop = '8px';
+        if (item.action === 'conflict' && target) {
+            const replace = document.createElement('button');
+            replace.className = 'btn btn-primary btn-sm';
+            replace.textContent = '用新证据取代';
+            replace.onclick = () => acceptCognitivePending(index, 'supersede');
+            const both = document.createElement('button');
+            both.className = 'btn btn-sm';
+            both.textContent = '都保留';
+            both.onclick = () => acceptCognitivePending(index, 'create');
+            const keep = document.createElement('button');
+            keep.className = 'btn btn-sm';
+            keep.textContent = '保留旧卡';
+            keep.onclick = () => acceptCognitivePending(index, 'keep');
+            actions.append(replace, both, keep);
+        } else {
+            const confirm = document.createElement('button');
+            confirm.className = 'btn btn-primary btn-sm';
+            confirm.textContent = '确认应用';
+            confirm.onclick = () => acceptCognitivePending(index, null);
+            const reject = document.createElement('button');
+            reject.className = 'btn btn-sm';
+            reject.textContent = '拒绝';
+            reject.onclick = () => rejectCognitivePendingItem(index);
+            actions.append(confirm, reject);
+        }
+        row.appendChild(actions);
+        root.appendChild(row);
+    });
+}
+
+async function acceptCognitivePending(index, resolve) {
+    const item = pendingCognitiveItems[index];
+    if (!item) return;
+    const status = document.getElementById('cognition-status');
+    const isConflict = item.action === 'conflict';
+    const confirmText = resolve === 'keep'
+        ? `保留现有认知 #${item.target_id}，拒绝这条新证据？`
+        : isConflict && resolve === 'supersede'
+            ? `用新证据取代现有认知 #${item.target_id}？`
+            : isConflict && resolve === 'create'
+                ? '新旧都保留（另建一张新卡）？'
+                : `确认应用这条自动候选？`;
+    if (!confirm(confirmText)) return;
+    try {
+        const response = await fetch(`/api/cognitive-items/pending/${item.id}/accept`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolve: resolve || '' }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        if (status) status.textContent = '已确认，待确认队列已更新。';
+        await loadCognitiveItems();
+    } catch (error) {
+        if (status) status.textContent = `确认失败：${error.message}`;
+    }
+}
+
+async function rejectCognitivePendingItem(index) {
+    const item = pendingCognitiveItems[index];
+    if (!item) return;
+    const status = document.getElementById('cognition-status');
+    if (!confirm('拒绝这条自动候选？拒绝记录会回喂模型，避免重复提出。')) return;
+    try {
+        const response = await fetch(`/api/cognitive-items/pending/${item.id}/reject`, {
+            method: 'POST',
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        if (status) status.textContent = '已拒绝。';
+        await loadCognitiveItems();
+    } catch (error) {
+        if (status) status.textContent = `拒绝失败：${error.message}`;
     }
 }
 
@@ -1910,13 +2073,14 @@ async function renderCognitiveRevisions() {
         }
         root.style.display = '';
         const heading = document.createElement('h3');
-        heading.textContent = '最近人工确认 / 修正记录（会作为证据回喂下次审视）';
+        heading.textContent = '最近确认 / 修正记录（人工决策会作为证据回喂下次审视，自动应用仅供参考）';
         root.appendChild(heading);
         const list = document.createElement('ul');
         list.className = 'cognition-revision-list';
         const actionLabels = {
             create: '确认·新建', reinforce: '确认·强化', supersede: '确认·取代',
             edit: '修正', delete: '删除', reject: '拒绝',
+            auto_create: '自动应用·新建', auto_reinforce: '自动应用·强化', auto_supersede: '自动应用·取代',
         };
         revisions.forEach(rev => {
             const row = document.createElement('li');
@@ -3894,8 +4058,8 @@ let _modelList = [];
 // 所有需要读写的字段 key（开源版：EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
 const _SETTINGS_FIELDS = {
     str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL',
-          'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT'],
-    int: ['MAX_MEMORIES_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'EMBEDDING_DIM'],
+          'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT', 'COGNITIVE_AUTO_MODE'],
+    int: ['MAX_MEMORIES_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'EMBEDDING_DIM', 'COGNITIVE_AUTO_INTERVAL_HOURS'],
     float: ['MIN_SCORE_THRESHOLD'],
     bool: ['MEMORY_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM'],
     range: ['MEMORY_HW_KEYWORD', 'MEMORY_HW_SEMANTIC', 'MEMORY_HW_IMPORTANCE',
@@ -3957,6 +4121,10 @@ async function loadSettings() {
         // REASONING_EFFORT 下拉
         const reEl = document.getElementById('set-REASONING_EFFORT');
         if (reEl) reEl.value = s.REASONING_EFFORT || '';
+
+        // COGNITIVE_AUTO_MODE 下拉
+        const camEl = document.getElementById('set-COGNITIVE_AUTO_MODE');
+        if (camEl) camEl.value = s.COGNITIVE_AUTO_MODE || 'manual';
 
         // CACHE_PARTITION_TRIGGER 下拉 + 联动时间窗口字段
         const triggerEl = document.getElementById('set-CACHE_PARTITION_TRIGGER');

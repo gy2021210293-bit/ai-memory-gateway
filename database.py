@@ -806,6 +806,31 @@ async def init_tables():
         await _migrate_cognitive_model_v3(conn)
         await _migrate_cognitive_model_v4(conn)
         await _migrate_cognitive_model_v5(conn)
+
+        # ---- 认知自动审视的待确认队列：模型自动生成的候选，等待人工确认 ----
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cognitive_pending (
+                id                  SERIAL PRIMARY KEY,
+                subject             TEXT NOT NULL,
+                cognitive_type      TEXT NOT NULL,
+                content             TEXT NOT NULL,
+                confidence          REAL NOT NULL DEFAULT 0.7,
+                level               TEXT NOT NULL DEFAULT 'explicit',
+                action              TEXT NOT NULL,
+                target_id           INTEGER DEFAULT NULL,
+                evidence_memory_ids INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+                review_after        DATE DEFAULT NULL,
+                source              TEXT NOT NULL DEFAULT 'auto',
+                status              TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK (status IN ('pending', 'accepted', 'rejected')),
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                decided_at          TIMESTAMPTZ DEFAULT NULL
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cognitive_pending_status
+            ON cognitive_pending (status, created_at);
+        """)
         
         # 尝试启用pgvector扩展（向量搜索）
         try:
@@ -5499,7 +5524,7 @@ async def list_cognitive_items(active_only: bool = False):
         return items
 
 
-async def save_cognitive_item(data: dict, item_id: int = None):
+async def save_cognitive_item(data: dict, item_id: int = None, created_by: str = "manual"):
     item = normalize_cognitive_item_input(data)
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -5553,7 +5578,8 @@ async def save_cognitive_item(data: dict, item_id: int = None):
                 """, target["id"])
                 await _record_cognitive_revision(
                     conn, card_id=target["id"], subject=target["subject"],
-                    cognitive_type=target["cognitive_type"], action="reinforce",
+                    cognitive_type=target["cognitive_type"],
+                    action=("auto_reinforce" if created_by == "auto" else "reinforce"),
                     content_before=target["content"], content_after=target["content"],
                     level_before=target["level"], level_after=target["level"],
                 )
@@ -5576,11 +5602,12 @@ async def save_cognitive_item(data: dict, item_id: int = None):
                         (subject, cognitive_type, content, confidence,
                          evidence_memory_ids, review_after, created_by,
                          level, times_derived, supersedes)
-                    VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7, $8, $9)
+                    VALUES ($1, $2, $3, $4, $5, $6, $10, $7, $8, $9)
                     RETURNING *
                 """, item["subject"], item["cognitive_type"], item["content"],
                      item["confidence"], evidence_ids, review_after,
-                     item["level"], carry, target["id"] if target else None)
+                     item["level"], carry, target["id"] if target else None,
+                     created_by)
                 if target:
                     await conn.execute("""
                         UPDATE cognitive_items
@@ -5588,6 +5615,8 @@ async def save_cognitive_item(data: dict, item_id: int = None):
                         WHERE id = $1
                     """, target["id"], row["id"])
                 log_action = "edit" if item_id is not None else ("supersede" if target else "create")
+                if created_by == "auto":
+                    log_action = f"auto_{log_action}"
                 await _record_cognitive_revision(
                     conn, card_id=row["id"], subject=row["subject"],
                     cognitive_type=row["cognitive_type"], action=log_action,
@@ -5639,6 +5668,131 @@ async def record_cognitive_rejection(subject: str, cognitive_type: str, content:
                 action="reject", content_before=content,
             )
     return {"status": "ok"}
+
+
+async def get_cognitive_item(item_id: int):
+    """One cognitive card row (used by the auto-review supersede guard)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, subject, cognitive_type, content, confidence, level,
+                   evidence_memory_ids, review_after, status, created_by,
+                   times_derived, supersedes, superseded_by
+            FROM cognitive_items
+            WHERE id = $1
+        """, item_id)
+    return dict(row) if row else None
+
+
+async def queue_cognitive_pending(item: dict, source: str = "auto") -> int:
+    """Persist one auto-generated candidate for human confirmation. Returns id."""
+    value = normalize_cognitive_item_input(item)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO cognitive_pending
+                (subject, cognitive_type, content, confidence, level, action,
+                 target_id, evidence_memory_ids, review_after, source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
+        """, value["subject"], value["cognitive_type"], value["content"],
+            value["confidence"], value["level"], value["action"],
+            value["target_id"], value["evidence_memory_ids"],
+            value["review_after"], source)
+    return row["id"]
+
+
+async def list_cognitive_pending(limit: int = 50) -> list:
+    """Undecided auto-generated candidates, oldest first (stable batch order)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, subject, cognitive_type, content, confidence, level,
+                   action, target_id, evidence_memory_ids, review_after,
+                   source, status, created_at
+            FROM cognitive_pending
+            WHERE status = 'pending'
+            ORDER BY id
+            LIMIT $1
+        """, max(1, int(limit)))
+    return [dict(r) for r in rows]
+
+
+async def accept_cognitive_pending(pending_id: int, resolve: str = None) -> dict:
+    """Human accepts a pending auto candidate.
+
+    create / reinforce / supersede 按存储的 action 应用；conflict 必须带 resolve：
+    'supersede'（用新证据取代旧卡）/ 'create'（都保留）/ 'keep'（保留旧卡=拒绝）。
+    应用走 save_cognitive_item(created_by='manual')，修订日志记人工决策；
+    应用失败退回 pending 便于修正重试。
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE cognitive_pending SET status = 'accepted', decided_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING *
+        """, pending_id)
+        if not row:
+            return {"error": "待确认项不存在或已处理"}
+        item = dict(row)
+        action = str(item["action"] or "").lower()
+        if action == "conflict":
+            resolve = str(resolve or "").strip().lower()
+            if resolve == "keep":
+                await conn.execute("""
+                    UPDATE cognitive_pending SET status = 'rejected', decided_at = NOW()
+                    WHERE id = $1
+                """, pending_id)
+                await _record_cognitive_revision(
+                    conn, card_id=None, subject=item["subject"],
+                    cognitive_type=item["cognitive_type"], action="reject",
+                    content_before=item["content"],
+                )
+                return {"status": "ok", "decision": "kept_old", "pending_id": pending_id}
+            if resolve == "supersede":
+                item["action"] = "supersede"
+            elif resolve == "create":
+                item["action"] = "create"
+                item["target_id"] = None
+            else:
+                await conn.execute("""
+                    UPDATE cognitive_pending SET status = 'pending', decided_at = NULL
+                    WHERE id = $1
+                """, pending_id)
+                return {"error": "冲突项需指定裁决：supersede / create / keep"}
+    payload = {key: item[key] for key in (
+        "subject", "cognitive_type", "content", "confidence", "level",
+        "action", "target_id", "evidence_memory_ids", "review_after",
+    )}
+    result = await save_cognitive_item(payload, created_by="manual")
+    if result.get("error"):
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE cognitive_pending SET status = 'pending', decided_at = NULL
+                WHERE id = $1
+            """, pending_id)
+        return result
+    return {"status": "ok", "item": result.get("item"), "pending_id": pending_id}
+
+
+async def reject_cognitive_pending(pending_id: int) -> dict:
+    """Human rejects a pending auto candidate; rejection feeds back to the model."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE cognitive_pending SET status = 'rejected', decided_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING subject, cognitive_type, content
+        """, pending_id)
+        if not row:
+            return {"error": "待确认项不存在或已处理"}
+        await _record_cognitive_revision(
+            conn, card_id=None, subject=row["subject"],
+            cognitive_type=row["cognitive_type"], action="reject",
+            content_before=row["content"],
+        )
+    return {"status": "ok", "pending_id": pending_id}
 
 
 async def delete_cognitive_revision(revision_id: int):
