@@ -1138,7 +1138,9 @@ async function detectDuplicateEntities() {
 function renderDuplicateGroup(group, index) {
     const target = group.entities.find(entity => entity.is_target) || group.entities[0];
     const others = group.entities.filter(entity => entity.id !== target.id);
-    const reasonLabel = group.reason === 'canonical' ? '规范名相同' : '名称相似或包含';
+    const reasonLabel = group.reason === 'canonical' ? '规范名相同'
+        : group.reason === 'alias' ? '别名与实体名冲突'
+        : '名称相似或包含';
     const listHtml = group.entities.map(entity => {
         const mark = entity.is_target ? ' <span class="combo-option-meta">（保留目标）</span>' : '';
         return `<div class="dup-entity">${escapeHtml(entity.name)}` +

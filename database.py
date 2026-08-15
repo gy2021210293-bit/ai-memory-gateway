@@ -4173,29 +4173,54 @@ def _pick_duplicate_group(members, reason):
 async def find_duplicate_entities():
     """Read-only scan for likely-duplicate entities. Never writes.
 
+    Pass 0 groups alias-vs-canonical-name collisions: an entity whose canonical
+    name equals another entity's alias (e.g. entity "橘瓣App" with alias "橘瓣"
+    next to entity "橘瓣"). This is the strongest duplicate signal, and the
+    name-only passes below can never see it.
     Pass 1 groups entities whose canonical surface collapses to the same key
     (e.g. "小明同学" / "小明（朋友）" / "小明" / "小明哥"), across entity types
     since the LLM assigns types noisily. Pass 2 pairs entities whose canonical
     surfaces share character bigrams and are type-compatible (same type, or one
-    side is 'other'), flagging high similarity OR containment. Each group carries
+    side is 'other'), flagging high similarity OR containment; containment
+    bypasses the length-ratio gate so a short CJK name inside a longer mixed
+    CJK/latin name ("橘瓣" ⊂ "橘瓣App") is still caught. Each group carries
     a recommended merge target (highest evidence).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT e.id, e.name, e.normalized_name, e.entity_type, e.evidence_count,
-                   COUNT(DISTINCT me.memory_id)::int AS memory_count
+                   COUNT(DISTINCT me.memory_id)::int AS memory_count,
+                   COALESCE(array_agg(DISTINCT ea.normalized_alias)
+                            FILTER (WHERE ea.normalized_alias IS NOT NULL),
+                            ARRAY[]::text[]) AS normalized_aliases
             FROM entities e
             LEFT JOIN memory_entities me ON me.entity_id = e.id
+            LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
             GROUP BY e.id
         """)
 
     groups = []
     seen_ids = set()
 
+    # ---- pass 0: alias vs canonical-name collisions (cross-type, identity-level) ----
+    by_name = {r["normalized_name"]: r for r in rows}
+    for r in rows:
+        for alias in (r.get("normalized_aliases") or []):
+            owner = by_name.get(alias)
+            if owner is None or owner["id"] == r["id"]:
+                continue
+            if r["id"] in seen_ids or owner["id"] in seen_ids:
+                continue
+            group = _pick_duplicate_group([r, owner], "alias")
+            groups.append(group)
+            seen_ids.update(m["id"] for m in group["entities"])
+
     # ---- pass 1: canonical-surface equality groups (cross-type) ----
     by_canonical = {}
     for r in rows:
+        if r["id"] in seen_ids:
+            continue
         canonical = canonicalize_entity_surface(r["normalized_name"])
         if len(canonical) < 2:
             continue
@@ -4233,14 +4258,19 @@ async def find_duplicate_entities():
                 seen_partners.add(other["id"])
                 if not _entity_type_compatible(r["entity_type"], other["entity_type"]):
                     continue
-                if not _length_ratio_ok(canonical, other_canonical):
-                    continue
+                # 严格包含是强信号（如 "橘瓣" ⊂ "橘瓣App"），不受长度比门槛限制；
+                # 长度比门槛只约束纯模糊相似匹配，避免把长短悬殊的名字误配。
                 contained = canonical in other_canonical or other_canonical in canonical
-                if contained or _entity_similar_enough(canonical, other_canonical):
-                    sim = 1.0 if contained else _entity_similarity(canonical, other_canonical)
-                    if sim > best_sim:
-                        best_sim = sim
-                        best = other
+                similar = (
+                    _length_ratio_ok(canonical, other_canonical)
+                    and _entity_similar_enough(canonical, other_canonical)
+                )
+                if not (contained or similar):
+                    continue
+                sim = 1.0 if contained else _entity_similarity(canonical, other_canonical)
+                if sim > best_sim:
+                    best_sim = sim
+                    best = other
         if best is not None:
             group = _pick_duplicate_group([r, best], "similarity")
             groups.append(group)
@@ -5197,7 +5227,7 @@ async def merge_entities(source_id: int, target_id: int):
                 source_id,
             )
             target = await conn.fetchrow(
-                "SELECT id, evidence_count FROM entities WHERE id = $1",
+                "SELECT id, normalized_name, evidence_count FROM entities WHERE id = $1",
                 target_id,
             )
             if not source or not target:
@@ -5236,8 +5266,9 @@ async def merge_entities(source_id: int, target_id: int):
             await conn.execute("""
                 INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
                 SELECT $2, alias, normalized_alias FROM entity_aliases WHERE entity_id = $1
+                   AND normalized_alias <> $3
                 ON CONFLICT (normalized_alias) DO NOTHING
-            """, source_id, target_id)
+            """, source_id, target_id, target["normalized_name"])
             await conn.execute("""
                 INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
                 VALUES ($1, $2, $3) ON CONFLICT (normalized_alias) DO NOTHING

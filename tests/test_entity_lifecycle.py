@@ -81,7 +81,7 @@ class MergeConnection:
     def __init__(self):
         self.rows = [
             {"id": 1, "name": "Ally", "normalized_name": "ally", "evidence_count": 2},
-            {"id": 2, "evidence_count": 3},
+            {"id": 2, "normalized_name": "ally", "evidence_count": 3},
         ]
         self.execute_calls = []
 
