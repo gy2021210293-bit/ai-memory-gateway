@@ -2728,6 +2728,14 @@ async function cleanupLowImportanceFragments() {
             showManageMsg('error', '❌ ' + preview.error);
             return;
         }
+        if (preview.detail) {
+            showManageMsg('error', '❌ 清理接口不可用（' + preview.detail + '）——请重启网关服务后重试');
+            return;
+        }
+        if (typeof preview.deleted !== 'number') {
+            showManageMsg('error', '❌ 清理接口返回异常：' + JSON.stringify(preview).slice(0, 200));
+            return;
+        }
         if (preview.deleted === 0) {
             showManageMsg('info', '📝 没有14天前重要度≤3的活跃碎片需要清理');
             return;
@@ -2743,6 +2751,8 @@ async function cleanupLowImportanceFragments() {
         const data = await resp.json();
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
+        } else if (data.detail || typeof data.deleted !== 'number') {
+            showManageMsg('error', '❌ 清理接口返回异常：' + JSON.stringify(data).slice(0, 200) + (data.detail ? '——请重启网关服务后重试' : ''));
         } else {
             showManageMsg('success', '✅ 已清理 ' + data.deleted + ' 条低评分活跃碎片');
             loadMemories();
