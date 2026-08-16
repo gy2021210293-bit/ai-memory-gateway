@@ -471,6 +471,44 @@ class CognitiveIntegrateScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["items"], [])
         self.assertEqual(result["scan_count"], 0)
 
+    async def test_scan_flags_partial_overlap_with_embedded_chunk(self):
+        # 一大段里嵌着另一段的一整块：整段余弦（0.8 < 0.9）漏不掉？不——包含度要能抓到
+        cards = [
+            self._card(1, "user", "user_core",
+                       "身份与形象：她喜欢安静的环境，阳台种了薄荷和茉莉，喜欢摄影，偏爱靠窗的位置",
+                       times_derived=2),
+            self._card(2, "user", "user_core",
+                       "阳台种了薄荷和茉莉，最近在准备影展", times_derived=1),
+        ]
+        with (
+            patch.object(main, "list_cognitive_items", AsyncMock(return_value=cards)),
+            patch.object(main, "compute_embeddings_batch",
+                         AsyncMock(return_value=[[1.0, 0.0], [0.8, 0.2]])),  # 全局余弦 0.8 < 0.9
+        ):
+            result = await main.api_integrate_scan()
+        self.assertEqual(result["scan_count"], 1)
+        merge = result["items"][0]
+        self.assertEqual(merge["action"], "merge")
+        self.assertEqual(merge["target_ids"], [1, 2])
+        self.assertEqual(merge["content"], cards[0]["content"])  # 保留证据更强卡
+
+    async def test_scan_keeps_containing_card_when_one_embedded(self):
+        # 单向包含（A 整体嵌在 B 里）→ 保留被包含的较长卡内容
+        cards = [
+            self._card(1, "user", "user_core", "她喜欢安静的环境"),
+            self._card(2, "user", "user_core", "她喜欢安静的环境，阳台种了薄荷和茉莉"),
+        ]
+        with (
+            patch.object(main, "list_cognitive_items", AsyncMock(return_value=cards)),
+            patch.object(main, "compute_embeddings_batch",
+                         AsyncMock(return_value=[[1.0, 0.0], [1.0, 0.0]])),
+        ):
+            result = await main.api_integrate_scan()
+        self.assertEqual(result["scan_count"], 1)
+        merge = result["items"][0]
+        self.assertEqual(merge["target_ids"], [2, 1])
+        self.assertEqual(merge["content"], cards[1]["content"])  # 保留较长（被包含方）内容
+
 
 if __name__ == "__main__":
     unittest.main()

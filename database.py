@@ -105,6 +105,10 @@ COGNITIVE_DUP_EMBED_THRESHOLD = 0.88
 COGNITIVE_DUP_STRING_THRESHOLD = 0.85
 # 整合扫描阈值：现有卡两两相似度 ≥ 此值视为重叠（同区块→merge，跨区块→retire 保留更强卡）。
 COGNITIVE_MERGE_SIMILARITY = 0.9
+# 部分重叠阈值：较短文本被较长文本包含的比例 ≥ 此值，或最长公共连续子串 ≥ 此字符数，
+# 即视为"一大段里嵌着另一段"的部分重复（整段相似度会漏掉这种情况）。
+COGNITIVE_OVERLAP_MIN = 0.5
+COGNITIVE_OVERLAP_MIN_RUN = 15
 COGNITIVE_DRAFT_NEW_LIMIT = 40  # 增量草稿每次最多只读"书签之后"的新记忆
 COGNITIVE_DRAFT_CURSOR_KEY = "cognitive_draft_cursor"  # 书签：上次草稿已展示的最大记忆 ID
 
@@ -5475,6 +5479,52 @@ def cognitive_content_similarity(a: str, b: str, emb_a=None, emb_b=None) -> floa
     if emb_a and emb_b and len(emb_a) == len(emb_b):
         return float(_cosine_sim(emb_a, emb_b))
     return float(_char_ngram_similarity(a, b))
+
+
+def cognitive_overlap_score(a: str, b: str) -> dict:
+    """部分重叠检测：两段长文本之间"嵌着一块"的重复程度。
+
+    整段余弦 / n-gram Jaccard 会被不重叠的部分稀释，漏掉一大段里嵌着
+    另一段一小块的情况。这里用两个互补指标：
+    - containment：较短文本的 n-gram 有多少比例出现在较长文本里
+      （较短文本整体被较长文本包含 → 接近 1.0）；
+    - longest_run：最长公共连续子串占较短文本的比例（逐字重复的短语）。
+    返回 {"containment", "longest_run", "absolute_run", "flagged"}；
+    flagged = containment ≥ COGNITIVE_OVERLAP_MIN 或
+              longest_run ≥ COGNITIVE_OVERLAP_MIN 或
+              absolute_run ≥ COGNITIVE_OVERLAP_MIN_RUN。
+    """
+    import difflib
+    a = re.sub(r"\s+", "", str(a or ""))
+    b = re.sub(r"\s+", "", str(b or ""))
+    if not a or not b:
+        return {"containment": 0.0, "longest_run": 0.0, "absolute_run": 0, "flagged": False}
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+
+    def ngrams(text, k):
+        if len(text) < k:
+            return {text} if text else set()
+        return {text[i:i + k] for i in range(len(text) - k + 1)}
+
+    gs, gl = ngrams(shorter, 3), ngrams(longer, 3)
+    containment = (len(gs & gl) / len(gs)) if gs else 0.0
+
+    matcher = difflib.SequenceMatcher(None, shorter, longer, autojunk=False)
+    match = matcher.find_longest_match(0, len(shorter), 0, len(longer))
+    absolute_run = int(match.size or 0)
+    longest_run = (absolute_run / len(shorter)) if absolute_run else 0.0
+
+    flagged = (
+        containment >= COGNITIVE_OVERLAP_MIN
+        or longest_run >= COGNITIVE_OVERLAP_MIN
+        or absolute_run >= COGNITIVE_OVERLAP_MIN_RUN
+    )
+    return {
+        "containment": round(containment, 4),
+        "longest_run": round(longest_run, 4),
+        "absolute_run": absolute_run,
+        "flagged": flagged,
+    }
 
 
 def normalize_cognitive_item_input(data: dict) -> dict:

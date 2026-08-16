@@ -35,7 +35,7 @@ from database import get_entity_card, apply_entity_snapshot, update_entity_card_
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
 from database import record_cognitive_correction, get_recent_cognitive_corrections
-from database import compute_embeddings_batch, cognitive_content_similarity, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY
+from database import compute_embeddings_batch, cognitive_content_similarity, cognitive_overlap_score, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY, COGNITIVE_OVERLAP_MIN, COGNITIVE_OVERLAP_MIN_RUN
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
@@ -3231,22 +3231,30 @@ async def api_integrate_scan():
     pairs = []
     for i in range(len(cards)):
         for j in range(i + 1, len(cards)):
-            sim = cognitive_content_similarity(
+            global_sim = cognitive_content_similarity(
                 texts[i], texts[j],
                 emb_map.get(texts[i], []), emb_map.get(texts[j], []),
             )
-            if sim >= COGNITIVE_MERGE_SIMILARITY:
-                pairs.append((sim, i, j))
+            overlap = cognitive_overlap_score(texts[i], texts[j])
+            if global_sim >= COGNITIVE_MERGE_SIMILARITY or overlap["flagged"]:
+                score = max(global_sim, overlap["containment"], overlap["longest_run"])
+                pairs.append((score, i, j))
 
     proposals = []
     used = set()
-    for _sim, i, j in sorted(pairs, key=lambda p: -p[0]):
+    for _score, i, j in sorted(pairs, key=lambda p: -p[0]):
         a, b = cards[i], cards[j]
         if a.get("id") in used or b.get("id") in used:
             continue
         same_cell = (a.get("cognitive_type") == b.get("cognitive_type")
                      and a.get("subject") == b.get("subject"))
-        stronger, weaker = (a, b) if strength(a) >= strength(b) else (b, a)
+        overlap = cognitive_overlap_score(texts[i], texts[j])
+        # 单向包含（A 整体嵌在 B 里）→ 保留被包含的较长卡内容，避免合并后丢内容
+        if overlap["containment"] >= 0.8:
+            containing = a if len(texts[i]) >= len(texts[j]) else b
+            stronger, weaker = containing, (b if containing is a else a)
+        else:
+            stronger, weaker = (a, b) if strength(a) >= strength(b) else (b, a)
         if same_cell:
             used.update([stronger["id"], weaker["id"]])
             merged_evidence = list(dict.fromkeys([
