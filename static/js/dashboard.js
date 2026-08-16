@@ -2217,6 +2217,8 @@ document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     // 加载记忆数据
     loadMemories();
+    // 加载记忆演化待确认候选
+    loadMemoryDerivations();
     // 加载导出统计
     loadExportStats();
     document.getElementById('cognition-content')?.addEventListener('input', updateCognitiveCharHint);
@@ -2262,6 +2264,8 @@ function switchSection(name) {
     }
     if (name === 'cognition') {
         loadCognitiveItems();
+    }
+    if (name === 'manage') {
         loadMemoryDerivations();
     }
     if (name === 'settings') {

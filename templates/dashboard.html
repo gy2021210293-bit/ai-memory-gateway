@@ -109,6 +109,16 @@
                     </div>
                 </div>
 
+                <div class="card" style="margin-top:12px">
+                    <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
+                        <h4 style="margin:0">记忆演化</h4>
+                        <span class="section-desc">从原文记忆推断聊天里没说但正确的新内容（事实/偏好均可），候选一律经你确认才写入记忆；已确认的派生记忆带"推断记忆"标记。</span>
+                        <button class="btn btn-secondary" id="memory-evolution-generate" onclick="generateMemoryDerivations()">生成演化候选</button>
+                    </div>
+                    <div id="memory-evolution-status" class="section-desc" style="margin-top:10px"></div>
+                    <div id="memory-evolution-pending" style="margin-top:12px"></div>
+                </div>
+
                 <div id="manage-msg" class="msg-container"></div>
                 
                 <div class="stats-bar">
@@ -648,15 +658,6 @@
                         <span class="section-desc">自动审视生成的拿不准候选：低置信度 / 取代人工确认过的卡 / 冲突，等你裁决。</span>
                     </div>
                     <div id="cognition-pending-list" style="margin-top:12px"></div>
-                </div>
-                <div class="card" style="margin-top:16px">
-                    <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
-                        <h4 style="margin:0">记忆演化</h4>
-                        <span class="section-desc">从原文记忆推断聊天里没说但正确的新内容（事实/偏好均可），候选一律经你确认才写入记忆；已确认的派生记忆带"推断记忆"标记。</span>
-                        <button class="btn btn-secondary" id="memory-evolution-generate" onclick="generateMemoryDerivations()">生成演化候选</button>
-                    </div>
-                    <div id="memory-evolution-status" class="section-desc" style="margin-top:10px"></div>
-                    <div id="memory-evolution-pending" style="margin-top:12px"></div>
                 </div>
                 <div class="card" id="cognition-editor" style="display:none">
                     <input id="cognition-subject" type="hidden">
