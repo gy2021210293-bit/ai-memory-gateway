@@ -16,6 +16,7 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertIn("三元一场认知模型", self.html)
         self.assertEqual(self.html.count("onclick=\"generateCognitiveDraft(false)\""), 1)
         self.assertEqual(self.html.count("onclick=\"generateCognitiveDraft(true)\""), 1)  # 深度体检按钮
+        self.assertEqual(self.html.count("onclick=\"integrateCognitiveScan()\""), 1)       # 整合扫描按钮
         self.assertNotIn("generateCognitiveDraft('user')", self.html)
         self.assertIn("id=\"cognition-review-after\"", self.html)
 

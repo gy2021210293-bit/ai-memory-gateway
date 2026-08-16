@@ -767,6 +767,29 @@ class CognitiveSaveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("偏好独处", revisions[0][4])
         self.assertEqual(revisions[0][5], "偏好安静与独处")
 
+    async def test_retire_marks_target_superseded_without_new_card(self):
+        conn = _FakeSaveConnection(target=TARGET_CARD)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "我是她愿意倾诉的对象", "level": "explicit",
+                "confidence": 0.8, "evidence_memory_ids": [2],
+                "action": "retire", "target_id": 5, "retain_id": 3,
+            })
+        self.assertEqual(result["status"], "ok")
+        # 只退休目标卡，不插入新卡
+        self.assertFalse(any(
+            query.startswith("INSERT INTO cognitive_items")
+            for query, _args in conn.executions
+        ))
+        superseded = [
+            args for query, args in conn.executions
+            if "SET status = 'superseded'" in query
+        ]
+        self.assertEqual(superseded[0][0], 5)
+        self.assertEqual(superseded[0][1], 3)  # superseded_by = retain_id
+        self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["retire"])
+
 
 class _FakeDeleteConnection:
     def __init__(self, row=None):

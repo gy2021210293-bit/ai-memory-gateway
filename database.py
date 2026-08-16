@@ -97,12 +97,14 @@ COGNITIVE_LEVEL_LABELS = {
     "inductive": "归纳推断",
 }
 COGNITIVE_LEVEL_RANK = {"explicit": 0, "deductive": 1, "inductive": 2}
-COGNITIVE_ACTIONS = ("create", "reinforce", "supersede", "conflict", "merge")
+COGNITIVE_ACTIONS = ("create", "reinforce", "supersede", "conflict", "merge", "retire")
 COGNITIVE_PER_TYPE_LIMIT = 3   # 草稿生成每轮每区块最多候选卡数（注入已全量，不再截断）
 COGNITIVE_DRAFT_TOTAL_LIMIT = 12  # 单次草稿最多返回的候选卡数
 # 认知去重阈值：向量余弦 ≥ 此值视为"实质重复"（同区块→强化，跨区块→丢弃）；无向量时退回字符 n-gram。
 COGNITIVE_DUP_EMBED_THRESHOLD = 0.88
 COGNITIVE_DUP_STRING_THRESHOLD = 0.85
+# 整合扫描阈值：现有卡两两相似度 ≥ 此值视为重叠（同区块→merge，跨区块→retire 保留更强卡）。
+COGNITIVE_MERGE_SIMILARITY = 0.9
 COGNITIVE_DRAFT_NEW_LIMIT = 40  # 增量草稿每次最多只读"书签之后"的新记忆
 COGNITIVE_DRAFT_CURSOR_KEY = "cognitive_draft_cursor"  # 书签：上次草稿已展示的最大记忆 ID
 
@@ -5521,7 +5523,15 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         if len(target_ids) < 2:
             raise ValueError("merge 必须指定至少 2 个 target_ids")
     elif action != "create" and target_id is None:
-        raise ValueError("reinforce / supersede / conflict 必须指定 target_id")
+        raise ValueError("reinforce / supersede / conflict / retire 必须指定 target_id")
+    retain_id = data.get("retain_id")
+    if retain_id in (None, ""):
+        retain_id = None
+    else:
+        try:
+            retain_id = int(retain_id)
+        except (TypeError, ValueError):
+            retain_id = None
     evidence_ids = []
     for value in data.get("evidence_memory_ids", []) or []:
         try:
@@ -5553,6 +5563,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         "action": action,
         "target_id": target_id,
         "target_ids": target_ids,
+        "retain_id": retain_id,
     }
 
 
@@ -5709,8 +5720,10 @@ async def save_cognitive_item(data: dict, item_id: int = None, created_by: str =
                 """, target_id)
                 if not target:
                     return {"error": "目标认知卡不存在或已失效"}
-                if (target["subject"] != item["subject"]
-                        or target["cognitive_type"] != item["cognitive_type"]):
+                # retire 是跨区块整合（退休与保留卡不同区块的重复卡），不做同区块校验
+                if (action != "retire"
+                        and (target["subject"] != item["subject"]
+                             or target["cognitive_type"] != item["cognitive_type"])):
                     return {"error": "目标认知卡与新建认知不属于同一区块"}
 
             if action == "reinforce":
@@ -5792,6 +5805,31 @@ async def save_cognitive_item(data: dict, item_id: int = None, created_by: str =
                     content_after=row["content"],
                     level_before="｜".join(str(mt["level"]) for mt in merge_targets),
                     level_after=row["level"],
+                )
+            elif action == "retire":
+                # 跨区块整合：退休重复卡（不建新卡），可指向保留卡留痕。
+                if not target:
+                    return {"error": "目标认知卡不存在或已失效"}
+                retain_id = item.get("retain_id")
+                await conn.execute("""
+                    UPDATE cognitive_items
+                    SET status = 'superseded', superseded_by = $2, updated_at = NOW()
+                    WHERE id = $1
+                """, target["id"], retain_id)
+                row = await conn.fetchrow("""
+                    SELECT id, subject, cognitive_type, content, confidence,
+                           evidence_memory_ids, review_after, status, created_by,
+                           created_at, updated_at,
+                           level, times_derived, supersedes, superseded_by
+                    FROM cognitive_items
+                    WHERE id = $1
+                """, target["id"])
+                log_action = "retire" if created_by != "auto" else "auto_retire"
+                await _record_cognitive_revision(
+                    conn, card_id=target["id"], subject=target["subject"],
+                    cognitive_type=target["cognitive_type"], action=log_action,
+                    content_before=target["content"], content_after=item.get("content"),
+                    level_before=target["level"],
                 )
             else:
                 # create 或 supersede：插入新卡；supersede 保留旧卡为历史并记录指针。

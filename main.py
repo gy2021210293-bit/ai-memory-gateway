@@ -35,7 +35,7 @@ from database import get_entity_card, apply_entity_snapshot, update_entity_card_
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
 from database import record_cognitive_correction, get_recent_cognitive_corrections
-from database import compute_embeddings_batch, cognitive_content_similarity, COGNITIVE_DUP_EMBED_THRESHOLD
+from database import compute_embeddings_batch, cognitive_content_similarity, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
@@ -3202,6 +3202,88 @@ async def api_generate_cognitive_draft(deep: int = 0):
     return {"status": "draft", "items": result["items"], "model": result["model"],
             "evidence_count": len(result["memories"]), "new_count": len(result["memories"]),
             "cursor": result["cursor"]}
+
+
+@app.post("/api/cognitive-items/integrate-scan")
+async def api_integrate_scan():
+    """整合扫描（确定性、零 LLM）：检测现有卡之间的重叠。
+
+    同区块重叠 → merge 提案（合并成一张，内容取证据更强卡、证据合并，可编辑后确认）；
+    跨区块重复 → retire 提案（保留证据更强卡，退休另一张，不建新卡）。
+    全部提案走人工确认；每张卡最多进入一个提案（贪心按相似度从高到低）。
+    """
+    try:
+        cards = await list_cognitive_items(active_only=True)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"读取认知卡失败: {exc}"})
+    if not cards:
+        return {"status": "scan", "items": [], "scan_count": 0}
+    texts = [str(c.get("content") or "") for c in cards]
+    embeddings = await compute_embeddings_batch(texts)
+    emb_map = {}
+    if embeddings:
+        for text, emb in zip(texts, embeddings):
+            emb_map.setdefault(text, emb)
+
+    def strength(card):
+        return (int(card.get("times_derived") or 1), int(card.get("id") or 0))
+
+    pairs = []
+    for i in range(len(cards)):
+        for j in range(i + 1, len(cards)):
+            sim = cognitive_content_similarity(
+                texts[i], texts[j],
+                emb_map.get(texts[i], []), emb_map.get(texts[j], []),
+            )
+            if sim >= COGNITIVE_MERGE_SIMILARITY:
+                pairs.append((sim, i, j))
+
+    proposals = []
+    used = set()
+    for _sim, i, j in sorted(pairs, key=lambda p: -p[0]):
+        a, b = cards[i], cards[j]
+        if a.get("id") in used or b.get("id") in used:
+            continue
+        same_cell = (a.get("cognitive_type") == b.get("cognitive_type")
+                     and a.get("subject") == b.get("subject"))
+        stronger, weaker = (a, b) if strength(a) >= strength(b) else (b, a)
+        if same_cell:
+            used.update([stronger["id"], weaker["id"]])
+            merged_evidence = list(dict.fromkeys([
+                *(stronger.get("evidence_memory_ids") or []),
+                *(weaker.get("evidence_memory_ids") or []),
+            ]))
+            proposals.append({
+                "subject": stronger["subject"],
+                "cognitive_type": stronger["cognitive_type"],
+                "content": str(stronger.get("content") or ""),
+                "level": stronger.get("level") or "explicit",
+                "confidence": max(
+                    float(stronger.get("confidence") or 0.7),
+                    float(weaker.get("confidence") or 0.7),
+                ),
+                "evidence_memory_ids": merged_evidence,
+                "review_after": stronger.get("review_after") or weaker.get("review_after"),
+                "action": "merge",
+                "target_ids": [stronger["id"], weaker["id"]],
+            })
+        else:
+            used.add(weaker["id"])
+            proposals.append({
+                "subject": weaker["subject"],
+                "cognitive_type": weaker["cognitive_type"],
+                "content": str(weaker.get("content") or ""),
+                "level": weaker.get("level") or "explicit",
+                "confidence": float(weaker.get("confidence") or 0.7),
+                "evidence_memory_ids": weaker.get("evidence_memory_ids") or [],
+                "review_after": weaker.get("review_after"),
+                "action": "retire",
+                "target_id": weaker["id"],
+                "retain_id": stronger["id"],
+            })
+        if len(proposals) >= 20:
+            break
+    return {"status": "scan", "items": proposals, "scan_count": len(proposals)}
 
 
 # ============================================================

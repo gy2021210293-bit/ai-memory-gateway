@@ -1361,6 +1361,7 @@ async function backfillEntityTraits() {
 let cognitiveItems = [];
 let editingCognitiveId = null;
 let pendingCognitiveDrafts = [];
+let pendingScanMode = false;
 let pendingCognitiveItems = [];
 let editingAction = 'create';
 let editingTargetId = null;
@@ -1488,6 +1489,9 @@ function renderCognitivePending() {
         } else if (item.action === 'merge') {
             const ids = (item.target_ids || []).map(id => `#${id}`).join('、');
             actionTag.textContent = `合并 ${ids}`;
+        } else if (item.action === 'retire') {
+            const retain = item.retain_id != null ? `（保留 #${item.retain_id}）` : '';
+            actionTag.textContent = `退休 #${item.target_id}${retain}`;
         } else {
             actionTag.textContent = '新建';
         }
@@ -1707,10 +1711,34 @@ async function generateCognitiveDraft(deep = false) {
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || '生成失败');
         pendingCognitiveDrafts = data.items || [];
+        pendingScanMode = false;
         renderCognitiveDrafts(data);
         status.textContent = pendingCognitiveDrafts.length
             ? `已生成 ${pendingCognitiveDrafts.length} 个画像提案（模型：${data.model}）。请逐项确认保存。`
             : `这 ${data.new_count || 0} 条记忆里没有发现证据充分的实质变化。`;
+    } catch (error) {
+        status.textContent = error.message;
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function integrateCognitiveScan() {
+    const button = document.getElementById('cognition-integrate-scan');
+    const status = document.getElementById('cognition-status');
+    if (!button) return;
+    button.disabled = true;
+    status.textContent = '正在扫描现有认知卡之间的重叠（同区块→合并，跨区块→退休）…';
+    try {
+        const response = await fetch('/api/cognitive-items/integrate-scan', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '扫描失败');
+        pendingCognitiveDrafts = data.items || [];
+        pendingScanMode = true;
+        renderCognitiveDrafts(data);
+        status.textContent = pendingCognitiveDrafts.length
+            ? `检测到 ${pendingCognitiveDrafts.length} 组重叠认知，请逐项确认。`
+            : '未发现重叠的认知卡。';
     } catch (error) {
         status.textContent = error.message;
     } finally {
@@ -1723,11 +1751,15 @@ function renderCognitiveDrafts(meta = {}) {
     root.replaceChildren();
     root.style.display = '';
     const heading = document.createElement('h3');
-    const evidenceLabel = Number.isFinite(Number(meta.new_count))
-        ? `${meta.new_count} 条新记忆（自上次草稿后）`
-        : (Number.isFinite(Number(meta.evidence_count))
-            ? `${meta.evidence_count} 条记忆` : '已有记忆');
-    heading.textContent = `整体审视草稿（证据来自 ${evidenceLabel}，尚未保存）`;
+    if (pendingScanMode) {
+        heading.textContent = '整合扫描提案（同区块合并 / 跨区块退休，尚未保存）';
+    } else {
+        const evidenceLabel = Number.isFinite(Number(meta.new_count))
+            ? `${meta.new_count} 条新记忆（自上次草稿后）`
+            : (Number.isFinite(Number(meta.evidence_count))
+                ? `${meta.evidence_count} 条记忆` : '已有记忆');
+        heading.textContent = `整体审视草稿（证据来自 ${evidenceLabel}，尚未保存）`;
+    }
     root.appendChild(heading);
     if (!pendingCognitiveDrafts.length) {
         const empty = document.createElement('p');
@@ -1763,6 +1795,9 @@ function renderCognitiveDrafts(meta = {}) {
         } else if (item.action === 'merge') {
             const ids = (item.target_ids || []).map(id => `#${id}`).join('、');
             actionTag.textContent = `合并 ${ids}`;
+        } else if (item.action === 'retire') {
+            const retain = item.retain_id != null ? `（保留 #${item.retain_id}）` : '';
+            actionTag.textContent = `退休 #${item.target_id}${retain}`;
         } else {
             actionTag.textContent = '新建';
         }
@@ -1834,6 +1869,10 @@ function renderCognitiveDrafts(meta = {}) {
             if (item.action === 'reinforce') {
                 confirm.textContent = target ? `确认强化 #${target.id}` : '确认';
                 confirm.onclick = () => confirmCognitiveReinforce(index);
+            } else if (item.action === 'retire') {
+                confirm.textContent = '确认退休';
+                confirm.title = '退休这张重复卡，不建新卡';
+                confirm.onclick = () => confirmCognitiveRetire(index);
             } else {
                 confirm.textContent = item.action === 'supersede' ? '编辑并保存（取代）' : '编辑并保存';
                 confirm.onclick = () => useCognitiveDraft(index);
@@ -1910,6 +1949,38 @@ async function confirmCognitiveReinforce(index) {
     renderCognitiveDrafts();
     await loadCognitiveItems();
     status.textContent = `认知 #${target.id} 已强化，累计次数 +1。`;
+}
+
+async function confirmCognitiveRetire(index) {
+    const item = pendingCognitiveDrafts[index];
+    if (!item) return;
+    const status = document.getElementById('cognition-status');
+    const data = {
+        subject: item.subject,
+        cognitive_type: item.cognitive_type,
+        content: item.content || '',
+        confidence: item.confidence ?? 0.7,
+        evidence_memory_ids: item.evidence_memory_ids || [],
+        review_after: item.review_after || null,
+        level: item.level || 'explicit',
+        action: 'retire',
+        target_id: item.target_id,
+        retain_id: item.retain_id ?? null,
+    };
+    const response = await fetch('/api/cognitive-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    });
+    const result = await response.json();
+    if (!response.ok || result.error) {
+        status.textContent = result.error || '退休失败';
+        return;
+    }
+    pendingCognitiveDrafts = pendingCognitiveDrafts.filter((_, i) => i !== index);
+    renderCognitiveDrafts();
+    await loadCognitiveItems();
+    status.textContent = `认知 #${item.target_id} 已退休${item.retain_id ? `，保留 #${item.retain_id}` : ''}。`;
 }
 
 function useCognitiveDraft(index) {

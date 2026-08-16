@@ -419,5 +419,58 @@ def database_fake_pool(conn):
     return _Pool()
 
 
+class CognitiveIntegrateScanTests(unittest.IsolatedAsyncioTestCase):
+    """整合扫描（确定性）：同区块重叠 → merge，跨区块重复 → retire。"""
+
+    def _card(self, card_id, subject, cognitive_type, content, times_derived=1):
+        return {
+            "id": card_id, "subject": subject, "cognitive_type": cognitive_type,
+            "content": content, "level": "explicit", "times_derived": times_derived,
+            "confidence": 0.8, "evidence_memory_ids": [card_id],
+            "review_after": None,
+        }
+
+    async def test_scan_proposes_merge_for_same_cell_and_retire_for_cross_cell(self):
+        cards = [
+            self._card(1, "user", "user_core", "喜欢安静", times_derived=2),
+            self._card(2, "user", "user_core", "偏好独处", times_derived=1),
+            self._card(3, "self", "self_core", "我是她愿意倾诉的对象", times_derived=3),
+            self._card(4, "relationship", "relationship_core", "她向我倾诉", times_derived=1),
+        ]
+        with (
+            patch.object(main, "list_cognitive_items", AsyncMock(return_value=cards)),
+            patch.object(main, "compute_embeddings_batch",
+                         AsyncMock(return_value=[
+                             [1.0, 0.0], [1.0, 0.0],   # 卡1/卡2 同区块重叠
+                             [0.0, 1.0], [0.0, 1.0],   # 卡3/卡4 跨区块重复
+                         ])),
+        ):
+            result = await main.api_integrate_scan()
+        self.assertEqual(result["scan_count"], 2)
+        merge = next(it for it in result["items"] if it["action"] == "merge")
+        retire = next(it for it in result["items"] if it["action"] == "retire")
+        # 同区块：合并，内容取证据更强卡，target_ids 列出两张
+        self.assertEqual(merge["target_ids"], [1, 2])
+        self.assertEqual(merge["content"], "喜欢安静")
+        # 跨区块：退休较弱卡（relationship #4），保留较强卡（self #3）
+        self.assertEqual(retire["target_id"], 4)
+        self.assertEqual(retire["retain_id"], 3)
+        self.assertEqual(retire["action"], "retire")
+
+    async def test_scan_skips_low_similarity_and_returns_empty(self):
+        cards = [
+            self._card(1, "user", "user_core", "喜欢爬山"),
+            self._card(2, "user", "user_core", "最近在准备影展"),
+        ]
+        with (
+            patch.object(main, "list_cognitive_items", AsyncMock(return_value=cards)),
+            patch.object(main, "compute_embeddings_batch",
+                         AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])),
+        ):
+            result = await main.api_integrate_scan()
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["scan_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
