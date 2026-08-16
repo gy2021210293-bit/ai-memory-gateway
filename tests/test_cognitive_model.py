@@ -166,14 +166,22 @@ class CognitiveModelTests(unittest.TestCase):
             {"subject": "user", "cognitive_type": "user_core",
              "content": "正在准备旅行", "confidence": 0.8,
              "review_after": date(2026, 8, 13)},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "可能喜欢咖啡", "confidence": 0.5,
+             "level": "inductive", "times_derived": 1},
         ], today=date(2026, 7, 30))
         self.assertIn("三元一场认知模型", prompt)
         self.assertIn("【用户核心】", prompt)
-        self.assertIn("[明确陈述·置信度0.80] 偏好简短回答", prompt)
-        self.assertIn("[演绎推断·置信度0.90] 重视诚实", prompt)
+        # 只标例外：明确陈述/推断不再区分层级，高置信长期卡不标前缀
+        self.assertIn("- 偏好简短回答", prompt)
+        self.assertIn("- 重视诚实", prompt)
+        # 低置信 → 标 [低置信]
+        self.assertIn("[低置信] 可能喜欢咖啡", prompt)
         self.assertIn("【AI 自我核心】", prompt)
         self.assertIn("【关系核心】", prompt)
         self.assertNotIn("当前认知场", prompt)
+        # 不再罗嗦地给每张卡标"层级·置信度"
+        self.assertNotIn("[明确陈述·置信度", prompt)
         # 未到期的 current 卡带稳定度标记
         self.assertIn("正在准备旅行（当前状态）", prompt)
         self.assertIn("当前用户消息", prompt)

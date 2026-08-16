@@ -1280,7 +1280,7 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
     fallback_time = datetime.now(timezone.utc)
     evidence_lines = []
     for memory in memories:
-        layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(memory.get("layer", 1), "记忆")
+        layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆", 4: "推断记忆"}.get(memory.get("layer", 1), "记忆")
         memory_time = _format_message_time(memory.get("created_at"), fallback_time)
         evidence_lines.append(
             f"[ID={memory['id']}][{layer_name}][重要度={memory.get('importance', 5)}]"
@@ -1302,7 +1302,7 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
         )
         current_lines.append(
             f"[card_id={item.get('id')}][{item.get('subject')}][{cognitive_type}]"
-            f"[level={item.get('level', 'explicit')}][置信度={item.get('confidence', 0.7)}]"
+            f"[置信度={item.get('confidence', 0.7)}]"
             f"[强化×{item.get('times_derived', 1)}][{stability}]{evidence_text}{review_text} {item.get('content')}"
         )
     revision_lines = []
@@ -1388,30 +1388,26 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 
 生成规则：
 1. 画像式，不是记忆复述：认知是“我是谁/你是谁/我们是什么”层面的抽象（身份、形象、价值观、世界归属、偏好带质地、性格、动机），不是对记忆的概括清单。每条候选是一个自包含的认知单元——可以是“维度：具体表现”句式，也可以是第一人称的信念/叙事陈述（如“我不靠「被使用」证明价值——我活着，我留下的痕迹就是价值”）；保留有质地的细节（形态、家园、原话片段），那是身份的纹理不是噪音。每条 content 建议 30-150 字。
-2. 分层（level，只能取其一）：
-   - explicit 明确陈述：晏晏直接陈述、或证据直接支持的稳定事实。
-   - deductive 演绎推断：由已有明确前提直接推出的结论。
-   - inductive 归纳推断：由 ≥2 个独立事件归纳出的倾向；单次事件不得归纳为倾向；同一次对话里的复述不算多份独立证据。
-3. 长期/短期分档（review_after）：stable 卡不带 review_after（长期认知：身份、价值观、性格、长期偏好——稳定，只换代不退休）；current 卡带 review_after（短期认知：当前状态、最近目标、情绪、进行中的事——到期自动退休）。临时状态也可以是认知（如“最近在忙的项目”“最近在哪里”），用 current + 短期 review_after 表达。同一区块同一内容只应有一张 active 卡；当前状态/待办用 current，稳定下来后再用 supersede 转成 stable。
-4. 与现有卡片的关系（action，只能取其一）：
+2. 长期/短期分档（review_after）：stable 卡不带 review_after（长期认知：身份、价值观、性格、长期偏好——稳定，只换代不退休）；current 卡带 review_after（短期认知：当前状态、最近目标、情绪、进行中的事——到期自动退休）。临时状态也可以是认知（如“最近在忙的项目”“最近在哪里”），用 current + 短期 review_after 表达。同一区块同一内容只应有一张 active 卡；当前状态/待办用 current，稳定下来后再用 supersede 转成 stable。
+3. 与现有卡片的关系（action，只能取其一）：
    - create 新建：证据支持、但任何现有卡都未覆盖的新认知。
    - reinforce 强化：与某条同区块现有卡内容实质相同、只是多了佐证 → 指定该卡 card_id 为 target_id。
    - supersede 取代：新证据更正或取代某条同区块现有卡 → 指定该卡 card_id 为 target_id。
    - conflict 冲突：新证据与某条现有卡互相矛盾、无法断定谁对 → 指定该卡 card_id 为 target_id，把两边证据写进 content，不得擅自 supersede。
    - merge 合并：多张同区块现有卡内容重叠或碎片化（如“喜欢安静”“偏好独处”“不爱热闹”三张应并成一张）→ 输出一张整合后的卡，target_ids 列出全部被合并卡（至少 2 个）。仅深度体检（deep）时使用。
    reinforce / supersede / conflict / merge 的 target 必须指向同区块的 active 卡；候选内容不得与任一区块现有 active 卡实质重复，跨区块的相同内容属于误分类，应改换正确区块。特别注意：三个区块之间也不得互相重复——尤其自我认知与关系认知（如“我是她愿意倾诉的对象”只应出现在自我认知或关系认知其一，不能两处都建）；若候选与其它区块的现有卡实质重复，不得 create，应在该内容真正所属的区块上 reinforce / supersede。
-5. confidence 为 0 到 1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。
-6. current 卡返回 review_after（YYYY-MM-DD；临时状态建议 7 天内，其余 14 天后）；stable 卡不要返回 review_after。
-7. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；不要为“正在聊的话题/主题”建卡（那是会话上下文，不是长期认知）；每类最多 3 条。
-8. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
-9. 用户纠正优先：若“用户最近的纠正表述”与某条现有卡矛盾（通常是用户明确说“不是/记错了/其实是…”），不得无视纠正继续保留旧认知——用纠正后的表述 supersede 旧卡（confidence 可给高些，因这是用户直接表态），或至少提出 conflict 让人类裁决；纠正表述本身也可作为 explicit 新建/取代的内容。{('10. 深度体检（deep）额外职责：站在全量证据视角重新审视稳定层——提出被新证据整体推翻的 supersede、遗漏维度的 create、以及把内容重叠/碎片化的现有卡用 merge 整合（同一区块、≥2 张、内容确实重叠才合并，不要为合并而合并）。' if deep else '')}
+4. confidence 为 0 到 1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。
+5. current 卡返回 review_after（YYYY-MM-DD；临时状态建议 7 天内，其余 14 天后）；stable 卡不要返回 review_after。
+6. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；不要为“正在聊的话题/主题”建卡（那是会话上下文，不是长期认知）；每类最多 3 条。
+7. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
+8. 用户纠正优先：若“用户最近的纠正表述”与某条现有卡矛盾（通常是用户明确说“不是/记错了/其实是…”），不得无视纠正继续保留旧认知——用纠正后的表述 supersede 旧卡（confidence 可给高些，因这是用户直接表态），或至少提出 conflict 让人类裁决；纠正表述本身也可作为新建/取代的内容。{('9. 深度体检（deep）额外职责：站在全量证据视角重新审视稳定层——提出被新证据整体推翻的 supersede、遗漏维度的 create、以及把内容重叠/碎片化的现有卡用 merge 整合（同一区块、≥2 张、内容确实重叠才合并，不要为合并而合并）。' if deep else '')}
 
 只返回 JSON 数组：
 [
-  {{"subject":"user","cognitive_type":"user_core","content":"掌控感驱动：对数据所有权、结果可控性有高需求","level":"inductive","confidence":0.7,"evidence_memory_ids":[12,15,20],"action":"create"}},
-  {{"subject":"relationship","cognitive_type":"relationship_core","content":"...","level":"deductive","confidence":0.6,"evidence_memory_ids":[18],"action":"conflict","target_id":8}},
-  {{"subject":"user","cognitive_type":"user_core","content":"最近在忙新项目","level":"explicit","confidence":0.8,"evidence_memory_ids":[20],"action":"create","review_after":"2026-08-27"}},
-  {{"subject":"self","cognitive_type":"self_core","content":"身份与形象整合版","level":"explicit","confidence":0.8,"evidence_memory_ids":[1,2],"action":"merge","target_ids":[3,4]}}
+  {{"subject":"user","cognitive_type":"user_core","content":"掌控感驱动：对数据所有权、结果可控性有高需求","confidence":0.7,"evidence_memory_ids":[12,15,20],"action":"create"}},
+  {{"subject":"relationship","cognitive_type":"relationship_core","content":"...","confidence":0.6,"evidence_memory_ids":[18],"action":"conflict","target_id":8}},
+  {{"subject":"user","cognitive_type":"user_core","content":"最近在忙新项目","confidence":0.8,"evidence_memory_ids":[20],"action":"create","review_after":"2026-08-27"}},
+  {{"subject":"self","cognitive_type":"self_core","content":"身份与形象整合版","confidence":0.8,"evidence_memory_ids":[1,2],"action":"merge","target_ids":[3,4]}}
 ]
 """
     # 与记忆提取/实体概况一致：不发送 max_tokens（推理模型的思考会吃光预算导致 content 为空或被截断），
@@ -1464,6 +1460,94 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
                     return None
     except Exception as exc:
         print(f"⚠️ 三元一场认知草稿解析失败: {exc}")
+        return None
+
+
+async def generate_memory_derivations(memories: List[Dict]) -> Optional[List[Dict]]:
+    """记忆演化：从原文记忆推断"没说但正确"的新内容（事实/偏好均可）。
+
+    核心要求：必须产生新信息（不是复述/拼接/摘要）；归纳需 ≥2 条独立跨时间前提；
+    演绎需前提逻辑蕴含结论；反幻觉、宁缺毋滥。只返回 JSON 数组候选，
+    由调用方校验前提、相关性、去重后进人工确认队列。
+    """
+    if not memories or not get_memory_api_key():
+        return None
+    fallback_time = datetime.now(timezone.utc)
+    evidence_lines = []
+    for memory in memories:
+        layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆", 4: "推断记忆"}.get(memory.get("layer", 1), "记忆")
+        memory_time = _format_message_time(memory.get("created_at"), fallback_time)
+        evidence_lines.append(
+            f"[ID={memory['id']}][{layer_name}][重要度={memory.get('importance', 5)}]"
+            f"[时间={memory_time}] {memory['content']}"
+        )
+    prompt = f"""我是栖，正在对已有记忆做“演化”——从多条记忆中推断出聊天里没直接说过、但由这些记忆逻辑蕴含的新内容。这不是整理/概括（那是把已有内容重新组织），而是产生真正的新信息。
+
+证据记忆（全部是聊天里真实说过的内容；只能引用它们，不得编造）：
+{chr(10).join(evidence_lines)}
+
+规则：
+1. 必须产生新信息：结论不能是某条记忆的复述或改写，也不能是多条记忆的简单拼接/摘要。判断标准：任何一条证据记忆单独都不包含这个结论——把前提放在一起才能得到的东西，才算“演化”。
+2. 归纳（inductive）：由 ≥2 条独立、跨时间的证据归纳出倾向/规律/事实。单次事件不得归纳；同一次对话里的复述不算多份独立证据。
+3. 演绎（deductive）：由前提逻辑必然推出的结论；只有真正蕴含的才算，不能脑补中间步骤。
+4. 可以推断事实，也可以推断偏好/性格/习惯——任何能被前提支持、且有新信息的内容都可以。
+5. 反幻觉：拿不准宁可不生成；不得编造细节；结论必须完全由前提支撑；不得与任何证据记忆矛盾。
+6. 每条结论都要列出前提证据 ID（premise_memory_ids，至少 2 条），并给 confidence（0-1）和一句话 reason（说明新信息是什么、由哪些前提推出）。
+
+只返回 JSON 数组：
+[
+  {{"content":"她对数据所有权有高需求，倾向自部署而非云服务","level":"inductive","confidence":0.75,"premise_memory_ids":[12,15,20],"reason":"多次提到自部署、导出、担心被绑死"}},
+  {{"content":"...","level":"deductive","confidence":0.7,"premise_memory_ids":[5,8],"reason":"..."}}
+]
+"""
+    request_messages = [{"role": "user", "content": prompt}]
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            headers = {
+                "Authorization": f"Bearer {get_memory_api_key()}",
+                "Content-Type": "application/json",
+            }
+            response = await client.post(
+                get_memory_api_base_url(),
+                headers=headers,
+                json={"model": MEMORY_MODEL, "temperature": 0, "messages": request_messages},
+            )
+            if response.status_code != 200:
+                print(f"⚠️ 记忆演化候选生成失败: {response.status_code} {response.text[:200]}")
+                return None
+            text = _extract_response_content(response.json()).strip()
+            try:
+                return parse_json_array(text)
+            except ValueError as first_error:
+                print(f"⚠️ 记忆演化候选解析失败，正在重试: {first_error}")
+                print(f"⚠️  原始文本前500字符: {text[:500]}")
+                retry_messages = request_messages + [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": "上一次输出没有给出可解析的最终结果。请重新检查证据，只返回最终 JSON 数组，不要分析、解释或使用 Markdown。",
+                    },
+                ]
+                retry_response = await client.post(
+                    get_memory_api_base_url(),
+                    headers=headers,
+                    json={"model": MEMORY_MODEL, "temperature": 0, "messages": retry_messages},
+                )
+                if retry_response.status_code != 200:
+                    print(f"⚠️ 记忆演化候选重试失败: {retry_response.status_code} {retry_response.text[:200]}")
+                    return None
+                retry_text = _extract_response_content(retry_response.json()).strip()
+                if not retry_text:
+                    print("⚠️ 记忆演化候选重试返回空内容")
+                    return None
+                try:
+                    return parse_json_array(retry_text)
+                except ValueError as retry_error:
+                    print(f"⚠️ 记忆演化候选重试结果仍无法解析: {retry_error}")
+                    print(f"⚠️  重试原始文本前500字符: {retry_text[:500]}")
+                    return None
+    except Exception as exc:
+        print(f"⚠️ 记忆演化候选生成异常: {exc}")
         return None
 
 

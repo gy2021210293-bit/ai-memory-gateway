@@ -1368,12 +1368,6 @@ let editingTargetId = null;
 let editingTargetIds = null;
 let editingDraftIndex = null;
 
-const COGNITIVE_LEVEL_LABELS = {
-    explicit: '明确陈述',
-    deductive: '演绎推断',
-    inductive: '归纳推断',
-};
-
 const COGNITION_SECTIONS = [
     {
         subject: 'user', cognitive_type: 'user_core', label: '用户核心',
@@ -1475,9 +1469,6 @@ function renderCognitivePending() {
         title.className = 'cognition-draft-title';
         const label = document.createElement('strong');
         label.textContent = section.label;
-        const badge = document.createElement('span');
-        badge.className = `cognition-level level-${item.level || 'explicit'}`;
-        badge.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
         const actionTag = document.createElement('span');
         actionTag.className = 'cognition-action';
         if (item.action === 'reinforce') {
@@ -1648,9 +1639,6 @@ function renderCognitiveItems() {
 function cognitiveCardRow(item) {
     const row = document.createElement('div');
     row.className = 'cognition-item';
-    const level = document.createElement('span');
-    level.className = `cognition-level level-${item.level || 'explicit'}`;
-    level.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
     const stability = document.createElement('span');
     const isCurrent = !!item.review_after;
     stability.className = `cognition-stability stability-${isCurrent ? 'current' : 'stable'}`;
@@ -1781,9 +1769,6 @@ function renderCognitiveDrafts(meta = {}) {
         title.className = 'cognition-draft-title';
         const label = document.createElement('strong');
         label.textContent = section.label;
-        const badge = document.createElement('span');
-        badge.className = `cognition-level level-${item.level || 'explicit'}`;
-        badge.textContent = COGNITIVE_LEVEL_LABELS[item.level] || '明确陈述';
         const actionTag = document.createElement('span');
         actionTag.className = 'cognition-action';
         if (item.action === 'reinforce') {
@@ -1928,7 +1913,6 @@ async function confirmCognitiveReinforce(index) {
         subject: target.subject,
         cognitive_type: target.cognitive_type,
         content: target.content,
-        level: target.level || 'explicit',
         confidence: target.confidence,
         evidence_memory_ids: target.evidence_memory_ids || [],
         review_after: target.review_after || null,
@@ -1962,7 +1946,6 @@ async function confirmCognitiveRetire(index) {
         confidence: item.confidence ?? 0.7,
         evidence_memory_ids: item.evidence_memory_ids || [],
         review_after: item.review_after || null,
-        level: item.level || 'explicit',
         action: 'retire',
         target_id: item.target_id,
         retain_id: item.retain_id ?? null,
@@ -2030,7 +2013,6 @@ function startCognitiveEdit(section, item = null, saveLabel = '保存认知', ac
     document.getElementById('cognition-content').value = item?.content || '';
     document.getElementById('cognition-confidence').value = item?.confidence ?? '0.7';
     document.getElementById('cognition-evidence').value = (item?.evidence_memory_ids || []).join(', ');
-    document.getElementById('cognition-level').value = item?.level || 'explicit';
     const editingIsCurrent = !!item?.review_after;
     document.getElementById('cognition-stability').value = editingIsCurrent ? 'current' : 'stable';
     const actionHint = document.getElementById('cognition-action-hint');
@@ -2074,7 +2056,6 @@ function cognitiveFormData() {
         review_after: document.getElementById('cognition-stability').value === 'current'
             ? document.getElementById('cognition-review-after').value || defaultReviewAfter()
             : null,
-        level: document.getElementById('cognition-level').value || 'explicit',
     };
     if (editingAction === 'merge' && editingTargetIds && editingTargetIds.length) {
         data.action = 'merge';
@@ -2281,6 +2262,7 @@ function switchSection(name) {
     }
     if (name === 'cognition') {
         loadCognitiveItems();
+        loadMemoryDerivations();
     }
     if (name === 'settings') {
         loadSettings();
@@ -4394,4 +4376,111 @@ function showSettingsMsg(type, text) {
     el.className = 'msg-box msg-' + type;
     el.textContent = text;
     setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+
+// ============================================
+// 记忆演化：从原文记忆推断"没说但正确"的新内容（候选人工确认）
+// ============================================
+const DERIVATION_LEVEL_LABELS = { deductive: '演绎推断', inductive: '归纳推断' };
+
+async function loadMemoryDerivations() {
+    try {
+        const response = await fetch('/api/memories/derivations/pending');
+        const data = await response.json();
+        renderMemoryDerivations(data.items || []);
+    } catch (error) {
+        const status = document.getElementById('memory-evolution-status');
+        if (status) status.textContent = '加载待确认候选失败：' + error.message;
+    }
+}
+
+function renderMemoryDerivations(items) {
+    const root = document.getElementById('memory-evolution-pending');
+    if (!root) return;
+    root.replaceChildren();
+    if (!items.length) {
+        const empty = document.createElement('p');
+        empty.className = 'section-desc';
+        empty.textContent = '没有待确认的演化候选。';
+        root.appendChild(empty);
+        return;
+    }
+    items.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'memory-item';
+        row.style.marginTop = '10px';
+        const title = document.createElement('div');
+        title.className = 'cognition-draft-title';
+        const badge = document.createElement('span');
+        badge.className = `cognition-level level-${item.level || 'inductive'}`;
+        badge.textContent = `${DERIVATION_LEVEL_LABELS[item.level] || '推断'}·置信度${Number(item.confidence).toFixed(2)}`;
+        const tag = document.createElement('span');
+        tag.className = 'cognition-action';
+        tag.textContent = `前提 #${(item.premise_memory_ids || []).join('、')}`;
+        title.append(badge, tag);
+        row.appendChild(title);
+        const content = document.createElement('div');
+        content.className = 'cognition-content';
+        content.textContent = item.content;
+        row.appendChild(content);
+        if (item.reason) {
+            const reason = document.createElement('div');
+            reason.className = 'section-desc';
+            reason.textContent = `推断理由：${item.reason}`;
+            row.appendChild(reason);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'toolbar';
+        actions.style.marginTop = '8px';
+        const accept = document.createElement('button');
+        accept.className = 'btn btn-primary btn-sm';
+        accept.textContent = '确认写入记忆';
+        accept.onclick = () => decideMemoryDerivation(item.id, 'accept');
+        const reject = document.createElement('button');
+        reject.className = 'btn btn-sm';
+        reject.textContent = '拒绝';
+        reject.title = '记录这次拒绝，后续不再重复提出';
+        reject.onclick = () => decideMemoryDerivation(item.id, 'reject');
+        actions.append(accept, reject);
+        row.appendChild(actions);
+        root.appendChild(row);
+    });
+}
+
+async function generateMemoryDerivations() {
+    const button = document.getElementById('memory-evolution-generate');
+    const status = document.getElementById('memory-evolution-status');
+    if (!button) return;
+    button.disabled = true;
+    status.textContent = '正在从原文记忆推断新内容…';
+    try {
+        const response = await fetch('/api/memories/derivations', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || '生成失败');
+        status.textContent = data.items.length
+            ? `已生成 ${data.items.length} 条演化候选，进入待确认列表。`
+            : '没有推断出值得确认的新内容（宁缺毋滥）。';
+        await loadMemoryDerivations();
+    } catch (error) {
+        status.textContent = error.message;
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function decideMemoryDerivation(pendingId, action) {
+    const status = document.getElementById('memory-evolution-status');
+    try {
+        const response = await fetch(`/api/memories/derivations/pending/${pendingId}/${action}`, {
+            method: 'POST',
+        });
+        const result = await response.json();
+        if (!response.ok || result.error) throw new Error(result.error || '操作失败');
+        status.textContent = action === 'accept'
+            ? `已确认写入记忆（#${result.memory_id}，推断记忆）。`
+            : '已拒绝，后续不再重复提出。';
+        await loadMemoryDerivations();
+    } catch (error) {
+        status.textContent = error.message;
+    }
 }

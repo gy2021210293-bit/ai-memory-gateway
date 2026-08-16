@@ -19,6 +19,10 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertEqual(self.html.count("onclick=\"integrateCognitiveScan()\""), 1)       # 整合扫描按钮
         self.assertNotIn("generateCognitiveDraft('user')", self.html)
         self.assertIn("id=\"cognition-review-after\"", self.html)
+        # 记忆演化区
+        self.assertEqual(self.html.count("onclick=\"generateMemoryDerivations()\""), 1)
+        self.assertIn("记忆演化", self.html)
+        self.assertIn("data-layer=\"4\"", self.html)  # 推断记忆分层 Tab
 
     def test_dashboard_renders_three_fixed_sections_and_diff(self):
         for cognitive_type in (
@@ -50,12 +54,10 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertIn("grid-template-columns: minmax(0, 1fr)", self.css)
         self.assertIn("min-width: 0", self.css)
 
-    def test_dashboard_supports_atomic_cards_with_levels_and_lifecycle(self):
-        # 层级下拉
-        self.assertIn('id="cognition-level"', self.html)
-        self.assertIn('<option value="explicit">', self.html)
-        self.assertIn('<option value="inductive">', self.html)
-        self.assertIn("COGNITIVE_LEVEL_LABELS", self.js)
+    def test_dashboard_supports_atomic_cards_with_lifecycle(self):
+        # 层级下拉已移除（分层纪律被证据门槛替代）
+        self.assertNotIn('id="cognition-level"', self.html)
+        self.assertNotIn("COGNITIVE_LEVEL_LABELS", self.js)
         # action 提示与强化确认路径
         self.assertIn("cognition-action-hint", self.html)
         self.assertIn("confirmCognitiveReinforce", self.js)

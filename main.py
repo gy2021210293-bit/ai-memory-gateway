@@ -35,6 +35,7 @@ from database import get_entity_card, apply_entity_snapshot, update_entity_card_
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
 from database import record_cognitive_correction, get_recent_cognitive_corrections
+from database import get_verbatim_memories_for_derivation, queue_memory_derivation, list_memory_derivation_pending, accept_memory_derivation, reject_memory_derivation, deactivate_derivations_with_dangling_premises, memory_derivation_content_exists
 from database import compute_embeddings_batch, cognitive_content_similarity, cognitive_overlap_score, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY, COGNITIVE_OVERLAP_MIN, COGNITIVE_OVERLAP_MIN_RUN, COGNITIVE_EVIDENCE_SIM_MIN
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -92,6 +93,10 @@ MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 # 认知模型自动审视（半自动分级：仅 reinforce 自动应用，其余一律挂起待人工确认）
 COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | auto
 COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "6"))  # 每轮间隔（小时）
+
+# 记忆演化（从原文记忆推断"没说但正确"的新内容）：后台定时 + 手动按钮
+MEMORY_EVOLUTION_INTERVAL_HOURS = int(os.getenv("MEMORY_EVOLUTION_INTERVAL_HOURS", "24"))  # 定时间隔
+COGNITIVE_DERIVE_MAX_RESTATEMENT = 0.9  # 结论与任一前提的相似度上限：超过=旧信息重组，丢弃
 
 # 特征定时重确认（P3 后台任务）
 TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
@@ -358,6 +363,15 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"⚠️ 认知自动审视启动失败: {exc}")
 
+    # 记忆演化（后台调度；候选进待确认队列，人工确认才写记忆）
+    memory_evolution_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            memory_evolution_task = asyncio.create_task(_memory_evolution_loop())
+            print(f"🧠 记忆演化已启动（间隔 {MEMORY_EVOLUTION_INTERVAL_HOURS}h，候选待人工确认）")
+        except Exception as exc:
+            print(f"⚠️ 记忆演化启动失败: {exc}")
+
     yield
 
     if trait_timer_task is not None:
@@ -366,6 +380,8 @@ async def lifespan(app: FastAPI):
         relation_timer_task.cancel()
     if cognitive_auto_task is not None:
         cognitive_auto_task.cancel()
+    if memory_evolution_task is not None:
+        memory_evolution_task.cancel()
     await close_pool()
 
 
@@ -662,7 +678,7 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
         memory_lines = []
         for mem in memories:
             date_str = ""
-            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(mem.get("layer", 1), "记忆")
+            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆", 4: "推断记忆"}.get(mem.get("layer", 1), "记忆")
             if mem.get("created_at"):
                 try:
                     utc_str = str(mem['created_at'])[:19]
@@ -1468,7 +1484,7 @@ async def build_memory_text(user_message: str) -> dict:
         memory_lines = []
         for mem in memories:
             date_str = ""
-            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆"}.get(mem.get("layer", 1), "记忆")
+            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆", 4: "推断记忆"}.get(mem.get("layer", 1), "记忆")
             if mem.get("created_at"):
                 try:
                     utc_str = str(mem['created_at'])[:19]
@@ -3360,6 +3376,208 @@ async def api_integrate_scan():
     """
     items = await _run_integrate_scan()
     return {"status": "scan", "items": items, "scan_count": len(items)}
+
+
+# ============================================================
+# 记忆演化：从原文记忆推断"没说但正确"的新内容（layer=4 推断记忆）
+# ============================================================
+
+async def _build_memory_derivation_draft() -> dict:
+    """记忆演化草稿：从原文记忆推断新内容，产出候选全部走人工确认。
+
+    校验链：前提在样本内且 ≥2 条 → 内容不与已有记忆/待确认/已拒绝重复 →
+    前提相关性（向量 ≥ COGNITIVE_EVIDENCE_SIM_MIN，剔除无关前提）→
+    新信息（结论与任一前提相似度 < COGNITIVE_DERIVE_MAX_RESTATEMENT，防重组）→
+    归纳需跨时间（前提 ≥2 个不同日期）。
+    返回 {"ok", "items", "memories", "model"}。
+    """
+    memories = await get_verbatim_memories_for_derivation(120)
+    if not memories:
+        return {"ok": False, "error": "没有可用于演化的原文记忆"}
+    raw_draft = await _memory_extractor_module.generate_memory_derivations(memories)
+    if raw_draft is None:
+        return {"ok": False, "error": "记忆演化模型调用失败"}
+    allowed_ids = {int(m["id"]) for m in memories}
+    memory_by_id = {int(m["id"]): m for m in memories}
+
+    items = []
+    for raw in raw_draft:
+        if not isinstance(raw, dict):
+            continue
+        content = re.sub(r"\s+", " ", str(raw.get("content") or "")).strip()
+        level = str(raw.get("level") or "").strip().lower()
+        if not content or level not in ("deductive", "inductive"):
+            continue
+        try:
+            confidence = max(0.0, min(1.0, float(raw.get("confidence") or 0.7)))
+        except (TypeError, ValueError):
+            continue
+        premises = []
+        for mid in (raw.get("premise_memory_ids") or []):
+            try:
+                mid = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if mid in allowed_ids and mid not in premises:
+                premises.append(mid)
+        if len(premises) < 2:
+            continue
+        try:
+            if await memory_derivation_content_exists(content):
+                continue
+        except Exception as exc:
+            print(f"⚠️ 记忆演化去重检查失败: {exc}")
+        items.append({
+            "content": content, "level": level, "confidence": confidence,
+            "premise_memory_ids": premises,
+            "reason": str(raw.get("reason") or "").strip()[:200],
+        })
+
+    # 前提相关性 + 新信息校验（有 embedding 时；无 key 退回人工确认把关）
+    if items:
+        card_texts = [it["content"] for it in items]
+        premise_texts, premise_index = [], []
+        for item_idx, it in enumerate(items):
+            for mid in it["premise_memory_ids"]:
+                premise_texts.append(str(memory_by_id.get(mid, {}).get("content") or ""))
+                premise_index.append((item_idx, mid))
+        embeddings = await compute_embeddings_batch(card_texts + premise_texts)
+        if embeddings and len(embeddings) >= len(card_texts):
+            card_embs = embeddings[:len(card_texts)]
+            prem_embs = embeddings[len(card_texts):]
+            kept_premises = {i: [] for i in range(len(items))}
+            best_sims = {i: 0.0 for i in range(len(items))}
+            for k, (item_idx, mid) in enumerate(premise_index):
+                if k >= len(prem_embs):
+                    break
+                ce, pe = card_embs[item_idx], prem_embs[k]
+                if not ce or not pe:
+                    continue
+                sim = cognitive_content_similarity(card_texts[item_idx], premise_texts[k], ce, pe)
+                if sim >= COGNITIVE_EVIDENCE_SIM_MIN:
+                    kept_premises[item_idx].append(mid)
+                    best_sims[item_idx] = max(best_sims[item_idx], sim)
+            filtered = []
+            for item_idx, it in enumerate(items):
+                kept = kept_premises[item_idx]
+                if len(kept) < 2:
+                    continue  # 前提相关性不足
+                if best_sims[item_idx] >= COGNITIVE_DERIVE_MAX_RESTATEMENT:
+                    print(f"🧠 记忆演化：候选与前提几乎相同（旧信息重组），丢弃", flush=True)
+                    continue
+                it["premise_memory_ids"] = kept
+                filtered.append(it)
+            items = filtered
+
+    # 归纳需跨时间（前提 ≥2 个不同日期）
+    inductive_items = [it for it in items if it["level"] == "inductive"]
+    if inductive_items:
+        premise_ids = list({mid for it in inductive_items for mid in it["premise_memory_ids"]})
+        premise_dates = {}
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, created_at FROM memories WHERE id = ANY($1::int[])",
+                    premise_ids,
+                )
+            for row in rows:
+                premise_dates[row["id"]] = str(row["created_at"])[:10]
+        except Exception as exc:
+            print(f"⚠️ 记忆演化前提日期读取失败，跳过跨时间校验: {exc}")
+        if premise_dates:
+            items = [
+                it for it in items
+                if it["level"] != "inductive"
+                or len({premise_dates.get(mid, "") for mid in it["premise_memory_ids"]
+                        if premise_dates.get(mid)}) >= 2
+            ]
+
+    return {"ok": True, "items": items, "memories": memories,
+            "model": _memory_extractor_module.MEMORY_MODEL}
+
+
+@app.post("/api/memories/derivations")
+async def api_generate_memory_derivations():
+    """记忆演化（手动按钮）：从原文记忆推断新内容，候选立即进待确认队列（人工确认才写记忆）。"""
+    result = await _build_memory_derivation_draft()
+    if not result.get("ok"):
+        status_code = 400 if "没有可用于演化" in str(result.get("error")) else 502
+        return JSONResponse(status_code=status_code, content={"error": result.get("error")})
+    queued = []
+    for item in result["items"]:
+        try:
+            pending_id = await queue_memory_derivation(item)
+            queued.append({**item, "id": pending_id})
+        except Exception as exc:
+            print(f"⚠️ 记忆演化候选落库失败: {exc}")
+    return {"status": "draft", "items": queued, "model": result["model"],
+            "evidence_count": len(result["memories"])}
+
+
+@app.get("/api/memories/derivations/pending")
+async def api_list_memory_derivation_pending(limit: int = 50):
+    """记忆演化待确认候选（后台定时 + 手动生成都会汇入，人工确认才生效）。"""
+    return {"items": await list_memory_derivation_pending(limit)}
+
+
+@app.post("/api/memories/derivations/pending/{pending_id}/accept")
+async def api_accept_memory_derivation(pending_id: int):
+    """确认一条演化候选：写入 memories（layer=4 推断记忆），可检索可注入。"""
+    result = await accept_memory_derivation(pending_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/memories/derivations/pending/{pending_id}/reject")
+async def api_reject_memory_derivation(pending_id: int):
+    """拒绝一条演化候选（记录决策，后续不再重复提出）。"""
+    result = await reject_memory_derivation(pending_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+_memory_evolution_lock = asyncio.Lock()
+
+
+async def _memory_evolution_once() -> dict:
+    """一轮记忆演化（后台定时调用）：候选全部进待确认队列，并清理前提失效的派生记忆。"""
+    if _memory_evolution_lock.locked():
+        return {"status": "already_running"}
+    async with _memory_evolution_lock:
+        try:
+            result = await _build_memory_derivation_draft()
+        except Exception as exc:
+            print(f"⚠️ 记忆演化生成异常: {exc}")
+            return {"status": "error"}
+        queued = 0
+        if result.get("ok"):
+            for item in result["items"]:
+                try:
+                    await queue_memory_derivation(item)
+                    queued += 1
+                except Exception as exc:
+                    print(f"⚠️ 记忆演化候选落库失败: {exc}")
+        try:
+            await deactivate_derivations_with_dangling_premises()
+        except Exception as exc:
+            print(f"⚠️ 记忆演化前提清理失败: {exc}")
+        print(f"🧠 记忆演化: {queued} 条候选进入待确认队列", flush=True)
+        return {"status": "ok", "queued": queued}
+
+
+async def _memory_evolution_loop():
+    """后台调度：定时跑一轮记忆演化（候选待人工确认，从不直接写记忆）。"""
+    while True:
+        try:
+            await asyncio.sleep(MEMORY_EVOLUTION_INTERVAL_HOURS * 3600)
+            await _memory_evolution_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 记忆演化任务异常: {exc}")
 
 
 # ============================================================

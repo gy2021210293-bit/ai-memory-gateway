@@ -279,11 +279,11 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [])
         prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
         self.assertIn("conflict 冲突", prompt)
-        self.assertIn("同一次对话里的复述不算多份独立证据", prompt)
         self.assertIn("长期/短期分档（review_after）", prompt)
         self.assertIn("[当前]", prompt)  # 现有卡带稳定度标记
         self.assertIn("不要为“正在聊的话题/主题”建卡", prompt)
         self.assertIn("候选内容不得与任一区块现有 active 卡实质重复", prompt)
+        self.assertNotIn("level", prompt)  # 认知生成不再分层
 
     async def test_cognitive_draft_prompt_feeds_back_human_revisions(self):
         response = Mock()
@@ -382,6 +382,34 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         for call in client.post.await_args_list:
             self.assertNotIn("max_tokens", call.kwargs["json"])
         self.assertIn("只返回最终 JSON 数组", client.post.await_args_list[1].kwargs["json"]["messages"][-1]["content"])
+
+    async def test_memory_derivations_prompt_requires_new_information(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": (
+            '[{"content":"她对数据所有权有高需求，倾向自部署而非云服务","level":"inductive",'
+            '"confidence":0.75,"premise_memory_ids":[1,2],"reason":"多次提到自部署、导出、担心被绑死"}]'
+        )}}]}
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_memory_derivations([
+                {"id": 1, "content": "她坚持自己部署服务器", "layer": 1, "importance": 8,
+                 "created_at": "2026-07-30T08:00:00+00:00"},
+                {"id": 2, "content": "她要求能导出全部数据", "layer": 1, "importance": 7,
+                 "created_at": "2026-08-01T08:00:00+00:00"},
+            ])
+
+        self.assertEqual(result[0]["level"], "inductive")
+        self.assertEqual(result[0]["premise_memory_ids"], [1, 2])
+        prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("演化", prompt)
+        self.assertIn("必须产生新信息", prompt)
+        self.assertIn("premise_memory_ids", prompt)
+        self.assertIn("反幻觉", prompt)
 
 
 if __name__ == "__main__":

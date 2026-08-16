@@ -402,6 +402,56 @@ async def _migrate_cognitive_model_v6(conn) -> int:
     return 0
 
 
+async def _migrate_memory_evolution_v7(conn) -> int:
+    """记忆演化：从原文记忆推断"没说但正确"的新内容（派生记忆）。
+
+    memories 加 derived_from（前提记忆 ID，NULL=原文）与 derivation_level
+    （deductive/inductive，NULL=原文）；派生记忆以 layer=4（推断记忆）存储，
+    自动避开碎片整理（只读 layer=1）并可打注入标记。新增待确认队列与决策日志。
+    Idempotent.
+    """
+    await conn.execute("""
+        ALTER TABLE memories
+        ADD COLUMN IF NOT EXISTS derived_from INTEGER[] DEFAULT NULL
+    """)
+    await conn.execute("""
+        ALTER TABLE memories
+        ADD COLUMN IF NOT EXISTS derivation_level TEXT DEFAULT NULL
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_derivation_pending (
+            id                  SERIAL PRIMARY KEY,
+            content             TEXT NOT NULL,
+            level               TEXT NOT NULL CHECK (level IN ('deductive', 'inductive')),
+            confidence          REAL NOT NULL DEFAULT 0.7,
+            premise_memory_ids  INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+            reason              TEXT DEFAULT '',
+            status              TEXT NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending', 'accepted', 'rejected')),
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            decided_at          TIMESTAMPTZ DEFAULT NULL
+        );
+    """)
+    await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_memory_derivation_pending_status
+        ON memory_derivation_pending (status, created_at);
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_derivation_log (
+            id                  SERIAL PRIMARY KEY,
+            memory_id           INTEGER DEFAULT NULL,
+            action              TEXT NOT NULL CHECK (action IN ('accept', 'reject')),
+            content             TEXT NOT NULL,
+            level               TEXT DEFAULT NULL,
+            confidence          REAL DEFAULT NULL,
+            premise_memory_ids  INTEGER[] DEFAULT NULL,
+            reason              TEXT DEFAULT '',
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    return 0
+
+
 # ============================================================
 # 表结构初始化
 # ============================================================
@@ -832,6 +882,7 @@ async def init_tables():
         await _migrate_cognitive_model_v4(conn)
         await _migrate_cognitive_model_v5(conn)
         await _migrate_cognitive_model_v6(conn)
+        await _migrate_memory_evolution_v7(conn)
 
         # ---- 认知自动审视的待确认队列：模型自动生成的候选，等待人工确认 ----
         await conn.execute("""
@@ -2859,6 +2910,7 @@ async def get_memories_for_cognitive_draft(limit: int = 80):
 
     书签 = gateway_config.cognitive_draft_cursor，记录上次草稿已展示的最大记忆 ID。
     草稿成功生成后才由 advance_cognitive_draft_cursor 推进；生成失败书签不动，下次重试不丢批。
+    包含人工确认过的派生记忆（它们也是事实，可作认知证据）。
     """
     new_limit = min(COGNITIVE_DRAFT_NEW_LIMIT, max(0, int(limit)))
     cursor = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
@@ -2880,6 +2932,7 @@ async def get_memories_for_portrait_review(limit: int = 120):
     短期层只看最近记忆；长期画像需要跨时间模式，所以这里在"书签之后的新记忆"
     之外，再按重要度补抽历史样本（importance >= 6），保证画像模型能看见
     "掌控感"这类横跨时间的模式。按时间倒序，去重由单一查询天然保证。
+    包含人工确认过的派生记忆（它们也是事实，可作认知证据）。
     """
     cursor = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
     pool = await get_pool()
@@ -5676,7 +5729,9 @@ def format_cognitive_items_for_prompt(items: list, today: date = None,
                 confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
             except (TypeError, ValueError):
                 confidence = 0.7
-            level_label = COGNITIVE_LEVEL_LABELS.get(item.get("level", "explicit"), "明确陈述")
+            # 只标例外：不区分明确陈述/推断（分层纪律已被证据门槛替代），
+            # 仅低置信（<0.7）标 [低置信]；临时状态标"当前+更新日期"。
+            prefix = "[低置信] " if confidence < 0.7 else ""
             tag = ""
             if item.get("review_after"):
                 updated = item.get("updated_at")
@@ -5691,10 +5746,7 @@ def format_cognitive_items_for_prompt(items: list, today: date = None,
                     except Exception:
                         updated_text = ""
                 tag = f"（当前状态，更新于 {updated_text}）" if updated_text else "（当前状态）"
-            lines.append(
-                f"- [{level_label}·置信度{confidence:.2f}] "
-                f"{str(item.get('content', '')).strip()}{tag}"
-            )
+            lines.append(f"- {prefix}{str(item.get('content', '')).strip()}{tag}")
         if lines:
             sections.append(f"【{type_labels[cognitive_type]}】\n" + "\n".join(lines))
     if not sections:
@@ -5703,8 +5755,7 @@ def format_cognitive_items_for_prompt(items: list, today: date = None,
     usage = (
         "\n\n使用规则：以下认知是对过往对话的抽象总结，反映双方长期面貌与近期状态，"
         "仅供参考而非强制设定；当前用户消息中更明确、更新的表述始终优先；"
-        "卡间矛盾以更新、更高置信度者为准；“明确陈述”可信于“演绎推断”，"
-        "“归纳推断”仅为倾向；置信度较低的内容只能保守参考；"
+        "卡间矛盾以更新、更高置信度者为准；置信度较低的内容只能保守参考；"
         "自然运用相关认知，不要向用户展示内部字段。"
     )
     return header + "\n" + "\n\n".join(sections) + usage
@@ -6061,6 +6112,180 @@ async def get_recent_cognitive_corrections(limit: int = 10) -> list:
             LIMIT $1
         """, max(1, int(limit)))
     return [dict(r) for r in rows]
+
+
+# ============================================================
+# 记忆演化：从原文记忆推断"没说但正确"的新内容（派生记忆，layer=4）
+# ============================================================
+
+async def get_verbatim_memories_for_derivation(limit: int = 120) -> list:
+    """演化用的原文记忆样本：非派生（derived_from IS NULL）且 active，
+    按"重要度 ≥6 或 30 天内"加权混合，时间倒序。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, importance, created_at, layer, title
+            FROM memories
+            WHERE is_active = TRUE AND derived_from IS NULL
+              AND (importance >= 6 OR created_at > NOW() - INTERVAL '30 days')
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+        """, max(1, int(limit)))
+        return [dict(r) for r in rows]
+
+
+async def queue_memory_derivation(item: dict) -> int:
+    """把一条演化候选放入待确认队列。返回 pending id。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO memory_derivation_pending
+                (content, level, confidence, premise_memory_ids, reason)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+        """, str(item.get("content") or "").strip(),
+            str(item.get("level") or "inductive").strip().lower(),
+            float(item.get("confidence") or 0.7),
+            [int(mid) for mid in (item.get("premise_memory_ids") or [])],
+            str(item.get("reason") or "").strip())
+    return row["id"]
+
+
+async def list_memory_derivation_pending(limit: int = 50) -> list:
+    """未决的演化候选，最旧在前。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, level, confidence, premise_memory_ids, reason,
+                   status, created_at
+            FROM memory_derivation_pending
+            WHERE status = 'pending'
+            ORDER BY id
+            LIMIT $1
+        """, max(1, int(limit)))
+    return [dict(r) for r in rows]
+
+
+async def memory_derivation_content_exists(content: str) -> bool:
+    """演化候选是否与"已有记忆 / 待确认队列 / 已拒绝记录"重复（归一化精确匹配）。"""
+    norm = _normalize_cognitive_content(content)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT content FROM memories WHERE is_active = TRUE AND content IS NOT NULL"
+        )
+        if any(_normalize_cognitive_content(r["content"]) == norm for r in rows):
+            return True
+        pending = await conn.fetch(
+            "SELECT content FROM memory_derivation_pending WHERE status = 'pending'"
+        )
+        if any(_normalize_cognitive_content(r["content"]) == norm for r in pending):
+            return True
+        rejected = await conn.fetch(
+            "SELECT content FROM memory_derivation_log WHERE action = 'reject'"
+        )
+        if any(_normalize_cognitive_content(r["content"]) == norm for r in rejected):
+            return True
+    return False
+
+
+async def accept_memory_derivation(pending_id: int) -> dict:
+    """人工确认一条演化候选：写入 memories（layer=4 推断记忆），记录决策。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                UPDATE memory_derivation_pending
+                SET status = 'accepted', decided_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING id, content, level, confidence, premise_memory_ids, reason
+            """, pending_id)
+            if not row:
+                return {"error": "待确认项不存在或已处理"}
+            item = dict(row)
+            premises = [int(mid) for mid in (item["premise_memory_ids"] or [])]
+            if len(premises) < 2:
+                return {"error": "前提记忆不足（至少 2 条）"}
+            premise_rows = await conn.fetch("""
+                SELECT id, importance FROM memories
+                WHERE id = ANY($1::int[]) AND is_active = TRUE AND derived_from IS NULL
+            """, premises)
+            if len(premise_rows) != len(premises):
+                return {"error": "部分前提记忆缺失或已失效"}
+            importance = max((int(r["importance"]) for r in premise_rows), default=5)
+            new_id = await conn.fetchval("""
+                INSERT INTO memories
+                    (content, importance, layer, derived_from, derivation_level)
+                VALUES ($1, $2, 4, $3, $4)
+                RETURNING id
+            """, item["content"], max(5, min(10, importance)),
+                premises, item["level"])
+            if MEMORY_VECTOR_ENABLED:
+                try:
+                    embedding = await compute_embedding(item["content"])
+                    if embedding:
+                        await save_memory_embedding(conn, new_id, embedding)
+                except Exception as exc:
+                    print(f"⚠️ 派生记忆 {new_id} embedding 计算失败: {exc}")
+            await conn.execute("""
+                INSERT INTO memory_derivation_log
+                    (memory_id, action, content, level, confidence,
+                     premise_memory_ids, reason)
+                VALUES ($1, 'accept', $2, $3, $4, $5, $6)
+            """, new_id, item["content"], item["level"], item["confidence"],
+                premises, item["reason"])
+            return {"status": "ok", "memory_id": new_id}
+
+
+async def reject_memory_derivation(pending_id: int) -> dict:
+    """人工拒绝一条演化候选（记录决策，后续不再重复提出）。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                UPDATE memory_derivation_pending
+                SET status = 'rejected', decided_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING content, level, confidence, premise_memory_ids, reason
+            """, pending_id)
+            if not row:
+                return {"error": "待确认项不存在或已处理"}
+            await conn.execute("""
+                INSERT INTO memory_derivation_log
+                    (memory_id, action, content, level, confidence,
+                     premise_memory_ids, reason)
+                VALUES (NULL, 'reject', $1, $2, $3, $4, $5)
+            """, row["content"], row["level"], row["confidence"],
+                row["premise_memory_ids"], row["reason"])
+    return {"status": "ok"}
+
+
+async def deactivate_derivations_with_dangling_premises() -> int:
+    """后台维护：前提记忆已删除/失效的派生记忆自动停用。返回停用条数。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, derived_from FROM memories
+            WHERE is_active = TRUE AND derived_from IS NOT NULL
+        """)
+        dangling = []
+        for r in rows:
+            premises = [int(mid) for mid in (r["derived_from"] or [])]
+            if not premises:
+                continue
+            alive = await conn.fetchval("""
+                SELECT COUNT(*) FROM memories
+                WHERE id = ANY($1::int[]) AND is_active = TRUE
+            """, premises)
+            if alive != len(premises):
+                dangling.append(r["id"])
+        if dangling:
+            await conn.execute(
+                "UPDATE memories SET is_active = FALSE WHERE id = ANY($1::int[])",
+                dangling,
+            )
+            print(f"🔄 记忆演化：{len(dangling)} 条派生记忆因前提失效而停用", flush=True)
+        return len(dangling)
 
 
 async def accept_cognitive_pending(pending_id: int, resolve: str = None) -> dict:
