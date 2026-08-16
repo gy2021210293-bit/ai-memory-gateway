@@ -1486,7 +1486,7 @@ function renderCognitivePending() {
         } else {
             actionTag.textContent = '新建';
         }
-        title.append(label, badge, actionTag);
+        title.append(label, actionTag);
         row.appendChild(title);
         if ((item.action === 'supersede' || item.action === 'conflict') && target) {
             const diff = document.createElement('div');
@@ -1660,7 +1660,7 @@ function cognitiveCardRow(item) {
         parts.push(`下次复核：${item.review_after}`);
     }
     meta.textContent = parts.join(' · ');
-    row.append(level, stability, content, meta);
+    row.append(stability, content, meta);
     if (item.is_stale) {
         const stale = document.createElement('div');
         stale.className = 'cognition-stale';
@@ -1786,7 +1786,7 @@ function renderCognitiveDrafts(meta = {}) {
         } else {
             actionTag.textContent = '新建';
         }
-        title.append(label, badge, actionTag);
+        title.append(label, actionTag);
         row.appendChild(title);
 
         if ((item.action === 'supersede' || item.action === 'conflict') && target) {
