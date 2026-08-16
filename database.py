@@ -89,7 +89,7 @@ COGNITIVE_TYPE_SUBJECTS = {
 }
 COGNITIVE_ITEM_RECOMMENDED_CHARS = 120
 COGNITIVE_FIELD_REVIEW_DAYS = 14
-# 原子认知卡分层：明确陈述 > 演绎推断 > 归纳推断（编译注入时按此优先级展示）
+# 原子认知卡分层：明确陈述 > 演绎推断 > 归纳推断（explicit 最可信，注入时按此标注）
 COGNITIVE_LEVELS = ("explicit", "deductive", "inductive")
 COGNITIVE_LEVEL_LABELS = {
     "explicit": "明确陈述",
@@ -97,9 +97,12 @@ COGNITIVE_LEVEL_LABELS = {
     "inductive": "归纳推断",
 }
 COGNITIVE_LEVEL_RANK = {"explicit": 0, "deductive": 1, "inductive": 2}
-COGNITIVE_ACTIONS = ("create", "reinforce", "supersede", "conflict")
-COGNITIVE_PER_TYPE_LIMIT = 3   # 编译注入时每格最多展示的 active 卡数
+COGNITIVE_ACTIONS = ("create", "reinforce", "supersede", "conflict", "merge")
+COGNITIVE_PER_TYPE_LIMIT = 3   # 草稿生成每轮每区块最多候选卡数（注入已全量，不再截断）
 COGNITIVE_DRAFT_TOTAL_LIMIT = 12  # 单次草稿最多返回的候选卡数
+# 认知去重阈值：向量余弦 ≥ 此值视为"实质重复"（同区块→强化，跨区块→丢弃）；无向量时退回字符 n-gram。
+COGNITIVE_DUP_EMBED_THRESHOLD = 0.88
+COGNITIVE_DUP_STRING_THRESHOLD = 0.85
 COGNITIVE_DRAFT_NEW_LIMIT = 40  # 增量草稿每次最多只读"书签之后"的新记忆
 COGNITIVE_DRAFT_CURSOR_KEY = "cognitive_draft_cursor"  # 书签：上次草稿已展示的最大记忆 ID
 
@@ -374,6 +377,19 @@ async def _migrate_cognitive_model_v5(conn) -> int:
                 END IF;
             END $$;
         """)
+    return 0
+
+
+async def _migrate_cognitive_model_v6(conn) -> int:
+    """Support merge（整合多张重叠卡）candidates in the pending queue.
+
+    cognitive_pending gains target_ids so a deep-review merge proposal can be
+    queued for human confirmation and applied with all its targets. Idempotent.
+    """
+    await conn.execute("""
+        ALTER TABLE cognitive_pending
+        ADD COLUMN IF NOT EXISTS target_ids INTEGER[] DEFAULT NULL
+    """)
     return 0
 
 
@@ -806,6 +822,7 @@ async def init_tables():
         await _migrate_cognitive_model_v3(conn)
         await _migrate_cognitive_model_v4(conn)
         await _migrate_cognitive_model_v5(conn)
+        await _migrate_cognitive_model_v6(conn)
 
         # ---- 认知自动审视的待确认队列：模型自动生成的候选，等待人工确认 ----
         await conn.execute("""
@@ -830,6 +847,19 @@ async def init_tables():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_cognitive_pending_status
             ON cognitive_pending (status, created_at);
+        """)
+
+        # ---- 认知纠正信号：用户在聊天里明确纠正既往认知（后台提取路径写入）----
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cognitive_corrections (
+                id          SERIAL PRIMARY KEY,
+                content     TEXT NOT NULL,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cognitive_corrections_created
+            ON cognitive_corrections (created_at);
         """)
         
         # 尝试启用pgvector扩展（向量搜索）
@@ -1020,6 +1050,51 @@ async def compute_embedding(text: str) -> list:
     except Exception as e:
         print(f"⚠️ Embedding计算失败: {e}")
         return []
+
+
+async def compute_embeddings_batch(texts: list) -> list:
+    """批量计算文本向量（一次 API 调用，去重保序）。
+
+    返回与输入对齐的 list（失败项为空 list）；未配置 EMBEDDING_API_KEY 或
+    调用失败时返回 []，调用方自行退回字符相似度兜底。
+    """
+    texts = [str(t) for t in (texts or []) if str(t or "").strip()]
+    if not texts or not EMBEDDING_API_KEY:
+        return []
+    seen, unique = set(), []
+    for t in texts:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    result_map = {}
+    try:
+        import httpx
+        body = {
+            "model": EMBEDDING_MODEL,
+            "input": unique[:256],
+        }
+        if EMBEDDING_DIM > 0 and "text-embedding" in EMBEDDING_MODEL:
+            body["dimensions"] = EMBEDDING_DIM
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{EMBEDDING_BASE_URL}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {EMBEDDING_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for entry in data.get("data", []):
+                index = entry.get("index")
+                if isinstance(index, int) and 0 <= index < len(unique):
+                    result_map[unique[index]] = entry.get("embedding") or []
+    except Exception as e:
+        print(f"⚠️ 批量Embedding计算失败: {e}")
+        return []
+    return [result_map.get(t, []) for t in texts]
 
 
 async def save_memory_embedding(conn, memory_id: int, embedding: list):
@@ -2787,6 +2862,26 @@ async def get_memories_for_cognitive_draft(limit: int = 80):
             ORDER BY created_at DESC, id DESC
             LIMIT $2
         """, cursor, new_limit)
+        return [dict(row) for row in rows]
+
+
+async def get_memories_for_portrait_review(limit: int = 120):
+    """画像审视（深度/低频）证据：增量 + 重要历史抽样混合。
+
+    短期层只看最近记忆；长期画像需要跨时间模式，所以这里在"书签之后的新记忆"
+    之外，再按重要度补抽历史样本（importance >= 6），保证画像模型能看见
+    "掌控感"这类横跨时间的模式。按时间倒序，去重由单一查询天然保证。
+    """
+    cursor = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, importance, created_at, layer, title
+            FROM memories
+            WHERE is_active = TRUE AND (id > $1 OR importance >= $2)
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+        """, cursor, 6, max(1, int(limit)))
         return [dict(row) for row in rows]
 
 
@@ -5360,6 +5455,26 @@ def _normalize_cognitive_content(content) -> str:
     return re.sub(r"\s+", " ", str(content or "")).strip().casefold()
 
 
+def _char_ngram_similarity(a: str, b: str, n: int = 2) -> float:
+    """字符 n-gram Jaccard 相似度：无向量时的低成本兜底（对中文改写有一定容忍度）。"""
+    def ngrams(text):
+        text = re.sub(r"\s+", "", str(text or ""))
+        if len(text) < n:
+            return {text} if text else set()
+        return {text[i:i + n] for i in range(len(text) - n + 1)}
+    ga, gb = ngrams(a), ngrams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def cognitive_content_similarity(a: str, b: str, emb_a=None, emb_b=None) -> float:
+    """认知内容语义相似度：双方都有向量时用余弦（0-1），否则退回字符 n-gram。"""
+    if emb_a and emb_b and len(emb_a) == len(emb_b):
+        return float(_cosine_sim(emb_a, emb_b))
+    return float(_char_ngram_similarity(a, b))
+
+
 def normalize_cognitive_item_input(data: dict) -> dict:
     """Validate the deliberately small manual cognitive-item schema."""
     subject = str(data.get("subject", "")).strip().lower()
@@ -5384,7 +5499,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         raise ValueError("level 必须是 explicit、deductive 或 inductive")
     action = str(data.get("action", "create")).strip().lower()
     if action not in COGNITIVE_ACTIONS:
-        raise ValueError("action 必须是 create、reinforce、supersede 或 conflict")
+        raise ValueError("action 必须是 create、reinforce、supersede、conflict 或 merge")
     target_id = data.get("target_id")
     if target_id in (None, ""):
         target_id = None
@@ -5393,7 +5508,19 @@ def normalize_cognitive_item_input(data: dict) -> dict:
             target_id = int(target_id)
         except (TypeError, ValueError):
             raise ValueError("target_id 必须是卡片 ID")
-    if action != "create" and target_id is None:
+    # merge（合并多张重叠卡为一张）用 target_ids 列表
+    target_ids = []
+    for value in (data.get("target_ids") or []):
+        try:
+            card_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if card_id > 0 and card_id not in target_ids:
+            target_ids.append(card_id)
+    if action == "merge":
+        if len(target_ids) < 2:
+            raise ValueError("merge 必须指定至少 2 个 target_ids")
+    elif action != "create" and target_id is None:
         raise ValueError("reinforce / supersede / conflict 必须指定 target_id")
     evidence_ids = []
     for value in data.get("evidence_memory_ids", []) or []:
@@ -5425,6 +5552,7 @@ def normalize_cognitive_item_input(data: dict) -> dict:
         "level": level,
         "action": action,
         "target_id": target_id,
+        "target_ids": target_ids,
     }
 
 
@@ -5440,39 +5568,17 @@ def is_cognitive_item_stale(item: dict, today: date = None) -> bool:
     return review_after <= (today or _local_today())
 
 
-def _cognitive_query_words(query: str) -> list:
-    """Extract meaningful 2+ char keywords from the user message for relevance.
-
-    优先用 jieba.analyse 提取关键词（生产环境），失败则退回正则取 2+ 字词。
-    """
-    query = str(query or "").strip()
-    if len(query) < 2:
-        return []
-    words = []
-    try:
-        raw = jieba.analyse.extract_tags(query, topK=8)
-        words = [str(w).strip() for w in raw if len(str(w).strip()) >= 2]
-    except Exception:
-        words = []
-    if not words:
-        words = list({w for w in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", query)})
-    return words[:8]
-
-
 def format_cognitive_items_for_prompt(items: list, today: date = None,
                                       context: dict = None) -> str:
     """Format active cognition for chat injection.
 
-    无 context（旧行为，完全兼容）：每格按"分层优先级 → 强化次数 → 新近度"排序，
-    取最多 COGNITIVE_PER_TYPE_LIMIT 张卡。
+    全量注入：不过滤、不设上限、不做话题相关排序。认知是独立于当前话题的
+    抽象层（性格、价值观、习惯、情绪模式、关系模式等），每轮完整呈现。
 
-    有 context（当前对话感知）：context = {"query": 用户消息,
-    "related_memory_ids": 当前检索到的记忆 ID 集合}。排序改为
-    "相关分 → 证据命中数 → 强化次数 → 置信度 → 分层 → 过期 → ID"：
-    - 相关分 = 证据关联命中（强信号，卡由哪些检索到的记忆总结而来）+ 关键词命中（弱）；
-    - 同分时逐级裁决，最后以 ID 兜底，保证完全确定、可复现；
-    - 相关才多给：相关分 > 0 的按序取前 COGNITIVE_PER_TYPE_LIMIT 张；
-      全部不相关时每格只保底 1 张最核心卡，避免冷场也不灌背景板。
+    临时认知（带 review_after）到期后自动退休：不再注入（需人工续期/删除/
+    转为稳定才会回来）。输出按区块分组（用户核心 / AI 自我核心 / 关系核心），
+    组内新的在前（id 降序）——仅为人类可读的稳定输出，没有任何优先级含义。
+    `context` 参数保留仅为兼容旧调用方，实际被忽略（认知不再按话题筛选）。
     """
     if not items:
         return ""
@@ -5491,105 +5597,70 @@ def format_cognitive_items_for_prompt(items: list, today: date = None,
             continue
         by_type.setdefault(cognitive_type, []).append(item)
 
-    related_ids = set()
-    query_words = []
-    if context:
-        raw_ids = context.get("related_memory_ids") or []
-        related_ids = {int(mid) for mid in raw_ids if mid is not None}
-        query_words = _cognitive_query_words(context.get("query") or "")
-
-    def relevance(item):
-        """0..N 相关分：证据关联为主，关键词命中为辅。"""
-        hits = 0
-        score = 0.0
-        if related_ids:
-            ev = set(item.get("evidence_memory_ids") or [])
-            hits = len(ev & related_ids)
-            if hits:
-                score += 1.0 + 0.4 * hits
-        if query_words:
-            content = str(item.get("content") or "")
-            hit = sum(1 for word in query_words if word in content)
-            if hit:
-                score += 0.3 * (hit / len(query_words))
-        return score, hits
-
-    if context:
-        def sort_key(item):
-            rel, hits = relevance(item)
-            level = item.get("level", "explicit")
-            return (
-                -rel, -hits,
-                -int(item.get("times_derived") or 1),
-                -float(item.get("confidence") or 0),
-                COGNITIVE_LEVEL_RANK.get(level, COGNITIVE_LEVEL_RANK["explicit"]),
-                is_cognitive_item_stale(item, today=today),
-                -int(item.get("id") or 0),
-            )
-
-        def pick(pool):
-            ranked = sorted(pool, key=sort_key)
-            relevant = [item for item in ranked if relevance(item)[0] > 0]
-            selected = relevant[:COGNITIVE_PER_TYPE_LIMIT]
-            return selected or ranked[:1]  # 全不相关 → 保底 1 张最核心卡
-    else:
-        def sort_key(item):
-            level = item.get("level", "explicit")
-            return (
-                COGNITIVE_LEVEL_RANK.get(level, COGNITIVE_LEVEL_RANK["explicit"]),
-                -int(item.get("times_derived") or 1),
-                -int(item.get("id") or 0),
-            )
-
-        def pick(pool):
-            return sorted(pool, key=sort_key)[:COGNITIVE_PER_TYPE_LIMIT]
-
     sections = []
     for cognitive_type in COGNITIVE_TYPE_ORDER:
-        selected = pick(by_type.get(cognitive_type, []))
-        if not selected:
+        pool = by_type.get(cognitive_type, [])
+        if not pool:
             continue
+        # 组内新的在前：固定、可复现，无优先级含义
+        ordered = sorted(pool, key=lambda item: -int(item.get("id") or 0))
         lines = []
-        for item in selected:
+        for item in ordered:
+            if is_cognitive_item_stale(item, today=today):
+                continue  # 临时认知到期：自动退休，不注入（人工续期/删除/转稳定后回来）
             try:
                 confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
             except (TypeError, ValueError):
                 confidence = 0.7
             level_label = COGNITIVE_LEVEL_LABELS.get(item.get("level", "explicit"), "明确陈述")
             tag = ""
-            if context:
-                tag = "（与当前话题相关）" if relevance(item)[0] > 0 else "（长期核心，保留参考）"
-            stale = ""
-            if is_cognitive_item_stale(item, today=today):
-                stale = "（可能过时，只能作为背景）"
-            elif item.get("review_after"):
-                stale = "（当前状态）"
+            if item.get("review_after"):
+                updated = item.get("updated_at")
+                updated_text = ""
+                if updated:
+                    try:
+                        if hasattr(updated, "strftime"):
+                            updated_text = updated.strftime("%m月%d日")
+                        else:
+                            s = str(updated)
+                            updated_text = f"{s[5:7]}月{s[8:10]}日" if len(s) >= 10 else ""
+                    except Exception:
+                        updated_text = ""
+                tag = f"（当前状态，更新于 {updated_text}）" if updated_text else "（当前状态）"
             lines.append(
                 f"- [{level_label}·置信度{confidence:.2f}] "
-                f"{str(item.get('content', '')).strip()}{tag}{stale}"
+                f"{str(item.get('content', '')).strip()}{tag}"
             )
-        sections.append(f"【{type_labels[cognitive_type]}】\n" + "\n".join(lines))
+        if lines:
+            sections.append(f"【{type_labels[cognitive_type]}】\n" + "\n".join(lines))
     if not sections:
         return ""
-    header = "【三元一场认知模型（按当前话题筛选，仅供参考）】" if context else "【三元一场认知模型】"
+    header = "【三元一场认知模型（参考）】"
     usage = (
-        "\n\n使用规则：当前用户消息，以及其中更明确、更新的日期或状态，始终优先于以上认知；"
-        "置信度较低的内容只能保守参考；标记为“可能过时”的认知只能作为背景，不得当作当前事实；"
-        "“明确陈述”优先于“演绎推断”，“归纳推断”仅为倾向；"
-        "自然体现相关认知，不要向用户展示内部字段。"
+        "\n\n使用规则：以下认知是对过往对话的抽象总结，反映双方长期面貌与近期状态，"
+        "仅供参考而非强制设定；当前用户消息中更明确、更新的表述始终优先；"
+        "卡间矛盾以更新、更高置信度者为准；“明确陈述”可信于“演绎推断”，"
+        "“归纳推断”仅为倾向；置信度较低的内容只能保守参考；"
+        "自然运用相关认知，不要向用户展示内部字段。"
     )
-    if context:
-        usage += (
-            "\n以下认知按与本次话题的相关度筛选注入：与当前话题关联的认知优先，"
-            "无关联时仅保留长期核心作参考。"
-        )
     return header + "\n" + "\n\n".join(sections) + usage
 
 
-async def list_cognitive_items(active_only: bool = False):
+async def list_cognitive_items(active_only: bool = False, reviewed_only: bool = False):
+    """列出认知卡。
+
+    active_only: 只列 status='active'。
+    reviewed_only: 只列"人工审核过"的卡（created_by <> 'auto'）——AI 自动应用的卡
+    一律视为未审核，不得注入；注入路径必须传 True，保证只有用户确认过的认知生效。
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        where = "WHERE status = 'active'" if active_only else ""
+        where_parts = []
+        if active_only:
+            where_parts.append("status = 'active'")
+        if reviewed_only:
+            where_parts.append("created_by <> 'auto'")
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         rows = await conn.fetch(f"""
             SELECT id, subject, cognitive_type, content, confidence,
                    evidence_memory_ids, review_after, status, created_by,
@@ -5669,6 +5740,59 @@ async def save_cognitive_item(data: dict, item_id: int = None, created_by: str =
                     content_before=target["content"], content_after=target["content"],
                     level_before=target["level"], level_after=target["level"],
                 )
+            elif action == "merge":
+                # 合并 = 把多张重叠/碎片化的卡整合成一张新卡，旧卡全部留档可追溯。
+                if not item["target_ids"]:
+                    return {"error": "merge 必须指定至少 2 个目标卡"}
+                merge_targets = []
+                for card_id in item["target_ids"]:
+                    mt = await conn.fetchrow("""
+                        SELECT id, subject, cognitive_type, content, level, times_derived,
+                               confidence, evidence_memory_ids, review_after, status
+                        FROM cognitive_items
+                        WHERE id = $1 AND status = 'active'
+                        FOR UPDATE
+                    """, card_id)
+                    if not mt:
+                        return {"error": f"目标认知卡 #{card_id} 不存在或已失效"}
+                    if (mt["subject"] != item["subject"]
+                            or mt["cognitive_type"] != item["cognitive_type"]):
+                        return {"error": f"目标认知卡 #{card_id} 与新建认知不属于同一区块"}
+                    merge_targets.append(mt)
+                merged_evidence = list(dict.fromkeys(
+                    ev for mt in merge_targets for ev in (mt["evidence_memory_ids"] or [])
+                ))
+                merged_evidence = list(dict.fromkeys([*merged_evidence, *evidence_ids]))[:50]
+                review_after = item["review_after"] or max(
+                    (mt["review_after"] for mt in merge_targets if mt["review_after"]),
+                    default=None,
+                )
+                carry = max(int(mt["times_derived"]) for mt in merge_targets)
+                row = await conn.fetchrow("""
+                    INSERT INTO cognitive_items
+                        (subject, cognitive_type, content, confidence,
+                         evidence_memory_ids, review_after, created_by,
+                         level, times_derived, supersedes)
+                    VALUES ($1, $2, $3, $4, $5, $6, $10, $7, $8, $9)
+                    RETURNING *
+                """, item["subject"], item["cognitive_type"], item["content"],
+                     item["confidence"], merged_evidence, review_after,
+                     item["level"], carry, merge_targets[0]["id"],
+                     created_by)
+                await conn.execute("""
+                    UPDATE cognitive_items
+                    SET status = 'superseded', superseded_by = $2, updated_at = NOW()
+                    WHERE id = ANY($1::int[])
+                """, [mt["id"] for mt in merge_targets], row["id"])
+                log_action = "merge" if created_by != "auto" else "auto_merge"
+                await _record_cognitive_revision(
+                    conn, card_id=row["id"], subject=row["subject"],
+                    cognitive_type=row["cognitive_type"], action=log_action,
+                    content_before="｜".join(str(mt["content"]) for mt in merge_targets),
+                    content_after=row["content"],
+                    level_before="｜".join(str(mt["level"]) for mt in merge_targets),
+                    level_after=row["level"],
+                )
             else:
                 # create 或 supersede：插入新卡；supersede 保留旧卡为历史并记录指针。
                 if action == "create":
@@ -5679,6 +5803,17 @@ async def save_cognitive_item(data: dict, item_id: int = None, created_by: str =
                     norm = _normalize_cognitive_content(item["content"])
                     if any(_normalize_cognitive_content(row["content"]) == norm for row in existing):
                         return {"error": "该区块已存在相同内容的认知，请用强化或取代"}
+                    # 语义防重（无向量时的 n-gram 兜底）：实质重复也拦下，提示走强化/取代
+                    for row in existing:
+                        row_text = str(row["content"] or "")
+                        if (row_text
+                                and _char_ngram_similarity(item["content"], row_text)
+                                >= COGNITIVE_DUP_STRING_THRESHOLD):
+                            return {"error": (
+                                f"该区块已存在实质重复的认知（相似度 "
+                                f"{_char_ngram_similarity(item['content'], row_text):.0%}），"
+                                f"请用强化或取代"
+                            )}
                 review_after = item["review_after"]
                 if not review_after and target and target["review_after"]:
                     review_after = target["review_after"]
@@ -5778,12 +5913,13 @@ async def queue_cognitive_pending(item: dict, source: str = "auto") -> int:
         row = await conn.fetchrow("""
             INSERT INTO cognitive_pending
                 (subject, cognitive_type, content, confidence, level, action,
-                 target_id, evidence_memory_ids, review_after, source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 target_id, target_ids, evidence_memory_ids, review_after, source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
         """, value["subject"], value["cognitive_type"], value["content"],
             value["confidence"], value["level"], value["action"],
-            value["target_id"], value["evidence_memory_ids"],
+            value["target_id"], value["target_ids"] or None,
+            value["evidence_memory_ids"],
             value["review_after"], source)
     return row["id"]
 
@@ -5794,11 +5930,42 @@ async def list_cognitive_pending(limit: int = 50) -> list:
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, subject, cognitive_type, content, confidence, level,
-                   action, target_id, evidence_memory_ids, review_after,
+                   action, target_id, target_ids, evidence_memory_ids, review_after,
                    source, status, created_at
             FROM cognitive_pending
             WHERE status = 'pending'
             ORDER BY id
+            LIMIT $1
+        """, max(1, int(limit)))
+    return [dict(r) for r in rows]
+
+
+async def record_cognitive_correction(content: str) -> int:
+    """记录一条用户纠正表述（同内容去重，返回新记录 id 或 0）。"""
+    content = re.sub(r"\s+", " ", str(content or "")).strip()
+    if not content:
+        return 0
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow("""
+            SELECT id FROM cognitive_corrections WHERE content = $1 LIMIT 1
+        """, content)
+        if existing:
+            return 0
+        return await conn.fetchval("""
+            INSERT INTO cognitive_corrections (content) VALUES ($1)
+            RETURNING id
+        """, content)
+
+
+async def get_recent_cognitive_corrections(limit: int = 10) -> list:
+    """最近的用户纠正表述（新的在前），供认知审视优先处理。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, created_at
+            FROM cognitive_corrections
+            ORDER BY id DESC
             LIMIT $1
         """, max(1, int(limit)))
     return [dict(r) for r in rows]
@@ -5849,7 +6016,7 @@ async def accept_cognitive_pending(pending_id: int, resolve: str = None) -> dict
                 return {"error": "冲突项需指定裁决：supersede / create / keep"}
     payload = {key: item[key] for key in (
         "subject", "cognitive_type", "content", "confidence", "level",
-        "action", "target_id", "evidence_memory_ids", "review_after",
+        "action", "target_id", "target_ids", "evidence_memory_ids", "review_after",
     )}
     result = await save_cognitive_item(payload, created_by="manual")
     if result.get("error"):

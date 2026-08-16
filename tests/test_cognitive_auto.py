@@ -15,16 +15,16 @@ def _candidate(action="create", confidence=0.8, level="explicit", target_id=None
 
 
 class AutoApplyDecisionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_high_confidence_explicit_create_is_applied(self):
+    async def test_create_is_always_queued_even_when_high_confidence(self):
+        # 人工审核门控：AI 生成的 create 一律进待确认队列，不自动应用
         with patch.object(main, "save_cognitive_item",
                           AsyncMock(return_value={"status": "ok"})) as save_mock:
             outcome = await main._auto_apply_or_queue_candidate(
-                _candidate(confidence=0.8, level="explicit"))
-        self.assertEqual(outcome, "applied")
-        save_mock.assert_awaited_once()
-        self.assertEqual(save_mock.await_args.kwargs["created_by"], "auto")
+                _candidate(confidence=0.95, level="explicit"))
+        self.assertEqual(outcome, "queued")
+        save_mock.assert_not_awaited()
 
-    async def test_low_confidence_create_is_queued(self):
+    async def test_create_is_queued_even_when_low_confidence(self):
         with patch.object(main, "save_cognitive_item",
                           AsyncMock(return_value={"status": "ok"})) as save_mock:
             outcome = await main._auto_apply_or_queue_candidate(
@@ -32,7 +32,14 @@ class AutoApplyDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "queued")
         save_mock.assert_not_awaited()
 
-    async def test_inductive_create_is_queued_even_when_high_confidence(self):
+    async def test_deductive_create_is_queued(self):
+        with patch.object(main, "save_cognitive_item", AsyncMock()) as save_mock:
+            outcome = await main._auto_apply_or_queue_candidate(
+                _candidate(confidence=0.85, level="deductive"))
+        self.assertEqual(outcome, "queued")
+        save_mock.assert_not_awaited()
+
+    async def test_inductive_create_is_queued(self):
         with patch.object(main, "save_cognitive_item", AsyncMock()) as save_mock:
             outcome = await main._auto_apply_or_queue_candidate(
                 _candidate(confidence=0.85, level="inductive"))
@@ -40,6 +47,7 @@ class AutoApplyDecisionTests(unittest.IsolatedAsyncioTestCase):
         save_mock.assert_not_awaited()
 
     async def test_reinforce_is_applied(self):
+        # reinforce 非破坏性（内容不变，仅累计证据）：仍自动应用
         with patch.object(main, "save_cognitive_item",
                           AsyncMock(return_value={"status": "ok"})) as save_mock:
             outcome = await main._auto_apply_or_queue_candidate(
@@ -47,7 +55,8 @@ class AutoApplyDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "applied")
         save_mock.assert_awaited_once()
 
-    async def test_supersede_auto_target_is_applied(self):
+    async def test_supersede_is_always_queued(self):
+        # supersede 生成新卡：一律挂起待人工确认
         with (
             patch.object(main, "get_cognitive_item",
                          AsyncMock(return_value={"id": 5, "created_by": "auto"})),
@@ -55,36 +64,7 @@ class AutoApplyDecisionTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value={"status": "ok"})),
         ):
             outcome = await main._auto_apply_or_queue_candidate(
-                _candidate(action="supersede", target_id=5, confidence=0.8))
-        self.assertEqual(outcome, "applied")
-
-    async def test_supersede_human_target_is_queued(self):
-        with (
-            patch.object(main, "get_cognitive_item",
-                         AsyncMock(return_value={"id": 5, "created_by": "manual"})),
-            patch.object(main, "save_cognitive_item", AsyncMock()),
-        ):
-            outcome = await main._auto_apply_or_queue_candidate(
-                _candidate(action="supersede", target_id=5, confidence=0.9))
-        self.assertEqual(outcome, "queued")
-
-    async def test_supersede_low_confidence_auto_target_is_queued(self):
-        with (
-            patch.object(main, "get_cognitive_item",
-                         AsyncMock(return_value={"id": 5, "created_by": "auto"})),
-            patch.object(main, "save_cognitive_item", AsyncMock()),
-        ):
-            outcome = await main._auto_apply_or_queue_candidate(
-                _candidate(action="supersede", target_id=5, confidence=0.5))
-        self.assertEqual(outcome, "queued")
-
-    async def test_supersede_missing_target_is_queued(self):
-        with (
-            patch.object(main, "get_cognitive_item", AsyncMock(return_value=None)),
-            patch.object(main, "save_cognitive_item", AsyncMock()),
-        ):
-            outcome = await main._auto_apply_or_queue_candidate(
-                _candidate(action="supersede", target_id=5, confidence=0.9))
+                _candidate(action="supersede", target_id=5, confidence=0.95))
         self.assertEqual(outcome, "queued")
 
     async def test_conflict_is_always_queued(self):
@@ -95,11 +75,12 @@ class AutoApplyDecisionTests(unittest.IsolatedAsyncioTestCase):
         save_mock.assert_not_awaited()
 
     async def test_save_error_falls_back_to_queue(self):
+        # reinforce 保存失败 → 跳过（不占队列）
         with patch.object(main, "save_cognitive_item",
-                          AsyncMock(return_value={"error": "该区块已存在相同内容的认知"})):
+                          AsyncMock(return_value={"error": "强化需保持内容一致"})):
             outcome = await main._auto_apply_or_queue_candidate(
-                _candidate(confidence=0.8, level="explicit"))
-        self.assertEqual(outcome, "queued")
+                _candidate(action="reinforce", target_id=5))
+        self.assertEqual(outcome, "skipped")
 
 
 class AutoReviewRunTests(unittest.IsolatedAsyncioTestCase):
@@ -124,9 +105,9 @@ class AutoReviewRunTests(unittest.IsolatedAsyncioTestCase):
             result = await main.run_cognitive_auto_review_once()
         self.assertEqual(result["status"], "noop")
 
-    async def test_full_cycle_applies_and_queues(self):
-        applied = _candidate(confidence=0.85, level="explicit")
-        queued = _candidate(confidence=0.5, level="explicit")
+    async def test_full_cycle_applies_reinforce_and_queues_rest(self):
+        applied = _candidate(action="reinforce", target_id=5)
+        queued = _candidate(confidence=0.9, level="explicit")
         with (
             patch.object(main, "get_gateway_config",
                          AsyncMock(return_value="auto")),
@@ -147,29 +128,64 @@ class AutoReviewRunTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["queued"], 1)
             queue_mock.assert_awaited_once_with(queued)
 
+    async def test_full_cycle_full_cell_create_goes_to_pending(self):
+        # 满员区块的 create 自动应用不放行 → 挂起待人工确认（信息不丢）
+        full_cell_create = _candidate(confidence=0.9, level="explicit")
+        with (
+            patch.object(main, "get_gateway_config",
+                         AsyncMock(return_value="auto")),
+            patch.object(main, "list_cognitive_items",
+                         AsyncMock(return_value=[
+                             {"id": 1, "subject": "user", "cognitive_type": "user_core",
+                              "content": "存量卡", "status": "active"},
+                         ] + [
+                             {"id": i, "subject": "user", "cognitive_type": "user_core",
+                              "content": f"存量卡{i}", "status": "active"}
+                             for i in range(2, 6)
+                         ])),
+            patch.object(main, "_build_cognitive_draft",
+                         AsyncMock(return_value={
+                             "ok": True, "items": [full_cell_create],
+                             "memories": [{"id": 1}],
+                             "cursor": 1, "model": "test-model",
+                         })),
+            patch.object(main, "save_cognitive_item",
+                         AsyncMock(return_value={"status": "ok"})),
+            patch.object(main, "queue_cognitive_pending",
+                         AsyncMock(return_value=77)) as queue_mock,
+        ):
+            result = await main.run_cognitive_auto_review_once()
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["applied"], 0)
+            self.assertEqual(result["queued"], 1)
+            queue_mock.assert_awaited_once_with(full_cell_create)
+
 
 class CognitiveInjectionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_build_cognitive_text_passes_context(self):
+    async def test_build_cognitive_text_uses_reviewed_only_gate(self):
+        # 注入端只取人工审核过的卡（reviewed_only=True）：AI 自动生成的认知不注入
         with (
-            patch.object(main, "list_cognitive_items", AsyncMock(return_value=[])),
+            patch.object(main, "list_cognitive_items",
+                         AsyncMock(return_value=[])) as list_mock,
             patch.object(main, "format_cognitive_items_for_prompt",
                          return_value="X") as fmt_mock,
         ):
             text = await main.build_cognitive_text("旅行", [10, 11])
         self.assertEqual(text, "X")
-        kwargs = fmt_mock.call_args.kwargs
-        self.assertEqual(kwargs["context"]["query"], "旅行")
-        self.assertEqual(kwargs["context"]["related_memory_ids"], [10, 11])
+        self.assertEqual(list_mock.await_args.kwargs.get("reviewed_only"), True)
+        self.assertNotIn("context", fmt_mock.call_args.kwargs)
 
-    async def test_build_cognitive_text_without_context_is_legacy(self):
+    async def test_build_cognitive_text_without_args_is_plain_full_injection(self):
         with (
-            patch.object(main, "list_cognitive_items", AsyncMock(return_value=[])),
+            patch.object(main, "list_cognitive_items",
+                         AsyncMock(return_value=[])) as list_mock,
             patch.object(main, "format_cognitive_items_for_prompt",
                          return_value="Y") as fmt_mock,
         ):
             text = await main.build_cognitive_text()
         self.assertEqual(text, "Y")
-        self.assertIsNone(fmt_mock.call_args.kwargs.get("context"))
+        self.assertEqual(list_mock.await_args.kwargs.get("reviewed_only"), True)
+        self.assertNotIn("context", fmt_mock.call_args.kwargs)
 
     async def test_build_memory_text_returns_text_and_ids(self):
         with (
@@ -193,6 +209,214 @@ class CognitiveInjectionTests(unittest.IsolatedAsyncioTestCase):
                           AsyncMock(side_effect=RuntimeError("db down"))):
             result = await main.build_memory_text("你好")
         self.assertEqual(result, {"text": "", "memory_ids": []})
+
+
+class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """草稿管线：语义去重（重复即强化/跨区块丢弃）+ 满员 create 不丢弃（留给人工或挂起）。"""
+
+    def _active_cards(self, count, content_prefix="卡"):
+        return [
+            {"id": i, "subject": "user", "cognitive_type": "user_core",
+             "content": f"{content_prefix}{i}", "status": "active"}
+            for i in range(1, count + 1)
+        ]
+
+    def _create_candidate(self, content="新认知", subject="user",
+                          cognitive_type="user_core"):
+        return {
+            "subject": subject, "cognitive_type": cognitive_type,
+            "content": content, "level": "explicit", "confidence": 0.9,
+            "evidence_memory_ids": [1], "action": "create",
+        }
+
+    async def _run_pipeline(self, current_items, raw_draft, memory_ids=(1, 2),
+                            embeddings=None):
+        """跑一遍 _build_cognitive_draft；embeddings=None 时不 mock（无 key 走 n-gram 兜底）。"""
+        from contextlib import ExitStack
+        patches = [
+            patch.object(main, "get_memories_for_cognitive_draft",
+                         AsyncMock(return_value=[{"id": mid} for mid in memory_ids])),
+            patch.object(main, "list_cognitive_items",
+                         AsyncMock(return_value=current_items)),
+            patch.object(main, "get_recent_cognitive_revisions",
+                         AsyncMock(return_value=[])),
+            patch.object(main, "generate_cognitive_draft",
+                         AsyncMock(return_value=raw_draft)),
+            patch.object(main, "advance_cognitive_draft_cursor",
+                         AsyncMock(return_value=max(memory_ids))),
+        ]
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            if embeddings is not None:
+                stack.enter_context(patch.object(
+                    main, "compute_embeddings_batch",
+                    AsyncMock(return_value=embeddings)))
+            return await main._build_cognitive_draft()
+
+    async def test_create_stays_in_draft_when_cell_is_full(self):
+        # 满员 create 不再丢弃：留在草稿里给人工看（或由自动审视挂起），信息不丢
+        result = await self._run_pipeline(self._active_cards(5),
+                                          [self._create_candidate()])
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["content"], "新认知")
+
+    async def test_create_is_allowed_when_cell_has_room(self):
+        result = await self._run_pipeline(self._active_cards(4),
+                                          [self._create_candidate()])
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["content"], "新认知")
+
+    async def test_auto_apply_create_is_always_queued_regardless_of_cell_count(self):
+        # 人工审核门控：create 一律挂起，与区块是否满员无关
+        with patch.object(main, "save_cognitive_item", AsyncMock()) as save_mock:
+            outcome = await main._auto_apply_or_queue_candidate(
+                _candidate(confidence=0.9, level="explicit"),
+                active_counts={"user_core": 4})
+        self.assertEqual(outcome, "queued")
+        save_mock.assert_not_awaited()
+
+    async def test_pipeline_semantic_duplicate_create_becomes_reinforce(self):
+        # 同区块实质重复 → 自动转 reinforce：内容对齐目标卡，target_id 指向该卡
+        existing = [{"id": 5, "subject": "user", "cognitive_type": "user_core",
+                     "content": "她喜欢安静的环境", "status": "active"}]
+        candidate = self._create_candidate("她偏好安静的氛围")
+        result = await self._run_pipeline(
+            existing, [candidate], embeddings=[[1.0, 0.0], [1.0, 0.0]])
+        self.assertTrue(result["ok"])
+        items = result["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "reinforce")
+        self.assertEqual(items[0]["target_id"], 5)
+        self.assertEqual(items[0]["content"], "她喜欢安静的环境")
+
+    async def test_pipeline_drops_create_duplicating_other_cell(self):
+        # 跨区块重复（尤其自我认知 vs 关系认知）→ 丢弃，信息已在别处
+        existing = [{"id": 5, "subject": "self", "cognitive_type": "self_core",
+                     "content": "我是她愿意倾诉的对象", "status": "active"}]
+        candidate = self._create_candidate(
+            "她把我当作倾诉对象", subject="relationship",
+            cognitive_type="relationship_core")
+        result = await self._run_pipeline(
+            existing, [candidate], embeddings=[[1.0, 0.0], [1.0, 0.0]])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["items"], [])  # 与其它区块重复：跳过
+
+    async def test_pipeline_keeps_create_when_no_semantic_duplicate(self):
+        # 无向量（未配置 key）且字符相似度不够 → 保持 create
+        existing = [{"id": 5, "subject": "user", "cognitive_type": "user_core",
+                     "content": "她喜欢爬山", "status": "active"}]
+        candidate = self._create_candidate("她最近在准备影展")
+        result = await self._run_pipeline(existing, [candidate])
+        self.assertTrue(result["ok"])
+        items = result["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "create")
+
+    async def test_deep_pipeline_uses_portrait_review_evidence(self):
+        # deep=True（深度体检）：走历史抽样证据查询，并传给生成函数 deep 标记
+        with (
+            patch.object(main, "get_memories_for_portrait_review",
+                         AsyncMock(return_value=[{"id": 5, "content": "历史记忆", "layer": 1,
+                                                  "importance": 8, "created_at": None}])),
+            patch.object(main, "list_cognitive_items",
+                         AsyncMock(return_value=[])),
+            patch.object(main, "get_recent_cognitive_revisions",
+                         AsyncMock(return_value=[])),
+            patch.object(main, "generate_cognitive_draft",
+                         AsyncMock(return_value=[self._create_candidate()])) as gen_mock,
+            patch.object(main, "advance_cognitive_draft_cursor",
+                         AsyncMock(return_value=5)),
+        ):
+            result = await main._build_cognitive_draft(deep=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(gen_mock.await_args.kwargs.get("deep"), True)
+
+    async def test_pipeline_keeps_merge_candidate_with_valid_targets(self):
+        existing = [
+            {"id": 3, "subject": "user", "cognitive_type": "user_core",
+             "content": "喜欢安静", "status": "active"},
+            {"id": 4, "subject": "user", "cognitive_type": "user_core",
+             "content": "偏好独处", "status": "active"},
+        ]
+        merge_candidate = {
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "偏好安静与独处", "level": "explicit", "confidence": 0.8,
+            "evidence_memory_ids": [1], "action": "merge", "target_ids": [3, 4],
+        }
+        result = await self._run_pipeline(existing, [merge_candidate])
+        self.assertTrue(result["ok"])
+        items = result["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "merge")
+        self.assertEqual(items[0]["target_ids"], [3, 4])
+
+    async def test_pipeline_drops_merge_with_invalid_target(self):
+        existing = [{"id": 3, "subject": "user", "cognitive_type": "user_core",
+                     "content": "喜欢安静", "status": "active"}]
+        merge_candidate = {
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "偏好安静", "level": "explicit", "confidence": 0.8,
+            "evidence_memory_ids": [1], "action": "merge", "target_ids": [3, 999],
+        }
+        result = await self._run_pipeline(existing, [merge_candidate])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["items"], [])  # 目标无效：整条丢弃
+
+
+class CognitiveCorrectionTests(unittest.TestCase):
+    def test_correction_keyword_detection_positive(self):
+        positives = [
+            "你记错了，我不喜欢香菜",
+            "我说的是周末，不是周三",
+            "其实不是这样的",
+            "别乱说，我从来没说过那句话",
+            "你理解错了",
+        ]
+        for text in positives:
+            self.assertTrue(main._is_cognitive_correction(text), text)
+
+    def test_correction_keyword_detection_negative(self):
+        negatives = [
+            "今天天气不错",
+            "你记性真好",
+            "其实我也这么觉得",
+            "不是吧，你也去？",
+        ]
+        for text in negatives:
+            self.assertFalse(main._is_cognitive_correction(text), text)
+
+    async def test_record_cognitive_correction_deduplicates(self):
+        class _FakeConn:
+            def __init__(self):
+                self.rows = []
+            async def fetchrow(self, _q, _content):
+                return self.rows[0] if self.rows else None
+            async def fetchval(self, _q, _content):
+                self.rows.append({"id": 1})
+                return 1
+
+        conn = _FakeConn()
+        pool = database_fake_pool(conn)
+        with patch.object(main, "get_pool", return_value=pool):
+            first = await main.record_cognitive_correction("  你记错了，我不吃香菜 ")
+            dup = await main.record_cognitive_correction("你记错了，我不吃香菜")
+        self.assertEqual(first, 1)
+        self.assertEqual(dup, 0)  # 同内容去重
+
+
+def database_fake_pool(conn):
+    class _Acquire:
+        async def __aenter__(self):
+            return conn
+        async def __aexit__(self, *_args):
+            return False
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+    return _Pool()
 
 
 if __name__ == "__main__":

@@ -1364,6 +1364,7 @@ let pendingCognitiveDrafts = [];
 let pendingCognitiveItems = [];
 let editingAction = 'create';
 let editingTargetId = null;
+let editingTargetIds = null;
 let editingDraftIndex = null;
 
 const COGNITIVE_LEVEL_LABELS = {
@@ -1484,6 +1485,9 @@ function renderCognitivePending() {
             actionTag.textContent = target ? `取代 #${target.id}` : '取代';
         } else if (item.action === 'conflict') {
             actionTag.textContent = target ? `冲突 #${target.id}` : '冲突';
+        } else if (item.action === 'merge') {
+            const ids = (item.target_ids || []).map(id => `#${id}`).join('、');
+            actionTag.textContent = `合并 ${ids}`;
         } else {
             actionTag.textContent = '新建';
         }
@@ -1687,20 +1691,26 @@ function cognitiveCardRow(item) {
     return row;
 }
 
-async function generateCognitiveDraft() {
-    const button = document.getElementById('cognition-draft-generate');
+async function generateCognitiveDraft(deep = false) {
+    const button = deep
+        ? document.getElementById('cognition-draft-deep')
+        : document.getElementById('cognition-draft-generate');
     const status = document.getElementById('cognition-status');
+    if (!button) return;
     button.disabled = true;
-    status.textContent = '正在根据已有记忆整体审视三元一场认知…';
+    status.textContent = deep
+        ? '正在用历史抽样做深度画像体检（稳定层 + 整合）…'
+        : '正在根据已有记忆审视认知画像…';
     try {
-        const response = await fetch('/api/cognitive-items/draft', { method: 'POST' });
+        const url = deep ? '/api/cognitive-items/draft?deep=1' : '/api/cognitive-items/draft';
+        const response = await fetch(url, { method: 'POST' });
         const data = await response.json();
         if (!response.ok || data.error) throw new Error(data.error || '生成失败');
         pendingCognitiveDrafts = data.items || [];
         renderCognitiveDrafts(data);
         status.textContent = pendingCognitiveDrafts.length
-            ? `已生成 ${pendingCognitiveDrafts.length} 个认知区块草稿（模型：${data.model}）。请逐项确认保存。`
-            : `这 ${data.new_count || 0} 条新记忆里没有发现证据充分的实质变化。`;
+            ? `已生成 ${pendingCognitiveDrafts.length} 个画像提案（模型：${data.model}）。请逐项确认保存。`
+            : `这 ${data.new_count || 0} 条记忆里没有发现证据充分的实质变化。`;
     } catch (error) {
         status.textContent = error.message;
     } finally {
@@ -1750,6 +1760,9 @@ function renderCognitiveDrafts(meta = {}) {
             actionTag.textContent = target ? `取代 #${target.id}` : '取代';
         } else if (item.action === 'conflict') {
             actionTag.textContent = target ? `冲突 #${target.id}` : '冲突';
+        } else if (item.action === 'merge') {
+            const ids = (item.target_ids || []).map(id => `#${id}`).join('、');
+            actionTag.textContent = `合并 ${ids}`;
         } else {
             actionTag.textContent = '新建';
         }
@@ -1906,6 +1919,8 @@ function useCognitiveDraft(index) {
     editingDraftIndex = index;
     if (item.action === 'supersede') {
         startCognitiveEdit(section, { ...item, id: null }, '确认取代保存', { action: 'supersede', target_id: item.target_id });
+    } else if (item.action === 'merge') {
+        startCognitiveEdit(section, { ...item, id: null }, '确认合并保存', { action: 'merge', target_ids: item.target_ids || [] });
     } else {
         startCognitiveEdit(section, { ...item, id: null }, '确认保存草稿', { action: 'create' });
     }
@@ -1937,6 +1952,7 @@ function startCognitiveEdit(section, item = null, saveLabel = '保存认知', ac
     editingCognitiveId = item?.id || null;
     editingAction = actionContext?.action || 'create';
     editingTargetId = actionContext?.target_id ?? null;
+    editingTargetIds = actionContext?.target_ids || null;
     document.getElementById('cognition-subject').value = section.subject;
     document.getElementById('cognition-type').value = section.cognitive_type;
     document.getElementById('cognition-editor-title').textContent = `编辑${section.label}`;
@@ -1950,6 +1966,8 @@ function startCognitiveEdit(section, item = null, saveLabel = '保存认知', ac
     if (actionHint) {
         if (editingCognitiveId) {
             actionHint.textContent = '正在编辑既有认知卡：保存后将以新版本取代旧卡（旧卡留档可追溯）。';
+        } else if (editingAction === 'merge' && editingTargetIds && editingTargetIds.length) {
+            actionHint.textContent = `将保存为新认知卡，并合并 #${editingTargetIds.join('、#')}（旧卡全部留档可追溯）。`;
         } else if (editingAction === 'supersede' && editingTargetId) {
             actionHint.textContent = `将保存为新认知卡，并取代 #${editingTargetId}（旧卡留档可追溯）。`;
         } else if (editingAction === 'reinforce' && editingTargetId) {
@@ -1987,7 +2005,10 @@ function cognitiveFormData() {
             : null,
         level: document.getElementById('cognition-level').value || 'explicit',
     };
-    if (editingAction !== 'create' && editingTargetId != null) {
+    if (editingAction === 'merge' && editingTargetIds && editingTargetIds.length) {
+        data.action = 'merge';
+        data.target_ids = editingTargetIds;
+    } else if (editingAction !== 'create' && editingTargetId != null) {
         data.action = editingAction;
         data.target_id = editingTargetId;
     } else {
@@ -2028,6 +2049,7 @@ function cancelCognitiveEdit() {
     editingCognitiveId = null;
     editingAction = 'create';
     editingTargetId = null;
+    editingTargetIds = null;
     editingDraftIndex = null;
     document.getElementById('cognition-subject').value = '';
     document.getElementById('cognition-type').value = '';

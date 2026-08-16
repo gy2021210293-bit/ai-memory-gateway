@@ -127,6 +127,24 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertEqual(item["action"], "conflict")
         self.assertEqual(item["target_id"], 7)
 
+    def test_normalize_merge_requires_at_least_two_targets(self):
+        with self.assertRaises(ValueError):
+            database.normalize_cognitive_item_input({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "x", "action": "merge", "target_ids": [3],
+            })
+        with self.assertRaises(ValueError):
+            database.normalize_cognitive_item_input({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "x", "action": "merge",
+            })
+        item = database.normalize_cognitive_item_input({
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "x", "action": "merge", "target_ids": [3, "4", 3],
+        })
+        self.assertEqual(item["action"], "merge")
+        self.assertEqual(item["target_ids"], [3, 4])
+
     def test_prompt_does_not_truncate_a_selected_item(self):
         content = "详细认知" * 80
         prompt = database.format_cognitive_items_for_prompt([{
@@ -176,7 +194,8 @@ class CognitiveModelTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertGreater(len(prompt), 1000)
 
-    def test_prompt_keeps_top_cards_per_section_and_drops_lowest_ranked(self):
+    def test_prompt_injects_all_cards_without_cap(self):
+        # 全量注入：不再有每格 3 张的上限，所有 active 卡都进提示词
         prompt = database.format_cognitive_items_for_prompt([
             {"subject": "user", "cognitive_type": "user_core",
              "content": "较早状态", "level": "explicit", "times_derived": 1, "id": 1},
@@ -187,57 +206,38 @@ class CognitiveModelTests(unittest.TestCase):
             {"subject": "user", "cognitive_type": "user_core",
              "content": "推断状态", "level": "inductive", "times_derived": 9, "id": 3},
         ])
-        # 每格最多 COGNITIVE_PER_TYPE_LIMIT 张：明确陈述优先，归纳推断被挤出
-        self.assertIn("较早状态", prompt)
-        self.assertIn("重复状态", prompt)
-        self.assertIn("第四状态", prompt)
-        self.assertNotIn("推断状态", prompt)
+        for content in ("较早状态", "重复状态", "第四状态", "推断状态"):
+            self.assertIn(content, prompt)
 
-    def test_stale_current_card_is_still_injected_with_warning(self):
-        item = {
-            "subject": "user",
-            "cognitive_type": "user_core",
-            "content": "旧的当前状态",
-            "confidence": 0.6,
-            "review_after": date(2026, 7, 30),
-        }
-        prompt = database.format_cognitive_items_for_prompt([item], today=date(2026, 7, 30))
-        self.assertTrue(database.is_cognitive_item_stale(item, today=date(2026, 7, 30)))
-        self.assertIn("旧的当前状态", prompt)
-        self.assertIn("可能过时，只能作为背景", prompt)
-        self.assertNotIn("evidence_memory_ids", prompt)
-
-    def test_context_evidence_hit_ranks_first(self):
-        # 证据关联是最强信号：当前检索到的记忆命中了卡 B 的证据 → B 入选并标注相关
+    def test_prompt_orders_newest_first_within_section(self):
+        # 组内新的在前（id 降序），固定可复现，无优先级含义
         prompt = database.format_cognitive_items_for_prompt([
             {"subject": "user", "cognitive_type": "user_core",
-             "content": "不相关的卡", "level": "explicit",
-             "times_derived": 9, "confidence": 0.9, "id": 1,
-             "evidence_memory_ids": [99]},
+             "content": "旧卡", "level": "explicit", "id": 1},
             {"subject": "user", "cognitive_type": "user_core",
-             "content": "话题相关的卡", "level": "inductive",
+             "content": "新卡", "level": "explicit", "id": 2},
+        ])
+        self.assertLess(prompt.index("新卡"), prompt.index("旧卡"))
+
+    def test_context_is_ignored_full_injection(self):
+        # context 参数保留仅为兼容，实际忽略：不筛选、不标注相关、不降级保底
+        prompt = database.format_cognitive_items_for_prompt([
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "话题相关的卡", "level": "explicit",
              "times_derived": 1, "confidence": 0.5, "id": 2,
              "evidence_memory_ids": [10, 11]},
+            {"subject": "user", "cognitive_type": "user_core",
+             "content": "完全不相关的卡", "level": "explicit",
+             "times_derived": 9, "confidence": 0.9, "id": 1,
+             "evidence_memory_ids": [99]},
         ], context={"query": "zzz不命中词", "related_memory_ids": [10]})
         self.assertIn("话题相关的卡", prompt)
-        self.assertIn("与当前话题相关", prompt)
-        self.assertNotIn("不相关的卡", prompt)  # 相关才多给：无关卡不注入
+        self.assertIn("完全不相关的卡", prompt)
+        self.assertNotIn("与当前话题相关", prompt)
+        self.assertNotIn("按当前话题筛选", prompt)
+        self.assertNotIn("长期核心", prompt)
 
-    def test_context_keyword_hit_ranks_above_irrelevant(self):
-        # 无证据命中时，关键词命中的卡入选，完全不相关的卡被过滤
-        prompt = database.format_cognitive_items_for_prompt([
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "喜欢周末去爬山", "level": "explicit",
-             "times_derived": 1, "confidence": 0.5, "id": 1},
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "完全无关的另一个话题", "level": "explicit",
-             "times_derived": 1, "confidence": 0.5, "id": 2},
-        ], context={"query": "爬山", "related_memory_ids": []})
-        self.assertIn("喜欢周末去爬山", prompt)
-        self.assertNotIn("完全无关的另一个话题", prompt)
-
-    def test_context_tie_breaker_is_deterministic_by_id(self):
-        # 证据命中数、强化次数、置信度、分层全部相同 → 按 ID 稳定裁决，绝不随机
+    def test_context_many_cards_all_injected_deterministically(self):
         items = [
             {"subject": "user", "cognitive_type": "user_core",
              "content": f"同分卡{i}", "level": "explicit",
@@ -249,56 +249,64 @@ class CognitiveModelTests(unittest.TestCase):
         first = database.format_cognitive_items_for_prompt(list(items), context=context)
         second = database.format_cognitive_items_for_prompt(list(items), context=context)
         self.assertEqual(first, second)  # 可复现
-        # 只选 3 张且是最新（id 大）的 3 张
-        self.assertIn("同分卡2", first)
-        self.assertIn("同分卡3", first)
-        self.assertIn("同分卡4", first)
-        self.assertNotIn("同分卡1", first)
+        for i in range(1, 5):
+            self.assertIn(f"同分卡{i}", first)
+        # 新的在前：同分卡4 在 同分卡1 之前
+        self.assertLess(first.index("同分卡4"), first.index("同分卡1"))
 
-    def test_context_relevant_only_dynamic_count(self):
-        # 相关才多给：3 张里只有 1 张相关 → 只注入那 1 张，不灌无关背景板
+    def test_header_is_neutral_reference_not_mandate(self):
         prompt = database.format_cognitive_items_for_prompt([
             {"subject": "user", "cognitive_type": "user_core",
-             "content": "相关的那张", "level": "explicit",
-             "times_derived": 1, "confidence": 0.5, "id": 1,
-             "evidence_memory_ids": [10]},
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "无关甲", "level": "explicit",
-             "times_derived": 3, "confidence": 0.9, "id": 2},
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "无关乙", "level": "explicit",
-             "times_derived": 2, "confidence": 0.8, "id": 3},
-        ], context={"query": "zzz不命中词", "related_memory_ids": [10]})
-        self.assertIn("相关的那张", prompt)
-        self.assertNotIn("无关甲", prompt)
-        self.assertNotIn("无关乙", prompt)
-
-    def test_context_all_irrelevant_falls_back_to_one_core_card(self):
-        # 全部不相关 → 每格只保底 1 张最核心卡，标注"长期核心，保留参考"
-        prompt = database.format_cognitive_items_for_prompt([
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "核心甲", "level": "explicit",
-             "times_derived": 2, "confidence": 0.8, "id": 1},
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "核心乙", "level": "explicit",
-             "times_derived": 1, "confidence": 0.7, "id": 2},
-        ], context={"query": "完全无关的话题词", "related_memory_ids": []})
-        self.assertIn("按当前话题筛选，仅供参考", prompt)
-        self.assertIn("长期核心，保留参考", prompt)
-        self.assertIn("核心甲", prompt)
-        self.assertNotIn("核心乙", prompt)
-
-    def test_without_context_keeps_legacy_behavior(self):
-        # 无 context（旧调用）→ 排序与输出和以前完全一致：无筛选标注、无相关性标记
-        prompt = database.format_cognitive_items_for_prompt([
-            {"subject": "user", "cognitive_type": "user_core",
-             "content": "旧行为卡", "level": "explicit",
+             "content": "示例认知", "level": "explicit",
              "times_derived": 1, "confidence": 0.5, "id": 1},
         ])
-        self.assertIn("【三元一场认知模型】", prompt)
+        self.assertIn("【三元一场认知模型（参考）】", prompt)
+        self.assertNotIn("必须遵守", prompt)
         self.assertNotIn("按当前话题筛选", prompt)
         self.assertNotIn("与当前话题相关", prompt)
         self.assertNotIn("长期核心", prompt)
+        self.assertIn("仅供参考", prompt)
+
+    def test_expired_current_card_is_retired_from_injection(self):
+        # 临时认知到期自动退休：不再注入（人工续期/删除/转稳定后才会回来）
+        item = {
+            "subject": "user",
+            "cognitive_type": "user_core",
+            "content": "旧的当前状态",
+            "confidence": 0.6,
+            "review_after": date(2026, 7, 30),
+        }
+        prompt = database.format_cognitive_items_for_prompt([item], today=date(2026, 7, 30))
+        self.assertTrue(database.is_cognitive_item_stale(item, today=date(2026, 7, 30)))
+        self.assertNotIn("旧的当前状态", prompt)
+        self.assertEqual(prompt, "")
+
+    def test_unexpired_current_card_is_injected_with_state_marker(self):
+        # 未到期的临时卡照常注入，标"（当前状态）"
+        item = {
+            "subject": "user",
+            "cognitive_type": "user_core",
+            "content": "正在准备旅行",
+            "confidence": 0.8,
+            "review_after": date(2026, 8, 13),
+        }
+        prompt = database.format_cognitive_items_for_prompt([item], today=date(2026, 7, 30))
+        self.assertIn("正在准备旅行", prompt)
+        self.assertIn("（当前状态）", prompt)
+
+    def test_current_card_shows_update_date(self):
+        # 状态卡标"更新于 X 日"，AI 知道新鲜度
+        item = {
+            "subject": "user",
+            "cognitive_type": "user_core",
+            "content": "最近在忙新项目",
+            "confidence": 0.8,
+            "review_after": date(2026, 8, 20),
+            "updated_at": "2026-08-13T08:00:00+00:00",
+        }
+        prompt = database.format_cognitive_items_for_prompt([item], today=date(2026, 7, 30))
+        self.assertIn("最近在忙新项目", prompt)
+        self.assertIn("（当前状态，更新于 08月13日）", prompt)
 
 
 class _FakeTransaction:
@@ -691,6 +699,74 @@ class CognitiveSaveTests(unittest.IsolatedAsyncioTestCase):
             })
         self.assertEqual(result["error"], "冲突需先裁决为具体动作（保留/取代/新建/修正）")
 
+    async def test_merge_combines_cards_into_one_and_retires_targets(self):
+        targets = [
+            {"id": 3, "subject": "user", "cognitive_type": "user_core",
+             "content": "喜欢安静", "level": "explicit", "times_derived": 1,
+             "confidence": 0.7, "evidence_memory_ids": [1], "review_after": None,
+             "status": "active"},
+            {"id": 4, "subject": "user", "cognitive_type": "user_core",
+             "content": "偏好独处", "level": "inductive", "times_derived": 2,
+             "confidence": 0.6, "evidence_memory_ids": [2], "review_after": None,
+             "status": "active"},
+        ]
+
+        class _MergeConn:
+            def __init__(self):
+                self.transaction_context = _FakeTransaction()
+                self.executions = []
+
+            def transaction(self):
+                return self.transaction_context
+
+            async def fetch(self, _query, arg):
+                return [{"id": mid} for mid in (arg or [])]
+
+            async def fetchrow(self, query, *args):
+                normalized = " ".join(query.split())
+                if "FOR UPDATE" in normalized:
+                    return next((t for t in targets if t["id"] == args[0]), None)
+                if normalized.startswith("INSERT INTO cognitive_items"):
+                    return {
+                        "id": 99, "subject": args[0], "cognitive_type": args[1],
+                        "content": args[2], "confidence": args[3],
+                        "evidence_memory_ids": args[4], "review_after": args[5],
+                        "status": "active", "created_by": args[9],
+                        "level": args[6], "times_derived": args[7],
+                        "supersedes": args[8], "superseded_by": None,
+                    }
+                raise AssertionError(normalized)
+
+            async def execute(self, query, *args):
+                self.executions.append((" ".join(query.split()), args))
+                return "UPDATE 2"
+
+        conn = _MergeConn()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "偏好安静与独处", "level": "explicit",
+                "confidence": 0.8, "evidence_memory_ids": [3],
+                "action": "merge", "target_ids": [3, 4],
+            })
+        self.assertEqual(result["item"]["id"], 99)
+        self.assertEqual(result["item"]["supersedes"], 3)
+        # 两张旧卡全部标记 superseded
+        superseded = [
+            args for query, args in conn.executions
+            if "SET status = 'superseded'" in query
+        ]
+        self.assertEqual(superseded[0][0], [3, 4])
+        # 修订日志记 merge
+        revisions = [
+            args for query, args in conn.executions
+            if query.startswith("INSERT INTO cognitive_revision_log")
+        ]
+        self.assertEqual(revisions[0][3], "merge")
+        self.assertIn("喜欢安静", revisions[0][4])   # content_before 含两张旧卡
+        self.assertIn("偏好独处", revisions[0][4])
+        self.assertEqual(revisions[0][5], "偏好安静与独处")
+
 
 class _FakeDeleteConnection:
     def __init__(self, row=None):
@@ -832,6 +908,21 @@ class CognitiveEvidenceTests(unittest.IsolatedAsyncioTestCase):
                          new=AsyncMock(return_value="0")):
             self.assertEqual(await database.advance_cognitive_draft_cursor([]), 0)
 
+    async def test_list_cognitive_items_reviewed_only_filters_auto(self):
+        # 注入门控：reviewed_only=True 时 SQL 必须排除 created_by='auto'（未人工审核）
+        conn = _FakeEvidenceConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            await database.list_cognitive_items(active_only=True, reviewed_only=True)
+        self.assertIn("status = 'active'", conn.query)
+        self.assertIn("created_by <> 'auto'", conn.query)
+
+    async def test_list_cognitive_items_without_reviewed_only_keeps_all(self):
+        conn = _FakeEvidenceConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            await database.list_cognitive_items(active_only=True)
+        self.assertIn("status = 'active'", conn.query)
+        self.assertNotIn("created_by <> 'auto'", conn.query)
+
 
 class _FakePendingConnection:
     """Fake conn for cognitive_pending queue flows.
@@ -879,7 +970,7 @@ def _pending_row(action="create", target_id=None, confidence=0.6, level="inducti
         "id": 7, "subject": "user", "cognitive_type": "user_core",
         "content": "低置信度的候选认知", "confidence": confidence,
         "level": level, "action": action, "target_id": target_id,
-        "evidence_memory_ids": [12], "review_after": None,
+        "target_ids": None, "evidence_memory_ids": [12], "review_after": None,
         "source": "auto", "status": "pending",
     }
 

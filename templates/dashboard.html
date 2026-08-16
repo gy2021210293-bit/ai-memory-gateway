@@ -631,8 +631,11 @@
                 </div>
                 <div class="card">
                     <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
-                        <span class="section-desc">综合最多60条高信号记忆与20条最新记忆，一次提出新建 / 强化 / 取代的原子认知卡；手动模式不会自动保存，自动模式安全项直接应用、拿不准的挂起待确认。</span>
-                        <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft()">重新审视认知</button>
+                        <span class="section-desc">审视认知画像：常规审视用最近记忆维护短期层；深度体检用历史抽样做稳定层体检与整合（合并重叠卡）。AI 只提议，一律经你确认后生效。</span>
+                        <div class="toolbar">
+                            <button class="btn btn-secondary" id="cognition-draft-generate" onclick="generateCognitiveDraft(false)">重新审视认知</button>
+                            <button class="btn btn-secondary" id="cognition-draft-deep" onclick="generateCognitiveDraft(true)">深度体检</button>
+                        </div>
                     </div>
                     <div id="cognition-status" class="section-desc" style="margin-top:10px"></div>
                     <div id="cognition-draft-list" style="display:none;margin-top:16px"></div>
@@ -750,9 +753,9 @@
                         <label>认知模型自动审视 (COGNITIVE_AUTO_MODE)</label>
                         <select id="set-COGNITIVE_AUTO_MODE" class="input">
                             <option value="manual">手动（现状，草稿需逐条确认）</option>
-                            <option value="auto">自动应用（安全项直接应用，拿不准的挂起待确认）</option>
+                            <option value="auto">自动审视（AI 生成的认知一律挂起待确认）</option>
                         </select>
-                        <small class="form-hint">自动模式：reinforce 全部应用；高置信度明确/演绎新建自动保存；取代只动自动建的卡；低置信度、归纳推断、取代人工确认的卡、冲突 → 挂起待确认</small>
+                        <small class="form-hint">自动模式：仅 reinforce（内容不变的证据累计）自动应用；create / supersede / conflict 一律进待确认队列——只有人工审核过的认知才会被注入</small>
                     </div>
                     <div class="settings-field">
                         <label>自动审视间隔小时 (COGNITIVE_AUTO_INTERVAL_HOURS)</label>

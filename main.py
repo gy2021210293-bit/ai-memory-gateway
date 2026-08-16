@@ -29,11 +29,13 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, cleanup_low_importance_fragments, revert_merge
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, get_memories_for_portrait_review, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, cleanup_low_importance_fragments, revert_merge
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
+from database import record_cognitive_correction, get_recent_cognitive_corrections
+from database import compute_embeddings_batch, cognitive_content_similarity, COGNITIVE_DUP_EMBED_THRESHOLD
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
@@ -87,10 +89,9 @@ MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 
-# 认知模型自动审视（半自动分级：安全项自动应用，拿不准的挂起待确认）
+# 认知模型自动审视（半自动分级：仅 reinforce 自动应用，其余一律挂起待人工确认）
 COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | auto
 COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "6"))  # 每轮间隔（小时）
-AUTO_COGNITIVE_CREATE_CONFIDENCE = 0.7  # create 自动应用的置信度门槛（低于此值挂起待确认）
 
 # 特征定时重确认（P3 后台任务）
 TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
@@ -644,11 +645,7 @@ async def build_system_prompt_with_memories(user_message: str, base_system_promp
         direct_entities = await find_directly_mentioned_entities(user_message)
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
         cognitive_text = format_cognitive_items_for_prompt(
-            await list_cognitive_items(active_only=True),
-            context={
-                "query": user_message,
-                "related_memory_ids": [mem["id"] for mem in memories],
-            },
+            await list_cognitive_items(active_only=True, reviewed_only=True)
         )
 
         if not memories and not cognitive_text and not direct_entities:
@@ -1503,20 +1500,16 @@ async def build_memory_text(user_message: str) -> dict:
 
 
 async def build_cognitive_text(user_message: str = "", related_memory_ids=None) -> str:
-    """Format confirmed active cognition for partitioned chat requests.
+    """Format confirmed active cognition for chat requests.
 
-    带当前话题上下文时按相关度筛选注入（证据关联 + 关键词命中，卡片从
-    "固定 top-N" 变为"聊什么带什么"）；无上下文时保持旧的固定排序行为。
+    全量注入：认知是独立于当前话题的抽象层（性格/价值观/习惯/情绪模式/关系模式），
+    每轮完整呈现，不做检索筛选。只注入"人工审核过"的卡（created_by <> 'auto'）——
+    AI 自动生成的认知一律先进待确认队列，确认后才生效。`user_message` /
+    `related_memory_ids` 参数保留仅为兼容旧调用方，实际被忽略。
     """
     try:
-        context = None
-        if user_message or related_memory_ids:
-            context = {
-                "query": user_message or "",
-                "related_memory_ids": list(related_memory_ids or []),
-            }
         return format_cognitive_items_for_prompt(
-            await list_cognitive_items(active_only=True), context=context
+            await list_cognitive_items(active_only=True, reviewed_only=True)
         )
     except Exception as e:
         print(f"⚠️ 认知模型读取失败: {e}")
@@ -1849,6 +1842,15 @@ async def process_memories_background(
             extraction_claim = None
             return
 
+        # 认知纠正信号：用户在聊天里纠正既往认知 → 记录，供认知审视优先处理
+        # （零额外 LLM 成本，纯关键词判定）。
+        try:
+            for msg in messages_for_extraction:
+                if msg.get("role") == "user" and _is_cognitive_correction(msg.get("content")):
+                    await record_cognitive_correction(str(msg.get("content") or ""))
+        except Exception as exc:
+            print(f"⚠️ 认知纠正信号检测失败: {exc}")
+
         print(
             f"📝 提取对话线 {session_id} 尚未处理的 {extraction_claim['claimed_rounds']} 轮"
             f"（{len(messages_for_extraction)} 条 user/assistant 消息，"
@@ -2145,8 +2147,7 @@ async def _chat_completions_inner(request: Request):
             prepared_drives_text = (
                 gathered[2] if not isinstance(gathered[2], Exception) else ""
             )
-        # 认知按当前话题筛选：记忆检索已拿到关联记忆 ID，认知构建只做 DB 读 + 内存排序，
-        # 零额外 LLM/向量成本，串行等待可接受。
+        # 认知全量注入：独立于记忆检索结果，只做 DB 读 + 内存格式化，零额外 LLM/向量成本。
         try:
             related_memory_ids = (
                 memory_result.get("memory_ids")
@@ -2980,20 +2981,45 @@ async def api_get_cognitive_items():
     return {"items": await list_cognitive_items(active_only=True)}
 
 
-async def _build_cognitive_draft() -> dict:
+# 聊天纠正信号关键词：命中即视为用户在纠正既往认知（后台提取路径记录，
+# 认知审视时优先处理，避免 AI 无视纠正继续保留旧认知）。
+COGNITIVE_CORRECTION_KEYWORDS = (
+    "你记错", "记错了", "我说的是", "其实不是", "不是这样的",
+    "不是那样", "纠正", "更正", "你理解错", "理解错了",
+    "误会了", "别乱说", "我从来没", "才不是",
+)
+
+
+def _is_cognitive_correction(text: str) -> bool:
+    return any(keyword in str(text or "") for keyword in COGNITIVE_CORRECTION_KEYWORDS)
+
+
+async def _build_cognitive_draft(deep: bool = False) -> dict:
     """共享草稿管线：手动按钮与自动审视循环共用。
 
-    只读书签之后的新记忆；草稿生成成功才推进书签（失败不丢批）。
+    deep=False（默认，高频）：只读书签之后的新记忆，维护现有卡 + 短期层。
+    deep=True（低频画像体检）：证据含历史抽样，额外做稳定层体检与整合（merge）。
+    草稿生成成功才推进书签（失败不丢批）。
     返回 {"ok": True, "items": [...], "memories": [...], "cursor": int, "model": str}
     或 {"ok": False, "error": str}。
     """
     allowed_rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES
-    memories = await get_memories_for_cognitive_draft(80)
+    if deep:
+        memories = await get_memories_for_portrait_review(120)
+    else:
+        memories = await get_memories_for_cognitive_draft(80)
     if not memories:
         return {"ok": False, "error": "没有新的记忆可审视（自上次草稿后无新增）"}
     current_items = await list_cognitive_items(active_only=True)
     revisions = await get_recent_cognitive_revisions(30)
-    raw_draft = await generate_cognitive_draft(memories, current_items, revisions)
+    try:
+        corrections = await get_recent_cognitive_corrections(10)
+    except Exception as exc:
+        print(f"⚠️ 认知纠正信号读取失败: {exc}")
+        corrections = []
+    raw_draft = await generate_cognitive_draft(
+        memories, current_items, revisions, corrections, deep=deep
+    )
     if raw_draft is None:
         return {"ok": False, "error": "认知草稿模型调用失败，现有认知未改变"}
     # 生成成功才推进书签：这批记忆已展示过，下次只看更新的；失败则保持原位。
@@ -3008,7 +3034,9 @@ async def _build_cognitive_draft() -> dict:
         existing_norms.setdefault(it["cognitive_type"], set()).add(
             _normalize_cognitive_content(it.get("content"))
         )
-    draft, seen_counts, seen_norms = [], {}, {}
+
+    # ---- 第一遍：规范化 + 基础校验（subject/类型/证据/目标引用）----
+    norm_items = []
     for raw_item in raw_draft:
         if not isinstance(raw_item, dict):
             continue
@@ -3043,6 +3071,105 @@ async def _build_cognitive_draft() -> dict:
                     or target["cognitive_type"] != cognitive_type
                     or target.get("subject") != item["subject"]):
                 continue
+        elif action == "merge":
+            # 合并必须指向同区块现存 active 卡；任一目标无效则整条丢弃。
+            if not item.get("target_ids"):
+                continue
+            valid_targets = all(
+                (card_id in active_by_id
+                 and active_by_id[card_id]["cognitive_type"] == cognitive_type
+                 and active_by_id[card_id].get("subject") == item["subject"])
+                for card_id in item["target_ids"]
+            )
+            if not valid_targets:
+                continue
+        norm_items.append(item)
+
+    # ---- 第二遍：语义去重（防新旧重复 + 重复即强化）----
+    # create 候选与同区块现有卡高度相似 → 自动转 reinforce（内容对齐目标卡，证据在保存时合并）；
+    # 与其它区块卡高度相似 → 丢弃（信息已在别处，防止三区块互相重复）。
+    # 批量向量一次算完；无 embedding（未配置 key）时退回字符 n-gram 相似度。
+    creates = [it for it in norm_items if it["action"] == "create"]
+    if creates and current_items:
+        texts = [str(it["content"]) for it in creates]
+        card_texts = [str(c.get("content") or "") for c in current_items]
+        embeddings = await compute_embeddings_batch(texts + card_texts)
+        emb_map = {}
+        if embeddings:
+            for text, emb in zip(texts + card_texts, embeddings):
+                emb_map.setdefault(text, emb)
+        reinforced_targets = set()
+        for it in creates:
+            content = str(it["content"])
+            emb = emb_map.get(content, []) if emb_map else []
+            best_card, best_sim = None, 0.0
+            for c in current_items:
+                ctext = str(c.get("content") or "")
+                if not ctext or ctext == content:
+                    continue
+                cemb = emb_map.get(ctext, []) if emb_map else []
+                sim = cognitive_content_similarity(content, ctext, emb, cemb)
+                if sim > best_sim:
+                    best_card, best_sim = c, sim
+            if best_card is None or best_sim < COGNITIVE_DUP_EMBED_THRESHOLD:
+                continue
+            if best_card["cognitive_type"] == it["cognitive_type"]:
+                # 同区块重复 → 强化：内容对齐目标卡（save 的 reinforce 要求内容一致），证据合并交给保存层
+                if best_card.get("id") in reinforced_targets:
+                    it["_drop"] = True  # 本批已强化过该卡，避免重复强化
+                    continue
+                reinforced_targets.add(best_card["id"])
+                it["action"] = "reinforce"
+                it["target_id"] = int(best_card["id"])
+                it["content"] = str(best_card.get("content") or "")
+                print(f"🧠 认知去重：候选与同区块卡 #{best_card['id']} 实质重复，转为强化", flush=True)
+            else:
+                it["_drop"] = True  # 跨区块重复：信息已在其它区块的卡上
+                print(f"🧠 认知去重：候选与 {best_card['cognitive_type']} 卡 #{best_card['id']} 重复，跳过", flush=True)
+
+    # ---- 稳定画像卡门槛：≥3 条证据且跨时间（≥2 个不同日期），否则降级为临时卡 ----
+    # 长期认知不允许单次事件/同一天的多条证据伪装成稳定身份；证据不足先当短期认知，
+    # 证据沉淀够了再由后续审视 supersede 转正为 stable。
+    stable_creates = [
+        it for it in norm_items
+        if not it.get("_drop") and it["action"] == "create" and not it["review_after"]
+    ]
+    if stable_creates:
+        evidence_ids = list({ev for it in stable_creates for ev in it["evidence_memory_ids"]})
+        evidence_dates = {}
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, created_at FROM memories WHERE id = ANY($1::int[])",
+                    evidence_ids,
+                )
+            for row in rows:
+                evidence_dates[row["id"]] = str(row["created_at"])[:10]
+        except Exception as exc:
+            print(f"⚠️ 画像卡证据时间读取失败，跳过门槛: {exc}")
+        if evidence_dates:
+            for it in stable_creates:
+                ev_ids = it["evidence_memory_ids"]
+                dates = {evidence_dates.get(mid, "") for mid in ev_ids if evidence_dates.get(mid)}
+                if len(ev_ids) < 3 or len(dates) < 2:
+                    it["review_after"] = (
+                        datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS) + timedelta(days=14)
+                    ).date()
+                    print(
+                        f"🧠 画像卡门槛：证据不足（{len(ev_ids)}条/{len(dates)}个日期），"
+                        "降级为临时卡（到期退休，证据够后再转正）",
+                        flush=True,
+                    )
+
+    # ---- 第三遍：组装（精确重复拦截 + 每轮每区块候选上限）----
+    # 满员 create 不再丢弃：留在草稿给人工看（手动模式）或由自动审视挂起待确认（自动模式）。
+    draft, seen_counts, seen_norms = [], {}, {}
+    for item in norm_items:
+        if item.get("_drop"):
+            continue
+        cognitive_type = item["cognitive_type"]
+        action = item["action"]
         if action == "create":
             norm = _normalize_cognitive_content(item["content"])
             if (norm in existing_norms.get(cognitive_type, set())
@@ -3060,14 +3187,15 @@ async def _build_cognitive_draft() -> dict:
 
 
 @app.post("/api/cognitive-items/draft")
-async def api_generate_cognitive_draft():
+async def api_generate_cognitive_draft(deep: int = 0):
     """Review cognitive sections without persisting any candidate.
 
     Incremental: only new memories since the last successful draft (cursor) are
-    read as evidence. The cursor advances only after generation succeeds, so a
-    failed run never skips a batch. Shared pipeline with the auto-review loop.
+    read as evidence (deep=1 时改为历史抽样，做稳定层体检与整合)。The cursor
+    advances only after generation succeeds, so a failed run never skips a batch.
+    Shared pipeline with the auto-review loop.
     """
-    result = await _build_cognitive_draft()
+    result = await _build_cognitive_draft(deep=bool(deep))
     if not result["ok"]:
         status_code = 400 if "没有新的记忆" in result["error"] else 502
         return JSONResponse(status_code=status_code, content={"error": result["error"]})
@@ -3082,14 +3210,14 @@ async def api_generate_cognitive_draft():
 _cognitive_draft_lock = asyncio.Lock()
 
 
-async def _auto_apply_or_queue_candidate(item: dict) -> str:
-    """半自动分级决策：安全项自动应用，拿不准的挂起待确认。
+async def _auto_apply_or_queue_candidate(item: dict, active_counts: dict = None) -> str:
+    """半自动分级决策：AI 生成的认知一律进待确认队列，人工审核后才生效。
 
     返回 'applied' / 'queued' / 'skipped'。
-    - reinforce：非破坏性，全部自动应用；内容不匹配等异常跳过（不占队列）。
-    - supersede：仅当被取代的卡本身是自动建的且置信度达标才自动；否则挂起。
-    - conflict：永远挂起，等人工裁决。
-    - create：置信度 >= AUTO_COGNITIVE_CREATE_CONFIDENCE 且非归纳推断才自动；否则挂起。
+    - reinforce：非破坏性（内容不变，仅累计证据），全部自动应用；异常跳过。
+    - create / supersede / conflict：一律挂起待人工确认——只有人工审核过的
+      认知才会被注入，自动应用只会把未审核卡塞进库且不会生效。
+    `active_counts` 参数保留仅为兼容旧调用方，不再使用。
     """
     action = item["action"]
     if action == "reinforce":
@@ -3098,40 +3226,19 @@ async def _auto_apply_or_queue_candidate(item: dict) -> str:
         except Exception:
             return "skipped"
         return "applied" if not result.get("error") else "skipped"
-    if action == "supersede":
-        target = None
-        try:
-            target = await get_cognitive_item(item["target_id"])
-        except Exception:
-            target = None
-        if (target is not None and target.get("created_by") == "auto"
-                and float(item.get("confidence") or 0) >= AUTO_COGNITIVE_CREATE_CONFIDENCE):
-            try:
-                result = await save_cognitive_item(item, created_by="auto")
-            except Exception:
-                return "queued"
-            return "applied" if not result.get("error") else "queued"
-        return "queued"
-    if action == "conflict":
-        return "queued"
-    # create
-    if (float(item.get("confidence") or 0) >= AUTO_COGNITIVE_CREATE_CONFIDENCE
-            and item.get("level") != "inductive"):
-        try:
-            result = await save_cognitive_item(item, created_by="auto")
-        except Exception:
-            return "queued"
-        return "applied" if not result.get("error") else "queued"
+    # create / supersede / conflict：一律进待确认队列
     return "queued"
 
 
-async def run_cognitive_auto_review_once() -> dict:
-    """一轮认知自动审视（后台调度调用；只建议自动应用，从不覆盖人工决策）。
+async def run_cognitive_auto_review_once(deep: bool = False) -> dict:
+    """一轮认知自动审视（后台调度调用；AI 生成的认知一律挂起，从不覆盖人工决策）。
 
     - 模式须为 auto（gateway_config 热切换，无需重启）；
     - 与手动生成草稿共用 _cognitive_draft_lock，避免并发重复调模型；
     - 有书签之后的新记忆才生成（零新记忆 = 零 LLM 成本）；
-    - 安全项自动应用，其余落 cognitive_pending 待人工确认。
+    - 只有 reinforce（非破坏性，内容不变）自动应用，create / supersede / conflict / merge
+      全部落 cognitive_pending 待人工确认——只有人工审核过的认知才会注入；
+    - deep=True 为低频画像体检（历史抽样 + 稳定层整合），提议同样进确认队列。
     """
     mode = str(await get_gateway_config("COGNITIVE_AUTO_MODE", COGNITIVE_AUTO_MODE) or COGNITIVE_AUTO_MODE).strip().lower()
     if mode != "auto":
@@ -3139,7 +3246,7 @@ async def run_cognitive_auto_review_once() -> dict:
     if _cognitive_draft_lock.locked():
         return {"status": "already_running"}
     async with _cognitive_draft_lock:
-        result = await _build_cognitive_draft()
+        result = await _build_cognitive_draft(deep=deep)
         if not result["ok"]:
             return {"status": "noop", "reason": result["error"]}
         applied = queued = skipped = 0
@@ -3163,11 +3270,25 @@ async def run_cognitive_auto_review_once() -> dict:
 
 
 async def _cognitive_auto_loop():
-    """Background scheduler: 半自动分级认知审视。模式在面板热切换，循环常驻。"""
+    """Background scheduler: 半自动分级认知审视。模式在面板热切换，循环常驻。
+
+    日常循环做增量审视；每满 7 天追加一轮深度画像体检（历史抽样 + 稳定层整合）。
+    """
     while True:
         try:
             await asyncio.sleep(COGNITIVE_AUTO_INTERVAL_HOURS * 3600)
             await run_cognitive_auto_review_once()
+            # 低频深度体检：上次深度审视距今 >= 7 天时执行一轮（记录时间戳，幂等推进）
+            try:
+                last_deep = str(await get_gateway_config("cognitive_deep_review_at", "") or "")
+                now_local = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)
+                if (not last_deep
+                        or (now_local - datetime.strptime(last_deep[:10], "%Y-%m-%d")).days >= 7):
+                    deep_result = await run_cognitive_auto_review_once(deep=True)
+                    await set_gateway_config("cognitive_deep_review_at", now_local.strftime("%Y-%m-%d"))
+                    print(f"🧠 认知深度体检: {deep_result.get('status')}", flush=True)
+            except Exception as deep_exc:
+                print(f"⚠️ 认知深度体检调度异常: {deep_exc}")
         except asyncio.CancelledError:
             break
         except Exception as exc:

@@ -23,3 +23,6 @@ MEMORY.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime cache
+.tmp/

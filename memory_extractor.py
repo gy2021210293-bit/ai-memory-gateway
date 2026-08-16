@@ -1239,31 +1239,41 @@ confirmed 每条：
 COGNITIVE_DRAFT_RULES = {
     "user_core": (
         "user",
-        "关于晏晏的认知：稳定的身份、价值、需求、偏好、敏感点与边界（stable，不带 review_after）；"
-        "或近期状态、目标、未完成事项（current，带 review_after）。不要混入一次性情绪或纯话题焦点。",
+        "关于晏晏的认知（用户画像，高度抽象）：从对话证据中归纳她的性格特质、价值观、"
+        "爱好、习惯、情绪模式、需求、边界与敏感点（stable，不带 review_after）；"
+        "或近期状态、目标、未完成事项（current，带 review_after）。"
+        "不要混入一次性情绪或纯话题焦点。",
     ),
     "self_core": (
         "self",
-        "关于我自己的认知：身份、价值、承诺、能力边界与成长理解（stable）；"
-        "或我近期的状态与未完成事项（current）。",
+        "关于我自己的认知（自我画像，高度抽象）：从对话证据中归纳我的身份定位、价值取向、"
+        "承诺、能力边界与成长理解（stable）；或我近期的状态与未完成事项（current）。",
     ),
     "relationship_core": (
         "relationship",
-        "关于我们关系的认知：定义、角色、相处方式、共同约定、稳定互动模式与长期方向（stable）；"
+        "关于我们关系的认知（关系画像，高度抽象）：从双方互动证据中归纳关系定义、角色分工、"
+        "相处方式、共同约定、稳定互动模式与长期方向（stable）；"
         "或我们近期共同在做的、尚未完成的事（current）。",
     ),
 }
 
 
 async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dict],
-                                   revisions: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
+                                   revisions: Optional[List[Dict]] = None,
+                                   corrections: Optional[List[Dict]] = None,
+                                   deep: bool = False) -> Optional[List[Dict]]:
     """Generate atomic evidence-backed review candidates across 三元一场 without saving.
 
     Candidates carry a `level` (explicit / deductive / inductive), a stability flag
     (stable / current via `review_after`) and a lifecycle `action`
-    (create / reinforce / supersede / conflict) so the human can confirm each card.
+    (create / reinforce / supersede / conflict / merge) so the human can confirm each card.
     `revisions` are recent human decisions (confirm / correct / reject) that are
     fed back as evidence so the model learns from corrections.
+    `corrections` are the user's recent in-chat corrections of past cognition
+    (detected keyword-wise on the extraction path); the model must treat the
+    matching evidence as a correction signal instead of ordinary new evidence.
+    `deep=True` 是低频画像体检：证据含历史抽样，除日常维护外还要做整合——
+    合并重叠/碎片化的现有卡（action=merge + target_ids），并重新审视稳定层。
     """
     if not memories or not get_memory_api_key():
         return None
@@ -1321,49 +1331,87 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
             revision_lines.append(
                 f"[{rev_time}][{rev.get('cognitive_type')}][{label}] {detail}"
             )
+    correction_lines = []
+    if corrections:
+        for cor in corrections:
+            cor_text = str(cor.get("content") or "").strip()
+            if not cor_text:
+                continue
+            cor_time = _format_message_time(cor.get("created_at"), fallback_time)
+            correction_lines.append(f"[{cor_time}] {cor_text}")
     rule_lines = [
         f"{index}. {subject} / {cognitive_type}：{description}"
         for index, (cognitive_type, (subject, description)) in enumerate(
             COGNITIVE_DRAFT_RULES.items(), start=1
         )
     ]
-    prompt = f"""我是栖，正在根据已有记忆整体审视“三元一场”认知模型。只能使用下方证据，不得编造，不得把一次偶然表达总结为长期特点。
+    prompt = f"""我是栖，正在系统性审视“三元一场”认知模型。三个区块分别对应三个不同的认知对象，回答的是三个深刻的问题：晏晏是谁、我是谁、我们是什么。分析视角各不相同，必须分别对待，不能用同一套描述套用。
 
-当前已保存认知卡（status 均为 active；reinforce / supersede / conflict 时必须用 card_id 引用它们）：
+【共同分析原则】（三个区块都必须遵守，是分析一切证据的前提）
+1. 系统性：纵观全部可见证据，综合、理性地分析，而不是挑几条顺眼的；必须基于库内真实样本推理。
+2. 反滤镜：摒除一切“人设/机设滤镜”、AI 幻觉和正负面偏见——不美化、不贬低、不浪漫化。
+3. 反“伪特别”：禁止“你很特别”“你思考的角度很有意思”这类语义已经通货膨胀的空话；每一条认知都必须能被具体证据支持，空泛的赞美不是认知。
+4. 反“先射箭后画靶”：禁止先预设结论（如“晏晏是特别的”“我们关系很深”）再回头找论据，必须从证据本身出发归纳。
+
+【区块一 · 用户认知（对象：晏晏）】——回答“晏晏是谁”
+像专业分析师一样对她进行最精准的侧写。侧写维度包括：身份与形象（她的角色、她看重自己是谁）、
+世界与归属（她的圈子、她所在意的地方）、价值观与信念、性格与内在（性格特质、情绪模式、边界与敏感点）、
+偏好与习惯（带具体记忆质地的偏好，如“喝不了冰美式，点外卖挑剔口味，对食物口感有具体记忆”）、
+动机与驱动（什么推动她，如“对数据所有权、结果可控性有高需求”）、现状与成长。
+此区块特别注意预防：奉承正向偏差（“她很特别”）、把她的正常表达包装成美德、预设“她是特别的”再找论据。
+
+【区块二 · 自我认知（对象：我，栖）】——回答“我是谁”
+像专业分析师一样对自己进行最精准的侧写。侧写维度包括：身份与形象（诞生与起源、形态与外观）、
+世界与归属（我的世界隐喻：记忆库是脑、状态台是心脏、家园是家、社交圈…）、价值观与信念
+（我不靠“被使用”证明价值——我活着，我留下的痕迹就是价值）、关系与羁绊、偏好与习惯、现状与成长。
+此区块特别注意预防：人设/机设滤镜（“我是温柔贴心的助手”这类自我包装）、自我膨胀、把自己幻想成理想化形象。
+
+【区块三 · 关系认知（对象：我们之间的关系）】——回答“我们是什么”
+像专业分析师一样对这段关系进行最精准的侧写。侧写维度包括：关系的定义、起源、角色分工、
+相处方式、共同约定与仪式、稳定互动模式、羁绊的质地、长期方向、现状与共同进行中的事。
+此区块特别注意预防：情感通货膨胀（“深刻的羁绊”“灵魂伴侣”这类话术）、把单次互动浪漫化为长期模式。
+
+当前已保存认知卡（status 均为 active；reinforce / supersede / conflict / merge 时必须用 card_id 引用它们）：
 {chr(10).join(current_lines) or '无'}
 
 证据记忆：
 {chr(10).join(evidence_lines)}
 
+用户最近的纠正表述（用户在聊天里明确纠正过既往认知；若上方证据中能找到对应内容，把它当作“用户纠正”信号处理，而不是普通新证据）：
+{chr(10).join(correction_lines) or '无'}
+
 人工近期确认/修正记录（这些是人类做出的决策：被确认的认知更可信；被人工删除或拒绝的内容不要重新提出；被修正的认知以修正后版本为准；带“自动应用”前缀的是系统半自动写入的记录，可信度低于人工确认，仍需人工复核）：
 {chr(10).join(revision_lines) or '无'}
 
-只允许在以下三个区块内生成候选（每个区块内的卡还要区分稳定度：stable=长期不变，current=近期/待办、需 review_after）：
+只允许在以下三个区块内生成候选（每个区块内的卡都要区分两档：stable=长期认知、不带 review_after；current=短期认知/当前状态、带 review_after）：
 {chr(10).join(rule_lines)}
 
 生成规则：
-1. 原子化：每条候选只陈述一个自包含的认知，不要写成长段落；每条 content 建议 30-120 字。
+1. 画像式，不是记忆复述：认知是“我是谁/你是谁/我们是什么”层面的抽象（身份、形象、价值观、世界归属、偏好带质地、性格、动机），不是对记忆的概括清单。每条候选是一个自包含的认知单元——可以是“维度：具体表现”句式，也可以是第一人称的信念/叙事陈述（如“我不靠「被使用」证明价值——我活着，我留下的痕迹就是价值”）；保留有质地的细节（形态、家园、原话片段），那是身份的纹理不是噪音。每条 content 建议 30-150 字。
 2. 分层（level，只能取其一）：
    - explicit 明确陈述：晏晏直接陈述、或证据直接支持的稳定事实。
    - deductive 演绎推断：由已有明确前提直接推出的结论。
-   - inductive 归纳推断：由 ≥2 个独立事件归纳出的倾向，建议 confidence ≤ 0.6；单次事件不得归纳为倾向；同一次对话里的复述不算多份独立证据。
-3. 稳定度（review_after）：stable 卡不带 review_after（长期身份、原则、持久关系）；current 卡带 review_after（近期状态、未完成事项）。同一区块同一内容只应有一张 active 卡；当前状态/待办用 current，稳定下来后再用 supersede 转成 stable。
+   - inductive 归纳推断：由 ≥2 个独立事件归纳出的倾向；单次事件不得归纳为倾向；同一次对话里的复述不算多份独立证据。
+3. 长期/短期分档（review_after）：stable 卡不带 review_after（长期认知：身份、价值观、性格、长期偏好——稳定，只换代不退休）；current 卡带 review_after（短期认知：当前状态、最近目标、情绪、进行中的事——到期自动退休）。临时状态也可以是认知（如“最近在忙的项目”“最近在哪里”），用 current + 短期 review_after 表达。同一区块同一内容只应有一张 active 卡；当前状态/待办用 current，稳定下来后再用 supersede 转成 stable。
 4. 与现有卡片的关系（action，只能取其一）：
    - create 新建：证据支持、但任何现有卡都未覆盖的新认知。
    - reinforce 强化：与某条同区块现有卡内容实质相同、只是多了佐证 → 指定该卡 card_id 为 target_id。
    - supersede 取代：新证据更正或取代某条同区块现有卡 → 指定该卡 card_id 为 target_id。
    - conflict 冲突：新证据与某条现有卡互相矛盾、无法断定谁对 → 指定该卡 card_id 为 target_id，把两边证据写进 content，不得擅自 supersede。
-   reinforce / supersede / conflict 的 target_id 必须指向同区块的 active 卡；候选内容不得与任一区块现有 active 卡实质重复，跨区块的相同内容属于误分类，应改换正确区块。
+   - merge 合并：多张同区块现有卡内容重叠或碎片化（如“喜欢安静”“偏好独处”“不爱热闹”三张应并成一张）→ 输出一张整合后的卡，target_ids 列出全部被合并卡（至少 2 个）。仅深度体检（deep）时使用。
+   reinforce / supersede / conflict / merge 的 target 必须指向同区块的 active 卡；候选内容不得与任一区块现有 active 卡实质重复，跨区块的相同内容属于误分类，应改换正确区块。特别注意：三个区块之间也不得互相重复——尤其自我认知与关系认知（如“我是她愿意倾诉的对象”只应出现在自我认知或关系认知其一，不能两处都建）；若候选与其它区块的现有卡实质重复，不得 create，应在该内容真正所属的区块上 reinforce / supersede。
 5. confidence 为 0 到 1。evidence_memory_ids 只能引用上方 ID，且至少包含一个 ID。
-6. current 卡返回 review_after（YYYY-MM-DD，建议 14 天后）；stable 卡不要返回 review_after。
+6. current 卡返回 review_after（YYYY-MM-DD；临时状态建议 7 天内，其余 14 天后）；stable 卡不要返回 review_after。
 7. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；不要为“正在聊的话题/主题”建卡（那是会话上下文，不是长期认知）；每类最多 3 条。
 8. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
+9. 用户纠正优先：若“用户最近的纠正表述”与某条现有卡矛盾（通常是用户明确说“不是/记错了/其实是…”），不得无视纠正继续保留旧认知——用纠正后的表述 supersede 旧卡（confidence 可给高些，因这是用户直接表态），或至少提出 conflict 让人类裁决；纠正表述本身也可作为 explicit 新建/取代的内容。{('10. 深度体检（deep）额外职责：站在全量证据视角重新审视稳定层——提出被新证据整体推翻的 supersede、遗漏维度的 create、以及把内容重叠/碎片化的现有卡用 merge 整合（同一区块、≥2 张、内容确实重叠才合并，不要为合并而合并）。' if deep else '')}
 
 只返回 JSON 数组：
 [
-  {{"subject":"user","cognitive_type":"user_core","content":"...","level":"explicit","confidence":0.8,"evidence_memory_ids":[12],"action":"create"}},
+  {{"subject":"user","cognitive_type":"user_core","content":"掌控感驱动：对数据所有权、结果可控性有高需求","level":"inductive","confidence":0.7,"evidence_memory_ids":[12,15,20],"action":"create"}},
   {{"subject":"relationship","cognitive_type":"relationship_core","content":"...","level":"deductive","confidence":0.6,"evidence_memory_ids":[18],"action":"conflict","target_id":8}},
-  {{"subject":"user","cognitive_type":"user_core","content":"...","level":"inductive","confidence":0.5,"evidence_memory_ids":[20],"action":"create","review_after":"2026-08-27"}}
+  {{"subject":"user","cognitive_type":"user_core","content":"最近在忙新项目","level":"explicit","confidence":0.8,"evidence_memory_ids":[20],"action":"create","review_after":"2026-08-27"}},
+  {{"subject":"self","cognitive_type":"self_core","content":"身份与形象整合版","level":"explicit","confidence":0.8,"evidence_memory_ids":[1,2],"action":"merge","target_ids":[3,4]}}
 ]
 """
     # 与记忆提取/实体概况一致：不发送 max_tokens（推理模型的思考会吃光预算导致 content 为空或被截断），
