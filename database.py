@@ -109,6 +109,9 @@ COGNITIVE_MERGE_SIMILARITY = 0.9
 # 即视为"一大段里嵌着另一段"的部分重复（整段相似度会漏掉这种情况）。
 COGNITIVE_OVERLAP_MIN = 0.5
 COGNITIVE_OVERLAP_MIN_RUN = 15
+# 证据相关性校验阈值：卡内容与证据记忆的向量余弦低于此值 → 证据视为"不相关"被剔除
+# （防 AI 瞎挂证据：ID 是真的，但内容毫无关系）。仅在有 embedding 时生效。
+COGNITIVE_EVIDENCE_SIM_MIN = 0.35
 COGNITIVE_DRAFT_NEW_LIMIT = 40  # 增量草稿每次最多只读"书签之后"的新记忆
 COGNITIVE_DRAFT_CURSOR_KEY = "cognitive_draft_cursor"  # 书签：上次草稿已展示的最大记忆 ID
 
@@ -5903,8 +5906,9 @@ async def save_cognitive_item(data: dict, item_id: int = None, created_by: str =
                                 f"请用强化或取代"
                             )}
                 review_after = item["review_after"]
-                if not review_after and target and target["review_after"]:
-                    review_after = target["review_after"]
+                # 不再自动继承被取代卡的复核日期：review_after 由调用方显式给出。
+                # 手动编辑的"稳定/当前"开关、LLM 升级的 ≥3 跨时间证据门槛都在上游把关；
+                # 这里照单全收，避免"明确不写复核日期=想转长期"的升级意图被旧日期弹回。
                 carry = int(target["times_derived"]) if target else 1
                 row = await conn.fetchrow("""
                     INSERT INTO cognitive_items

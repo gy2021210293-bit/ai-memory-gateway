@@ -1,5 +1,6 @@
 """半自动分级认知审视：自动应用 / 挂起待确认的决策规则测试。"""
 import unittest
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import main
@@ -364,6 +365,119 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await self._run_pipeline(existing, [merge_candidate])
         self.assertTrue(result["ok"])
         self.assertEqual(result["items"], [])  # 目标无效：整条丢弃
+
+    async def test_evidence_relevance_drops_unrelated_evidence(self):
+        # 证据相关性校验：与卡内容向量不相关的证据被剔除（防 AI 瞎挂证据）
+        candidate = {
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "掌控感驱动：对数据所有权有高需求", "level": "explicit",
+            "confidence": 0.9, "evidence_memory_ids": [1, 2], "action": "create",
+        }
+        # 卡向量 [1,0]：证据1 高度相关（0.99），证据2 完全不相关（0）
+        result = await self._run_pipeline(
+            [], [candidate],
+            embeddings=[[1.0, 0.0], [0.99, 0.01], [0.0, 1.0]],
+        )
+        self.assertTrue(result["ok"])
+        items = result["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["evidence_memory_ids"], [1])
+
+    async def test_evidence_all_irrelevant_drops_candidate(self):
+        candidate = {
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "掌控感驱动", "level": "explicit",
+            "confidence": 0.9, "evidence_memory_ids": [1, 2], "action": "create",
+        }
+        result = await self._run_pipeline(
+            [], [candidate],
+            embeddings=[[1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["items"], [])  # 证据全部不相关 → 丢弃
+
+    async def _run_pipeline_with_gate(self, current_items, raw_draft, gate_rows,
+                                      memory_ids=(1, 2)):
+        """跑 _build_cognitive_draft，并 mock get_pool 返回证据日期（供 ≥3 跨时间门槛查证）。"""
+        from contextlib import ExitStack
+
+        class _GateConn:
+            def __init__(self, rows):
+                self.rows = rows
+
+            async def fetch(self, query, *_args):
+                if "cognitive_corrections" in query:
+                    return []
+                return self.rows
+
+        patches = [
+            patch.object(main, "get_memories_for_cognitive_draft",
+                         AsyncMock(return_value=[{"id": mid} for mid in memory_ids])),
+            patch.object(main, "list_cognitive_items",
+                         AsyncMock(return_value=current_items)),
+            patch.object(main, "get_recent_cognitive_revisions",
+                         AsyncMock(return_value=[])),
+            patch.object(main, "generate_cognitive_draft",
+                         AsyncMock(return_value=raw_draft)),
+            patch.object(main, "advance_cognitive_draft_cursor",
+                         AsyncMock(return_value=max(memory_ids))),
+            patch.object(main, "get_pool",
+                         return_value=database_fake_pool(_GateConn(gate_rows))),
+        ]
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            return await main._build_cognitive_draft()
+
+    async def test_supersede_upgrade_insufficient_evidence_stays_current(self):
+        # 升级意图（supersede 短期卡、不写复核日期）但证据不足 → 保持短期，沿用原复核日期
+        target = {"id": 5, "subject": "user", "cognitive_type": "user_core",
+                  "content": "最近在忙项目A", "review_after": date(2026, 8, 20),
+                  "status": "active"}
+        supersede = {
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "对编程有长期热情，已稳定", "level": "explicit",
+            "confidence": 0.85, "evidence_memory_ids": [1, 2],
+            "action": "supersede", "target_id": 5,
+        }
+        # 证据 2 条（<3）→ 不够转长期
+        gate_rows = [
+            {"id": 1, "created_at": "2026-08-01T00:00:00+00:00"},
+            {"id": 2, "created_at": "2026-08-02T00:00:00+00:00"},
+        ]
+        result = await self._run_pipeline_with_gate(
+            [target], [supersede], gate_rows,
+        )
+        self.assertTrue(result["ok"])
+        items = result["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "supersede")
+        self.assertEqual(items[0]["review_after"], date(2026, 8, 20))  # 保持短期，沿用旧复核日期
+
+    async def test_supersede_upgrade_sufficient_evidence_becomes_stable(self):
+        target = {"id": 5, "subject": "user", "cognitive_type": "user_core",
+                  "content": "最近在忙项目A", "review_after": date(2026, 8, 20),
+                  "status": "active"}
+        supersede = {
+            "subject": "user", "cognitive_type": "user_core",
+            "content": "对编程有长期热情，已稳定", "level": "explicit",
+            "confidence": 0.85, "evidence_memory_ids": [1, 2, 3],
+            "action": "supersede", "target_id": 5,
+        }
+        # 证据 3 条、跨 2 个日期 → 允许升级为长期
+        gate_rows = [
+            {"id": 1, "created_at": "2026-07-01T00:00:00+00:00"},
+            {"id": 2, "created_at": "2026-08-01T00:00:00+00:00"},
+            {"id": 3, "created_at": "2026-08-10T00:00:00+00:00"},
+        ]
+        result = await self._run_pipeline_with_gate(
+            [target], [supersede], gate_rows, memory_ids=(1, 2, 3),
+        )
+        self.assertTrue(result["ok"])
+        items = result["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "supersede")
+        self.assertIsNone(items[0]["review_after"])  # 升级成功：无复核日期 = 长期
 
 
 class CognitiveCorrectionTests(unittest.TestCase):

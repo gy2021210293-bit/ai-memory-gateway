@@ -678,6 +678,19 @@ class CognitiveSaveTests(unittest.IsolatedAsyncioTestCase):
         # 手动编辑被记录为 action=edit
         self.assertEqual([rev[3] for rev in self.revision_inserts(conn)], ["edit"])
 
+    async def test_edit_current_card_to_stable_does_not_inherit_review_date(self):
+        # 手动把"当前"切成"稳定"保存（不带 review_after）→ 升级为长期，不再被旧复核日期弹回
+        current_target = dict(TARGET_CARD, review_after=date(2026, 8, 20))
+        conn = _FakeSaveConnection(target=current_target)
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            result = await database.save_cognitive_item({
+                "subject": "user", "cognitive_type": "user_core",
+                "content": "稳定版用户核心", "confidence": 0.8,
+                "evidence_memory_ids": [2, 3],
+            }, item_id=5)
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(result["item"]["review_after"])  # 升级成功：无复核日期 = 长期卡
+
     async def test_create_rejects_duplicate_content_in_same_scope(self):
         conn = _FakeSaveConnection(duplicate_content="新的用户核心")
         with patch.object(database, "get_pool", return_value=_FakePool(conn)):

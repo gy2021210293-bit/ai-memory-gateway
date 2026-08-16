@@ -35,7 +35,7 @@ from database import get_entity_card, apply_entity_snapshot, update_entity_card_
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
 from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
 from database import record_cognitive_correction, get_recent_cognitive_corrections
-from database import compute_embeddings_batch, cognitive_content_similarity, cognitive_overlap_score, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY, COGNITIVE_OVERLAP_MIN, COGNITIVE_OVERLAP_MIN_RUN
+from database import compute_embeddings_batch, cognitive_content_similarity, cognitive_overlap_score, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY, COGNITIVE_OVERLAP_MIN, COGNITIVE_OVERLAP_MIN_RUN, COGNITIVE_EVIDENCE_SIM_MIN
 from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
@@ -3085,6 +3085,47 @@ async def _build_cognitive_draft(deep: bool = False) -> dict:
                 continue
         norm_items.append(item)
 
+    # ---- 证据相关性校验：卡内容 vs 每条证据记忆的向量相似度，不相关的证据剔除 ----
+    # 防"AI 瞎挂证据"：引用的记忆 ID 是真的，但内容与卡毫无关系（如给"掌控感"卡挂食物记忆）。
+    # 仅在有 embedding 时生效；无 key 时跳过（退回门槛 + 人工确认兜底）。
+    relevance_items = [
+        it for it in norm_items
+        if not it.get("_drop") and it["action"] in ("create", "supersede")
+        and it.get("evidence_memory_ids")
+    ]
+    if relevance_items:
+        memory_by_id = {int(m["id"]): str(m.get("content") or "") for m in memories}
+        card_texts = [str(it["content"]) for it in relevance_items]
+        ev_pairs = []  # (item_index, memory_id)
+        ev_texts = []
+        for item_idx, it in enumerate(relevance_items):
+            for mid in it["evidence_memory_ids"]:
+                ev_pairs.append((item_idx, mid))
+                ev_texts.append(memory_by_id.get(int(mid), ""))
+        embeddings = await compute_embeddings_batch(card_texts + ev_texts)
+        if embeddings and len(embeddings) >= len(card_texts):
+            card_embs = embeddings[:len(card_texts)]
+            ev_embs = embeddings[len(card_texts):]
+            kept = {item_idx: [] for item_idx in range(len(relevance_items))}
+            for k, (item_idx, mid) in enumerate(ev_pairs):
+                if k >= len(ev_embs):
+                    break
+                card_emb, ev_emb = card_embs[item_idx], ev_embs[k]
+                if not card_emb or not ev_emb:
+                    continue
+                sim = cognitive_content_similarity(
+                    card_texts[item_idx], ev_texts[k], card_emb, ev_emb,
+                )
+                if sim >= COGNITIVE_EVIDENCE_SIM_MIN:
+                    kept[item_idx].append(mid)
+            for item_idx, it in enumerate(relevance_items):
+                surviving = kept[item_idx]
+                if surviving:
+                    it["evidence_memory_ids"] = surviving
+                else:
+                    it["_drop"] = True  # 证据全部不相关 → 丢弃
+                    print(f"🧠 证据校验：候选证据全部不相关（如“{str(it['content'])[:20]}”），跳过", flush=True)
+
     # ---- 第二遍：语义去重（防新旧重复 + 重复即强化）----
     # create 候选与同区块现有卡高度相似 → 自动转 reinforce（内容对齐目标卡，证据在保存时合并）；
     # 与其它区块卡高度相似 → 丢弃（信息已在别处，防止三区块互相重复）。
@@ -3128,14 +3169,20 @@ async def _build_cognitive_draft(deep: bool = False) -> dict:
                 print(f"🧠 认知去重：候选与 {best_card['cognitive_type']} 卡 #{best_card['id']} 重复，跳过", flush=True)
 
     # ---- 稳定画像卡门槛：≥3 条证据且跨时间（≥2 个不同日期），否则降级为临时卡 ----
-    # 长期认知不允许单次事件/同一天的多条证据伪装成稳定身份；证据不足先当短期认知，
-    # 证据沉淀够了再由后续审视 supersede 转正为 stable。
-    stable_creates = [
-        it for it in norm_items
-        if not it.get("_drop") and it["action"] == "create" and not it["review_after"]
-    ]
-    if stable_creates:
-        evidence_ids = list({ev for it in stable_creates for ev in it["evidence_memory_ids"]})
+    # 长期认知不允许单次事件/同一天的多条证据伪装成稳定身份；证据不足先当短期认知。
+    # 覆盖两类：create（新长期卡）+ supersede 升级（明确不写复核日期、取代的是短期卡 = 升级意图）。
+    stable_candidates = []
+    for it in norm_items:
+        if it.get("_drop") or it["review_after"]:
+            continue
+        if it["action"] == "create":
+            stable_candidates.append((it, None))
+        elif it["action"] == "supersede":
+            target = active_by_id.get(it.get("target_id"))
+            if target and target.get("review_after"):
+                stable_candidates.append((it, target))
+    if stable_candidates:
+        evidence_ids = list({ev for it, _t in stable_candidates for ev in it["evidence_memory_ids"]})
         evidence_dates = {}
         try:
             pool = await get_pool()
@@ -3149,18 +3196,27 @@ async def _build_cognitive_draft(deep: bool = False) -> dict:
         except Exception as exc:
             print(f"⚠️ 画像卡证据时间读取失败，跳过门槛: {exc}")
         if evidence_dates:
-            for it in stable_creates:
+            for it, upgrade_target in stable_candidates:
                 ev_ids = it["evidence_memory_ids"]
                 dates = {evidence_dates.get(mid, "") for mid in ev_ids if evidence_dates.get(mid)}
                 if len(ev_ids) < 3 or len(dates) < 2:
-                    it["review_after"] = (
-                        datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS) + timedelta(days=14)
-                    ).date()
-                    print(
-                        f"🧠 画像卡门槛：证据不足（{len(ev_ids)}条/{len(dates)}个日期），"
-                        "降级为临时卡（到期退休，证据够后再转正）",
-                        flush=True,
-                    )
+                    if upgrade_target is not None:
+                        # 升级意图但证据不足：保持短期，沿用原复核日期（不强行转长期）
+                        it["review_after"] = upgrade_target["review_after"]
+                        print(
+                            f"🧠 画像卡门槛：升级证据不足（{len(ev_ids)}条/{len(dates)}个日期），"
+                            "保持短期认知",
+                            flush=True,
+                        )
+                    else:
+                        it["review_after"] = (
+                            datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS) + timedelta(days=14)
+                        ).date()
+                        print(
+                            f"🧠 画像卡门槛：证据不足（{len(ev_ids)}条/{len(dates)}个日期），"
+                            "降级为临时卡（到期退休，证据够后再转正）",
+                            flush=True,
+                        )
 
     # ---- 第三遍：组装（精确重复拦截 + 每轮每区块候选上限）----
     # 满员 create 不再丢弃：留在草稿给人工看（手动模式）或由自动审视挂起待确认（自动模式）。
@@ -3204,20 +3260,21 @@ async def api_generate_cognitive_draft(deep: int = 0):
             "cursor": result["cursor"]}
 
 
-@app.post("/api/cognitive-items/integrate-scan")
-async def api_integrate_scan():
-    """整合扫描（确定性、零 LLM）：检测现有卡之间的重叠。
+async def _run_integrate_scan() -> list:
+    """确定性重叠扫描（零 LLM）：检测现有卡之间的重叠，返回提案列表。
 
-    同区块重叠 → merge 提案（合并成一张，内容取证据更强卡、证据合并，可编辑后确认）；
-    跨区块重复 → retire 提案（保留证据更强卡，退休另一张，不建新卡）。
-    全部提案走人工确认；每张卡最多进入一个提案（贪心按相似度从高到低）。
+    同区块重叠 → merge 提案（内容取更强/被包含卡，证据合并）；
+    跨区块重复 → retire 提案（保留更强卡，退休另一张）。
+    整段相似（余弦/n-gram）或部分重叠（包含度/最长公共子串）任一命中即标记；
+    每张卡最多进一个提案（贪心按分数从高到低）。
     """
     try:
         cards = await list_cognitive_items(active_only=True)
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"error": f"读取认知卡失败: {exc}"})
+        print(f"⚠️ 整合扫描读取认知卡失败: {exc}")
+        return []
     if not cards:
-        return {"status": "scan", "items": [], "scan_count": 0}
+        return []
     texts = [str(c.get("content") or "") for c in cards]
     embeddings = await compute_embeddings_batch(texts)
     emb_map = {}
@@ -3291,7 +3348,18 @@ async def api_integrate_scan():
             })
         if len(proposals) >= 20:
             break
-    return {"status": "scan", "items": proposals, "scan_count": len(proposals)}
+    return proposals
+
+
+@app.post("/api/cognitive-items/integrate-scan")
+async def api_integrate_scan():
+    """体检（去重整合，确定性、零 LLM）：仅重叠检测。
+
+    同区块重叠（含部分重叠）→ merge 提案；跨区块重复 → retire 提案。
+    与深度审视（稳定画像）分开：本端点只做去重/整合，不参与画像形成。
+    """
+    items = await _run_integrate_scan()
+    return {"status": "scan", "items": items, "scan_count": len(items)}
 
 
 # ============================================================
