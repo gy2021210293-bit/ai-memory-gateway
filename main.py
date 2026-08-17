@@ -2939,6 +2939,8 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                             if isinstance(first_choice, dict)
                             else {}
                         )
+                        if not isinstance(delta, dict):
+                            delta = {}
                         content = delta.get("content", "")
                         if content:
                             full_response.append(content)
@@ -2947,7 +2949,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         if reasoning:
                             full_reasoning.append(reasoning)
 
-                        if "tool_calls" in delta:
+                        if delta.get("tool_calls"):
                             for tc in delta["tool_calls"]:
                                 idx = tc.get("index", 0)
                                 if idx not in accumulated_tool_calls:

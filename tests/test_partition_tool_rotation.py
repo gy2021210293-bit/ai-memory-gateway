@@ -255,6 +255,26 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.httpx.AsyncClient = original_client
 
+    async def test_stream_accepts_null_tool_calls_after_reasoning(self):
+        original_client = main.httpx.AsyncClient
+        _FakeAsyncClient.response = _FakeResponse([
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"answer","tool_calls":null}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        main.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            chunks = [
+                chunk async for chunk in main.stream_and_capture(
+                    {}, {"stream": True}, "session", "", "model"
+                )
+            ]
+            self.assertTrue(any(b'"reasoning_content":"thinking"' in chunk for chunk in chunks))
+            self.assertTrue(any(b'"content":"answer"' in chunk for chunk in chunks))
+            self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+        finally:
+            main.httpx.AsyncClient = original_client
+
     async def test_heartbeat_waits_for_real_upstream_first_event(self):
         response = _DelayedFirstResponse()
         stream = main._iterate_upstream_with_heartbeat(response, interval_seconds=0.01)
