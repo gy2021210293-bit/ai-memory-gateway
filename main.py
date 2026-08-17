@@ -2724,6 +2724,22 @@ def _upstream_malformed_sse_event(reason: str) -> bytes:
     return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
 
 
+def _stream_bootstrap_event(model: str, request_id: str) -> bytes:
+    """Start an OpenAI-compatible stream with data, not a comment-only frame."""
+    payload = {
+        "id": f"chatcmpl-{request_id or uuid.uuid4().hex[:12]}",
+        "object": "chat.completion.chunk",
+        "created": int(datetime.now(timezone.utc).timestamp()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant"},
+            "finish_reason": None,
+        }],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
 def _persistence_error_event(exc: Exception) -> bytes:
     payload = {
         "error": {
@@ -2795,10 +2811,6 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # 立即发一个初始心跳，让边缘代理在 SSE 建立瞬间就看到活动字节；
-        # 随后在建立上游连接（可能耗时数秒到数十秒，如 opencode 冷启动）期间
-        # 持续发心跳，避免"首字节前静默"被 Zeabur 等边缘代理判定为超时而回 502。
-        yield b": keep-alive\n\n"
         request = client.build_request("POST", API_BASE_URL, headers=headers, json=body)
         print(
             f"[gateway-state] request={request_id or '-'} session={session_id} state=upstream_started",
@@ -2806,6 +2818,10 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
         )
         connect_task = asyncio.create_task(client.send(request, stream=True))
         try:
+            # Some OpenAI clients treat a comment-only first frame as an empty
+            # response and disconnect. Start with a valid assistant-role chunk;
+            # later comment heartbeats remain transport-only and are ignored.
+            yield _stream_bootstrap_event(model, request_id)
             while not connect_task.done():
                 try:
                     done, _ = await asyncio.wait(
@@ -2833,6 +2849,11 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             )
             yield _upstream_stream_error_event(exc)
             return
+        finally:
+            if not connect_task.done():
+                connect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await connect_task
 
         try:
             # 打印上游响应头（排查thinking问题用）

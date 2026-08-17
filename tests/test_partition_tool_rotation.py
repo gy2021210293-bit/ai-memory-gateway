@@ -144,7 +144,9 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
                 {}, {"stream": True}, "session", "run", "model",
                 current_block=({"role": "user", "content": "run"},),
             )
-            self.assertEqual(await anext(stream), b": keep-alive\n\n")
+            bootstrap = await anext(stream)
+            self.assertIn(b'"object": "chat.completion.chunk"', bootstrap)
+            self.assertIn(b'"role": "assistant"', bootstrap)
             self.assertIn(b'"content":"checking"', await anext(stream))
             tool_call_chunk = await anext(stream)
             self.assertIn(b'"tool_calls"', tool_call_chunk)
@@ -210,7 +212,8 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         main.httpx.AsyncClient = _FakeAsyncClient
         try:
             stream = main.stream_and_capture({}, {"stream": True}, "session", "", "model")
-            self.assertEqual(await anext(stream), b": keep-alive\n\n")
+            bootstrap = await anext(stream)
+            self.assertIn(b'"object": "chat.completion.chunk"', bootstrap)
             error = await anext(stream)
             self.assertIn(b'"type": "upstream_malformed_sse"', error)
             self.assertIn(b"data: [DONE]", error)
@@ -228,7 +231,8 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         main.httpx.AsyncClient = _FakeAsyncClient
         try:
             stream = main.stream_and_capture({}, {"stream": True}, "session", "", "model")
-            self.assertEqual(await anext(stream), b": keep-alive\n\n")
+            bootstrap = await anext(stream)
+            self.assertIn(b'"object": "chat.completion.chunk"', bootstrap)
             self.assertIn(b'"choices":[]', await anext(stream))
             self.assertIn(b'"content":"ok"', await anext(stream))
             self.assertEqual(await anext(stream), b"data: [DONE]\n\n")
