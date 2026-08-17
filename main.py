@@ -1715,7 +1715,10 @@ async def commit_response_state(
     if skip:
         return None, None
 
-    pending = await get_pending_tool_workflow(session_id)
+    # Ordinary chat rounds do not depend on the temporary tool-workflow table.
+    # Only a tool-result request can be completing a previously staged chain.
+    has_tool_results = any(message.get("role") == "tool" for message in current_block)
+    pending = await get_pending_tool_workflow(session_id) if has_tool_results else None
     pending_messages = list(pending.get("messages") or []) if pending else []
     workflow_id = pending.get("workflow_id") if pending else str(uuid.uuid4())
     block = list(current_block)

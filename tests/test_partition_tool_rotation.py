@@ -238,6 +238,31 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PendingToolWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ordinary_round_does_not_depend_on_pending_workflow_table(self):
+        original_get = main.get_pending_tool_workflow
+        original_persist = main.persist_conversation_batch
+        main.get_pending_tool_workflow = AsyncMock(
+            side_effect=RuntimeError("pending_tool_workflows is unavailable")
+        )
+        main.persist_conversation_batch = AsyncMock(
+            return_value={"inserted": 2, "rerolled": False}
+        )
+        try:
+            plan, result = await main.commit_response_state(
+                "thread-a", ({"role": "user", "content": "hello"},),
+                "hi", None, None, "model", False,
+            )
+            self.assertEqual(
+                [message["role"] for message in plan.messages],
+                ["user", "assistant"],
+            )
+            self.assertEqual(result["inserted"], 2)
+            main.get_pending_tool_workflow.assert_not_awaited()
+            main.persist_conversation_batch.assert_awaited_once()
+        finally:
+            main.get_pending_tool_workflow = original_get
+            main.persist_conversation_batch = original_persist
+
     async def test_chain_start_is_staged_durably(self):
         original_get = main.get_pending_tool_workflow
         original_stage = main.stage_tool_workflow
