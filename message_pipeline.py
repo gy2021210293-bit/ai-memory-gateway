@@ -2,11 +2,13 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 
 
 Message = dict[str, Any]
+DYNAMIC_ENVIRONMENT_MAX_AGE = timedelta(minutes=10)
 
 
 def normalize_content_text(content: Any) -> str:
@@ -56,6 +58,23 @@ def _dynamic_environment_content(content: Any) -> str | None:
     return text
 
 
+def _dynamic_environment_is_fresh(message: Message) -> bool:
+    metadata = message.get("metadata")
+    generated_at = metadata.get("generated_at") if isinstance(metadata, dict) else None
+    if not generated_at:
+        return False
+    if not isinstance(generated_at, str):
+        return False
+    try:
+        generated = datetime.fromisoformat(generated_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - generated.astimezone(timezone.utc)
+    return -timedelta(minutes=1) <= age <= DYNAMIC_ENVIRONMENT_MAX_AGE
+
+
 @dataclass(frozen=True)
 class ClassifiedRequest:
     raw_messages: tuple[Message, ...]
@@ -66,6 +85,7 @@ class ClassifiedRequest:
     is_tool_chain: bool
     latest_user_text: str
     invalid_dynamic_count: int
+    stale_dynamic_count: int
 
 
 @dataclass(frozen=True)
@@ -483,26 +503,42 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
     raw = deepcopy(messages)
     ordinary = []
     systems = []
-    dynamic = ""
+    dynamic_candidates = []
     invalid_dynamic = 0
+    stale_dynamic = 0
+    non_system_count = 0
 
     for message in raw:
         metadata = message.get("metadata")
         if isinstance(metadata, dict) and metadata.get("dynamic_environment") is True:
             dynamic_text = _dynamic_environment_content(message.get("content"))
             if message.get("role") == "user" and dynamic_text is not None:
-                dynamic = dynamic_text
+                if _dynamic_environment_is_fresh(message):
+                    dynamic_candidates.append((non_system_count, dynamic_text))
+                else:
+                    stale_dynamic += 1
                 continue
             else:
                 invalid_dynamic += 1
         clean = {key: value for key, value in message.items() if key != "metadata"}
         ordinary.append(clean)
+        if clean.get("role") != "system":
+            non_system_count += 1
         if clean.get("role") == "system":
             text = _system_text(clean)
             if text:
                 systems.append(text)
 
     current, is_tool_chain = extract_current_block(ordinary)
+    current_start = non_system_count - len(current)
+    dynamic = next(
+        (
+            text
+            for position, text in reversed(dynamic_candidates)
+            if position == current_start
+        ),
+        "",
+    )
     return ClassifiedRequest(
         raw_messages=tuple(raw),
         ordinary_messages=tuple(ordinary),
@@ -512,6 +548,7 @@ def classify_request(messages: list[Message]) -> ClassifiedRequest:
         is_tool_chain=is_tool_chain,
         latest_user_text=_latest_user_text(current),
         invalid_dynamic_count=invalid_dynamic,
+        stale_dynamic_count=stale_dynamic,
     )
 
 

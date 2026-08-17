@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from message_pipeline import (
     classify_request,
@@ -12,6 +13,10 @@ from message_pipeline import (
 )
 
 
+def _fresh_generated_at():
+    return datetime.now(timezone.utc).isoformat()
+
+
 class MessagePipelineTests(unittest.TestCase):
     def test_classification_does_not_modify_input_and_isolates_environment(self):
         messages = [
@@ -21,7 +26,10 @@ class MessagePipelineTests(unittest.TestCase):
             {
                 "role": "user",
                 "content": "battery=80",
-                "metadata": {"dynamic_environment": True},
+                "metadata": {
+                    "dynamic_environment": True,
+                    "generated_at": _fresh_generated_at(),
+                },
             },
             {"role": "user", "content": "current"},
         ]
@@ -259,7 +267,10 @@ class MessagePipelineTests(unittest.TestCase):
             {
                 "role": "user",
                 "content": "battery=80",
-                "metadata": {"dynamic_environment": True},
+                "metadata": {
+                    "dynamic_environment": True,
+                    "generated_at": _fresh_generated_at(),
+                },
             },
             {"role": "user", "content": "workflow"},
         ])
@@ -291,7 +302,10 @@ class MessagePipelineTests(unittest.TestCase):
                         "text": "<dynamic_context generated_at=\"t1\">battery=80\ncharging</dynamic_context>",
                     },
                 ],
-                "metadata": {"dynamic_environment": True},
+                "metadata": {
+                    "dynamic_environment": True,
+                    "generated_at": _fresh_generated_at(),
+                },
             },
             {"role": "user", "content": "run workflow"},
         ])
@@ -344,6 +358,78 @@ class MessagePipelineTests(unittest.TestCase):
         self.assertEqual(classified.dynamic_environment, "")
         self.assertEqual(classified.latest_user_text, "look")
         self.assertNotIn("metadata", classified.ordinary_messages[0])
+
+    def test_historical_snapshot_is_not_reused_for_new_user_turn(self):
+        classified = classify_request([
+            {
+                "role": "user",
+                "content": "<dynamic_context>phone=true</dynamic_context>",
+                "metadata": {"dynamic_environment": True},
+            },
+            {"role": "user", "content": "old mobile request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new desktop request"},
+        ])
+
+        self.assertEqual(classified.dynamic_environment, "")
+        self.assertEqual(classified.latest_user_text, "new desktop request")
+
+    def test_expired_current_snapshot_is_discarded(self):
+        generated_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=11)
+        ).isoformat()
+        classified = classify_request([
+            {
+                "role": "user",
+                "content": "<dynamic_context>phone=true</dynamic_context>",
+                "metadata": {
+                    "dynamic_environment": True,
+                    "generated_at": generated_at,
+                },
+            },
+            {"role": "user", "content": "new desktop request"},
+        ])
+
+        self.assertEqual(classified.dynamic_environment, "")
+        self.assertEqual(classified.stale_dynamic_count, 1)
+
+    def test_current_snapshot_without_timestamp_is_discarded(self):
+        classified = classify_request([
+            {
+                "role": "user",
+                "content": "<dynamic_context>phone=true</dynamic_context>",
+                "metadata": {"dynamic_environment": True},
+            },
+            {"role": "user", "content": "new desktop request"},
+        ])
+
+        self.assertEqual(classified.dynamic_environment, "")
+        self.assertEqual(classified.stale_dynamic_count, 1)
+
+    def test_historical_snapshot_does_not_change_current_tool_chain(self):
+        classified = classify_request([
+            {
+                "role": "user",
+                "content": "<dynamic_context>phone=true</dynamic_context>",
+                "metadata": {"dynamic_environment": True},
+            },
+            {"role": "user", "content": "old mobile request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "run tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1"}],
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "call-1"},
+        ])
+
+        self.assertEqual(classified.dynamic_environment, "")
+        self.assertTrue(classified.is_tool_chain)
+        self.assertEqual(
+            [message["role"] for message in classified.current_block],
+            ["user", "assistant", "tool"],
+        )
 
     def test_no_new_message_after_alignment_is_rejected(self):
         history = [

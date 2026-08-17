@@ -2108,6 +2108,11 @@ async def _chat_completions_inner(request: Request):
             f"[warning] 忽略 {classified.invalid_dynamic_count} 个无效动态环境标记，原消息已保留",
             flush=True,
         )
+    if classified.stale_dynamic_count:
+        print(
+            f"[dynamic-environment] 已丢弃 {classified.stale_dynamic_count} 个过期动态环境快照",
+            flush=True,
+        )
     
     # ---------- 检测是否应跳过对话存储 ----------
     # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。

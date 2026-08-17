@@ -1,5 +1,6 @@
 import ast
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from message_pipeline import classify_request
 
@@ -34,17 +35,18 @@ class DynamicEnvironmentTests(unittest.TestCase):
         cls.helpers = _load_helpers()
 
     def test_extracts_last_valid_snapshot_and_removes_all_marked_messages(self):
+        generated_at = datetime.now(timezone.utc).isoformat()
         messages = [
             {"role": "system", "content": "stable"},
             {
                 "role": "user",
                 "content": "battery=50",
-                "metadata": {"dynamic_environment": True, "generated_at": "t1"},
+                "metadata": {"dynamic_environment": True, "generated_at": generated_at},
             },
             {
                 "role": "user",
                 "content": "battery=51",
-                "metadata": {"dynamic_environment": True, "generated_at": "t1"},
+                "metadata": {"dynamic_environment": True, "generated_at": generated_at},
             },
             {"role": "user", "content": "real request"},
         ]
@@ -61,6 +63,7 @@ class DynamicEnvironmentTests(unittest.TestCase):
         )
 
     def test_extracts_text_list_snapshot_with_dynamic_context_envelope(self):
+        generated_at = datetime.now(timezone.utc).isoformat()
         messages = [
             {
                 "role": "user",
@@ -68,7 +71,7 @@ class DynamicEnvironmentTests(unittest.TestCase):
                     "type": "text",
                     "text": "<dynamic_context generated_at=\"t1\">battery=51</dynamic_context>",
                 }],
-                "metadata": {"dynamic_environment": True, "generated_at": "t1"},
+                "metadata": {"dynamic_environment": True, "generated_at": generated_at},
             },
             {"role": "user", "content": "real request"},
         ]
