@@ -114,6 +114,8 @@ COGNITIVE_OVERLAP_MIN_RUN = 15
 COGNITIVE_EVIDENCE_SIM_MIN = 0.35
 COGNITIVE_DRAFT_NEW_LIMIT = 40  # 增量草稿每次最多只读"书签之后"的新记忆
 COGNITIVE_DRAFT_CURSOR_KEY = "cognitive_draft_cursor"  # 书签：上次草稿已展示的最大记忆 ID
+COGNITIVE_DEEP_REVIEW_CURSOR_KEY = "cognitive_deep_review_cursor"
+COGNITIVE_AUTO_INTERVAL_V12_MIGRATION_KEY = "cognitive_auto_interval_v12_migrated"
 
 
 # ============================================================
@@ -518,6 +520,21 @@ async def init_tables():
                 value   TEXT DEFAULT ''
             );
         """)
+        migrated_interval = await conn.fetchval(
+            "SELECT value FROM gateway_config WHERE key = $1",
+            COGNITIVE_AUTO_INTERVAL_V12_MIGRATION_KEY,
+        )
+        if migrated_interval != "1":
+            await conn.execute("""
+                UPDATE gateway_config
+                SET value = '12'
+                WHERE key = 'COGNITIVE_AUTO_INTERVAL_HOURS' AND value = '6'
+            """)
+            await conn.execute("""
+                INSERT INTO gateway_config (key, value)
+                VALUES ($1, '1')
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, COGNITIVE_AUTO_INTERVAL_V12_MIGRATION_KEY)
         
         # 分区缓存状态表（存储每个session的轮转状态）
         await conn.execute("""
@@ -3007,11 +3024,10 @@ async def get_fragments_by_date_range(start_date, end_date):
 
 
 async def get_memories_for_cognitive_draft(limit: int = 80):
-    """增量取草稿证据：只读书签之后新出现的记忆，旧的不再重复喂。
+    """快速审视证据：只读书签之后新增的 Layer 1 事实碎片。
 
     书签 = gateway_config.cognitive_draft_cursor，记录上次草稿已展示的最大记忆 ID。
     草稿成功生成后才由 advance_cognitive_draft_cursor 推进；生成失败书签不动，下次重试不丢批。
-    包含人工确认过的派生记忆（它们也是事实，可作认知证据）。
     """
     new_limit = min(COGNITIVE_DRAFT_NEW_LIMIT, max(0, int(limit)))
     cursor = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
@@ -3020,7 +3036,7 @@ async def get_memories_for_cognitive_draft(limit: int = 80):
         rows = await conn.fetch("""
             SELECT id, content, importance, created_at, layer, title
             FROM memories
-            WHERE is_active = TRUE AND id > $1
+            WHERE is_active = TRUE AND layer = 1 AND id > $1
             ORDER BY created_at DESC, id DESC
             LIMIT $2
         """, cursor, new_limit)
@@ -3028,20 +3044,20 @@ async def get_memories_for_cognitive_draft(limit: int = 80):
 
 
 async def get_memories_for_portrait_review(limit: int = 120):
-    """画像审视（深度/低频）证据：增量 + 重要历史抽样混合。
+    """深度审视证据：Layer 2/3/4 的新增与重要历史记忆。
 
-    短期层只看最近记忆；长期画像需要跨时间模式，所以这里在"书签之后的新记忆"
-    之外，再按重要度补抽历史样本（importance >= 6），保证画像模型能看见
-    "掌控感"这类横跨时间的模式。按时间倒序，去重由单一查询天然保证。
-    包含人工确认过的派生记忆（它们也是事实，可作认知证据）。
+    深度审视不回读 Layer 1，以事件、核心与人工确认的推断作为长期材料。
+    它使用独立游标，不能消耗快速审视尚未处理的事实碎片。
     """
-    cursor = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
+    cursor = int(await get_gateway_config(COGNITIVE_DEEP_REVIEW_CURSOR_KEY, "0") or 0)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, content, importance, created_at, layer, title
             FROM memories
-            WHERE is_active = TRUE AND (id > $1 OR importance >= $2)
+            WHERE is_active = TRUE
+              AND layer IN (2, 3, 4)
+              AND (id > $1 OR importance >= $2)
             ORDER BY created_at DESC, id DESC
             LIMIT $3
         """, cursor, 6, max(1, int(limit)))
@@ -3060,6 +3076,19 @@ async def advance_cognitive_draft_cursor(memory_ids) -> int:
     current = int(await get_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, "0") or 0)
     if high > current:
         await set_gateway_config(COGNITIVE_DRAFT_CURSOR_KEY, str(high))
+        return high
+    return current
+
+
+async def advance_cognitive_deep_review_cursor(memory_ids) -> int:
+    """推进深度审视自己的证据游标，不影响快速审视。"""
+    ids = [int(mid) for mid in (memory_ids or []) if mid and int(mid) > 0]
+    if not ids:
+        return int(await get_gateway_config(COGNITIVE_DEEP_REVIEW_CURSOR_KEY, "0") or 0)
+    high = max(ids)
+    current = int(await get_gateway_config(COGNITIVE_DEEP_REVIEW_CURSOR_KEY, "0") or 0)
+    if high > current:
+        await set_gateway_config(COGNITIVE_DEEP_REVIEW_CURSOR_KEY, str(high))
         return high
     return current
 

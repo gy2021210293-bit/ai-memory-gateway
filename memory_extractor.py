@@ -1272,8 +1272,8 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
     `corrections` are the user's recent in-chat corrections of past cognition
     (detected keyword-wise on the extraction path); the model must treat the
     matching evidence as a correction signal instead of ordinary new evidence.
-    `deep=True` 是低频画像体检：证据含历史抽样，除日常维护外还要做整合——
-    合并重叠/碎片化的现有卡（action=merge + target_ids），并重新审视稳定层。
+    `deep=False` 是快速审视：只维护短期状态，不新建或改写稳定认知。
+    `deep=True` 是手动深度审视：可重新审视稳定层与整合重叠认知。
     """
     if not memories or not get_memory_api_key():
         return None
@@ -1345,6 +1345,15 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
             COGNITIVE_DRAFT_RULES.items(), start=1
         )
     ]
+    mode_rules = (
+        "【本次为快速审视】只根据新增事实维护近期状态：\n"
+        "- 只可 create / supersede 带 review_after 的 current 卡；supersede 的目标也必须是 current 卡。\n"
+        "- stable 卡只可 reinforce 或 conflict；不得 create、supersede、merge 或 retire stable 卡。\n"
+        "- 不要把一次新事件上升为长期身份、价值观或关系定义；没有新的短期状态就返回空数组。"
+        if not deep else
+        "【本次为手动深度审视】可基于事件、核心与已确认推断重新判断长期画像：\n"
+        "可以 create / reinforce / supersede / conflict / merge / retire；稳定认知的新建、改写、合并和退休只在此模式进行。"
+    )
     prompt = f"""我是栖，正在系统性审视“三元一场”认知模型。三个区块分别对应三个不同的认知对象，回答的是三个深刻的问题：晏晏是谁、我是谁、我们是什么。分析视角各不相同，必须分别对待，不能用同一套描述套用。
 
 【共同分析原则】（三个区块都必须遵守，是分析一切证据的前提）
@@ -1401,6 +1410,8 @@ async def generate_cognitive_draft(memories: List[Dict], current_items: List[Dic
 6. 没有实质变化就省略；不能提出删除；不能把生日、账号、航班号等原始事实机械复制为认知；不要为“正在聊的话题/主题”建卡（那是会话上下文，不是长期认知）；每类最多 3 条。
 7. 尊重人工决策：不得重新提出已被人工删除或拒绝的认知；被人工修正的认知以其修正后内容为准；已被人工确认的 active 卡，若无更充分的新证据，不要重复 create 或 supersede。
 8. 用户纠正优先：若“用户最近的纠正表述”与某条现有卡矛盾（通常是用户明确说“不是/记错了/其实是…”），不得无视纠正继续保留旧认知——用纠正后的表述 supersede 旧卡（confidence 可给高些，因这是用户直接表态），或至少提出 conflict 让人类裁决；纠正表述本身也可作为新建/取代的内容。{('9. 深度体检（deep）额外职责：站在全量证据视角重新审视稳定层——提出被新证据整体推翻的 supersede、遗漏维度的 create、以及把内容重叠/碎片化的现有卡用 merge 整合（同一区块、≥2 张、内容确实重叠才合并，不要为合并而合并）。' if deep else '')}
+
+{mode_rules}
 
 只返回 JSON 数组：
 [

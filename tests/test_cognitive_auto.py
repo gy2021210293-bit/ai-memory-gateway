@@ -231,11 +231,12 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
         }
 
     async def _run_pipeline(self, current_items, raw_draft, memory_ids=(1, 2),
-                            embeddings=None):
-        """跑一遍 _build_cognitive_draft；embeddings=None 时不 mock（无 key 走 n-gram 兜底）。"""
+                            embeddings=None, deep=True):
+        """默认以深度模式验证完整认知生命周期；快速模式另行覆盖。"""
         from contextlib import ExitStack
         patches = [
-            patch.object(main, "get_memories_for_cognitive_draft",
+            patch.object(main,
+                         "get_memories_for_portrait_review" if deep else "get_memories_for_cognitive_draft",
                          AsyncMock(return_value=[{"id": mid} for mid in memory_ids])),
             patch.object(main, "list_cognitive_items",
                          AsyncMock(return_value=current_items)),
@@ -243,7 +244,8 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=[])),
             patch.object(main, "generate_cognitive_draft",
                          AsyncMock(return_value=raw_draft)),
-            patch.object(main, "advance_cognitive_draft_cursor",
+            patch.object(main,
+                         "advance_cognitive_deep_review_cursor" if deep else "advance_cognitive_draft_cursor",
                          AsyncMock(return_value=max(memory_ids))),
         ]
         with ExitStack() as stack:
@@ -253,7 +255,7 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch.object(
                     main, "compute_embeddings_batch",
                     AsyncMock(return_value=embeddings)))
-            return await main._build_cognitive_draft()
+            return await main._build_cognitive_draft(deep=deep)
 
     async def test_create_stays_in_draft_when_cell_is_full(self):
         # 满员 create 不再丢弃：留在草稿里给人工看（或由自动审视挂起），信息不丢
@@ -269,6 +271,27 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["items"]), 1)
         self.assertEqual(result["items"][0]["content"], "新认知")
+
+    async def test_fast_pipeline_drops_stable_create_but_keeps_current_create(self):
+        stable = self._create_candidate("稳定画像")
+        current = self._create_candidate("近期状态")
+        current["review_after"] = "2026-09-01"
+        result = await self._run_pipeline([], [stable, current], deep=False)
+        self.assertEqual([item["content"] for item in result["items"]], ["近期状态"])
+
+    async def test_fast_pipeline_only_supersedes_current_cards(self):
+        stable_target = {"id": 3, "subject": "user", "cognitive_type": "user_core",
+                         "content": "稳定认知", "status": "active", "review_after": None}
+        current_target = {"id": 4, "subject": "user", "cognitive_type": "user_core",
+                          "content": "近期认知", "status": "active", "review_after": "2026-08-20"}
+        stable_change = self._create_candidate("稳定认知更新")
+        stable_change.update({"action": "supersede", "target_id": 3})
+        current_change = self._create_candidate("近期认知更新")
+        current_change.update({"action": "supersede", "target_id": 4,
+                               "review_after": "2026-09-01"})
+        result = await self._run_pipeline(
+            [stable_target, current_target], [stable_change, current_change], deep=False)
+        self.assertEqual([item["target_id"] for item in result["items"]], [4])
 
     async def test_auto_apply_create_is_always_queued_regardless_of_cell_count(self):
         # 人工审核门控：create 一律挂起，与区块是否满员无关
@@ -328,7 +351,7 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=[])),
             patch.object(main, "generate_cognitive_draft",
                          AsyncMock(return_value=[self._create_candidate()])) as gen_mock,
-            patch.object(main, "advance_cognitive_draft_cursor",
+            patch.object(main, "advance_cognitive_deep_review_cursor",
                          AsyncMock(return_value=5)),
         ):
             result = await main._build_cognitive_draft(deep=True)
@@ -411,7 +434,7 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
                 return self.rows
 
         patches = [
-            patch.object(main, "get_memories_for_cognitive_draft",
+            patch.object(main, "get_memories_for_portrait_review",
                          AsyncMock(return_value=[{"id": mid} for mid in memory_ids])),
             patch.object(main, "list_cognitive_items",
                          AsyncMock(return_value=current_items)),
@@ -419,7 +442,7 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=[])),
             patch.object(main, "generate_cognitive_draft",
                          AsyncMock(return_value=raw_draft)),
-            patch.object(main, "advance_cognitive_draft_cursor",
+            patch.object(main, "advance_cognitive_deep_review_cursor",
                          AsyncMock(return_value=max(memory_ids))),
             patch.object(main, "get_pool",
                          return_value=database_fake_pool(_GateConn(gate_rows))),
@@ -427,7 +450,7 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
         with ExitStack() as stack:
             for patcher in patches:
                 stack.enter_context(patcher)
-            return await main._build_cognitive_draft()
+            return await main._build_cognitive_draft(deep=True)
 
     async def test_supersede_upgrade_insufficient_evidence_stays_current(self):
         # 升级意图（supersede 短期卡、不写复核日期）但证据不足 → 保持短期，沿用原复核日期

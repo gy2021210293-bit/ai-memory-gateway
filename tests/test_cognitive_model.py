@@ -921,6 +921,7 @@ class CognitiveEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await database.get_memories_for_cognitive_draft(80), [])
         self.assertEqual(conn.args, (137, database.COGNITIVE_DRAFT_NEW_LIMIT))
         self.assertIn("id > $1", conn.query)
+        self.assertIn("layer = 1", conn.query)
         self.assertNotIn("recent AS", conn.query)
         self.assertNotIn("high_signal AS", conn.query)
 
@@ -931,6 +932,24 @@ class CognitiveEvidenceTests(unittest.IsolatedAsyncioTestCase):
                              new=AsyncMock(return_value="0")):
                 self.assertEqual(await database.get_memories_for_cognitive_draft(80), [])
         self.assertEqual(conn.args, (0, database.COGNITIVE_DRAFT_NEW_LIMIT))
+
+    async def test_deep_review_uses_own_cursor_and_long_term_layers(self):
+        conn = _FakeEvidenceConnection()
+        with patch.object(database, "get_pool", return_value=_FakePool(conn)):
+            with patch.object(database, "get_gateway_config",
+                             new=AsyncMock(return_value="42")):
+                self.assertEqual(await database.get_memories_for_portrait_review(120), [])
+        self.assertEqual(conn.args, (42, 6, 120))
+        self.assertIn("layer IN (2, 3, 4)", conn.query)
+
+    async def test_advance_deep_cursor_does_not_use_fast_cursor_key(self):
+        setter = AsyncMock()
+        with patch.object(database, "get_gateway_config",
+                          new=AsyncMock(return_value="7")):
+            with patch.object(database, "set_gateway_config", new=setter):
+                advanced = await database.advance_cognitive_deep_review_cursor([9])
+        self.assertEqual(advanced, 9)
+        setter.assert_awaited_once_with(database.COGNITIVE_DEEP_REVIEW_CURSOR_KEY, "9")
 
     async def test_advance_cursor_moves_forward_only(self):
         setter = AsyncMock()

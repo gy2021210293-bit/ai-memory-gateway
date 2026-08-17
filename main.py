@@ -29,7 +29,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, get_memories_for_portrait_review, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, cleanup_low_importance_fragments, revert_merge
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, get_memories_for_portrait_review, advance_cognitive_deep_review_cursor, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, cleanup_low_importance_fragments, revert_merge
 from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
 from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
 from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
@@ -91,7 +91,7 @@ MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "15"))
 
 # 认知模型自动审视（半自动分级：仅 reinforce 自动应用，其余一律挂起待人工确认）
 COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | auto
-COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "6"))  # 每轮间隔（小时）
+COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "12"))  # 每轮间隔（小时）
 
 # 记忆演化（从原文记忆推断"没说但正确"的新内容）：后台定时 + 手动按钮
 MEMORY_EVOLUTION_INTERVAL_HOURS = int(os.getenv("MEMORY_EVOLUTION_INTERVAL_HOURS", "24"))  # 定时间隔
@@ -3159,8 +3159,8 @@ def _is_cognitive_correction(text: str) -> bool:
 async def _build_cognitive_draft(deep: bool = False) -> dict:
     """共享草稿管线：手动按钮与自动审视循环共用。
 
-    deep=False（默认，高频）：只读书签之后的新记忆，维护现有卡 + 短期层。
-    deep=True（低频画像体检）：证据含历史抽样，额外做稳定层体检与整合（merge）。
+    deep=False（自动、12 小时）：只读新增 Layer 1 事实碎片，只维护短期层。
+    deep=True（手动深审）：读取 Layer 2/3/4，完整审视稳定层与整合。
     草稿生成成功才推进书签（失败不丢批）。
     返回 {"ok": True, "items": [...], "memories": [...], "cursor": int, "model": str}
     或 {"ok": False, "error": str}。
@@ -3185,7 +3185,10 @@ async def _build_cognitive_draft(deep: bool = False) -> dict:
     if raw_draft is None:
         return {"ok": False, "error": "认知草稿模型调用失败，现有认知未改变"}
     # 生成成功才推进书签：这批记忆已展示过，下次只看更新的；失败则保持原位。
-    cursor = await advance_cognitive_draft_cursor([m["id"] for m in memories])
+    cursor = await (
+        advance_cognitive_deep_review_cursor([m["id"] for m in memories])
+        if deep else advance_cognitive_draft_cursor([m["id"] for m in memories])
+    )
     allowed_memory_ids = {int(memory["id"]) for memory in memories}
     active_by_id = {
         int(item["id"]): item for item in current_items
@@ -3244,6 +3247,15 @@ async def _build_cognitive_draft(deep: bool = False) -> dict:
                 for card_id in item["target_ids"]
             )
             if not valid_targets:
+                continue
+        if not deep:
+            target = active_by_id.get(item.get("target_id"))
+            if action in ("merge", "retire"):
+                continue
+            if action == "create" and not item.get("review_after"):
+                continue
+            if action == "supersede" and (
+                    not item.get("review_after") or not target or not target.get("review_after")):
                 continue
         norm_items.append(item)
 
@@ -3792,25 +3804,11 @@ async def run_cognitive_auto_review_once(deep: bool = False) -> dict:
 
 
 async def _cognitive_auto_loop():
-    """Background scheduler: 半自动分级认知审视。模式在面板热切换，循环常驻。
-
-    日常循环做增量审视；每满 7 天追加一轮深度画像体检（历史抽样 + 稳定层整合）。
-    """
+    """Background scheduler for incremental, current-state review only."""
     while True:
         try:
             await asyncio.sleep(COGNITIVE_AUTO_INTERVAL_HOURS * 3600)
             await run_cognitive_auto_review_once()
-            # 低频深度体检：上次深度审视距今 >= 7 天时执行一轮（记录时间戳，幂等推进）
-            try:
-                last_deep = str(await get_gateway_config("cognitive_deep_review_at", "") or "")
-                now_local = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)
-                if (not last_deep
-                        or (now_local - datetime.strptime(last_deep[:10], "%Y-%m-%d")).days >= 7):
-                    deep_result = await run_cognitive_auto_review_once(deep=True)
-                    await set_gateway_config("cognitive_deep_review_at", now_local.strftime("%Y-%m-%d"))
-                    print(f"🧠 认知深度体检: {deep_result.get('status')}", flush=True)
-            except Exception as deep_exc:
-                print(f"⚠️ 认知深度体检调度异常: {deep_exc}")
         except asyncio.CancelledError:
             break
         except Exception as exc:

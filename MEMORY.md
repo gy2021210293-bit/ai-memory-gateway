@@ -1,5 +1,12 @@
 # Project Memory
 
+## 2026-08-17 cognition scope correction
+
+- The cognitive model maintains long-term cognition and short-term state judgments; it must not become another indiscriminate memory-condensation stream. Do not impose hard card-count or time-budget caps: independent short-term states may be created, while lifecycle actions reconcile same-dimension states.
+- Fast review runs every 12 hours and reads only new Layer 1 fact fragments. It may create, reinforce, supersede, or flag conflicts for current cards; stable cards may only be reinforced or flagged as conflicted. Automatic deep review is disabled.
+- Manual deep review reads Layer 2 events, Layer 3 core memories, and Layer 4 human-confirmed derivations. It may perform the full cognition lifecycle, and has its own cursor so it cannot consume fast-review evidence. Cognitive cards remain review targets, not deep-review source facts. Original-conversation provenance mapping is deferred.
+- Do not treat lower card count alone as convergence. Keep identity texture where it carries meaning; when merging, synthesize repeated evidence instead of concatenating prose, and judge growth by redundant semantic coverage as well as active cognitive text.
+
 ## Project facts
 
 - Project: AI Memory Gateway.
