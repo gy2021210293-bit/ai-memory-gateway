@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
@@ -61,6 +62,15 @@ class _FakeRequest:
             "stream": False,
             "messages": [{"role": "user", "content": "run tool"}],
         }
+
+
+class _DelayedFirstResponse:
+    def __init__(self):
+        self.release_first = asyncio.Event()
+
+    async def aiter_bytes(self):
+        await self.release_first.wait()
+        yield b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
 
 
 class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
@@ -144,9 +154,6 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
                 {}, {"stream": True}, "session", "run", "model",
                 current_block=({"role": "user", "content": "run"},),
             )
-            bootstrap = await anext(stream)
-            self.assertIn(b'"object": "chat.completion.chunk"', bootstrap)
-            self.assertIn(b'"role": "assistant"', bootstrap)
             self.assertIn(b'"content":"checking"', await anext(stream))
             tool_call_chunk = await anext(stream)
             self.assertIn(b'"tool_calls"', tool_call_chunk)
@@ -212,8 +219,6 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         main.httpx.AsyncClient = _FakeAsyncClient
         try:
             stream = main.stream_and_capture({}, {"stream": True}, "session", "", "model")
-            bootstrap = await anext(stream)
-            self.assertIn(b'"object": "chat.completion.chunk"', bootstrap)
             error = await anext(stream)
             self.assertIn(b'"type": "upstream_malformed_sse"', error)
             self.assertIn(b"data: [DONE]", error)
@@ -231,14 +236,25 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         main.httpx.AsyncClient = _FakeAsyncClient
         try:
             stream = main.stream_and_capture({}, {"stream": True}, "session", "", "model")
-            bootstrap = await anext(stream)
-            self.assertIn(b'"object": "chat.completion.chunk"', bootstrap)
             self.assertIn(b'"choices":[]', await anext(stream))
             self.assertIn(b'"content":"ok"', await anext(stream))
             self.assertEqual(await anext(stream), b"data: [DONE]\n\n")
             await stream.aclose()
         finally:
             main.httpx.AsyncClient = original_client
+
+    async def test_heartbeat_waits_for_real_upstream_first_event(self):
+        response = _DelayedFirstResponse()
+        stream = main._iterate_upstream_with_heartbeat(response, interval_seconds=0.01)
+        first = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.03)
+        self.assertFalse(first.done())
+        response.release_first.set()
+        chunk, is_heartbeat, error = await first
+        self.assertIn(b'"content":"first"', chunk)
+        self.assertFalse(is_heartbeat)
+        self.assertIsNone(error)
+        await stream.aclose()
 
 
 class PendingToolWorkflowTests(unittest.IsolatedAsyncioTestCase):

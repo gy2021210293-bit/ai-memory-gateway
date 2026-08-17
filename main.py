@@ -2584,6 +2584,7 @@ async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = S
     """Yield upstream bytes and SSE comments while the upstream is silent."""
     iterator = response.aiter_bytes().__aiter__()
     pending_chunk = None
+    received_first_chunk = False
     try:
         while True:
             if pending_chunk is None:
@@ -2591,7 +2592,11 @@ async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = S
 
             done, _ = await asyncio.wait({pending_chunk}, timeout=interval_seconds)
             if not done:
-                yield b": keep-alive\n\n", True, None
+                # Some OpenAI clients terminate when the first SSE body frame
+                # is synthetic. Let the real upstream establish the stream;
+                # heartbeats are safe only after at least one real event.
+                if received_first_chunk:
+                    yield b": keep-alive\n\n", True, None
                 continue
 
             try:
@@ -2599,6 +2604,7 @@ async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = S
             except StopAsyncIteration:
                 return
             pending_chunk = None
+            received_first_chunk = True
             yield chunk, False, None
     except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
         yield _upstream_stream_error_event(exc), False, exc
@@ -2724,22 +2730,6 @@ def _upstream_malformed_sse_event(reason: str) -> bytes:
     return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
 
 
-def _stream_bootstrap_event(model: str, request_id: str) -> bytes:
-    """Start an OpenAI-compatible stream with data, not a comment-only frame."""
-    payload = {
-        "id": f"chatcmpl-{request_id or uuid.uuid4().hex[:12]}",
-        "object": "chat.completion.chunk",
-        "created": int(datetime.now(timezone.utc).timestamp()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {"role": "assistant"},
-            "finish_reason": None,
-        }],
-    }
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
 def _persistence_error_event(exc: Exception) -> bytes:
     payload = {
         "error": {
@@ -2818,21 +2808,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
         )
         connect_task = asyncio.create_task(client.send(request, stream=True))
         try:
-            # Some OpenAI clients treat a comment-only first frame as an empty
-            # response and disconnect. Start with a valid assistant-role chunk;
-            # later comment heartbeats remain transport-only and are ignored.
-            yield _stream_bootstrap_event(model, request_id)
-            while not connect_task.done():
-                try:
-                    done, _ = await asyncio.wait(
-                        {connect_task}, timeout=STREAM_HEARTBEAT_INTERVAL
-                    )
-                except asyncio.CancelledError:
-                    connect_task.cancel()
-                    raise
-                if not done:
-                    yield b": keep-alive\n\n"
-            response = connect_task.result()
+            response = await connect_task
         except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
             print(
                 f"❌ 上游连接失败: session={session_id}, "
