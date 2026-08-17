@@ -37,7 +37,7 @@ from database import list_cognitive_items, save_cognitive_item, delete_cognitive
 from database import record_cognitive_correction, get_recent_cognitive_corrections
 from database import get_verbatim_memories_for_derivation, queue_memory_derivation, list_memory_derivation_pending, accept_memory_derivation, reject_memory_derivation, deactivate_derivations_with_dangling_premises, memory_derivation_content_exists
 from database import compute_embeddings_batch, cognitive_content_similarity, cognitive_overlap_score, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY, COGNITIVE_OVERLAP_MIN, COGNITIVE_OVERLAP_MIN_RUN, COGNITIVE_EVIDENCE_SIM_MIN
-from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch
+from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch, stage_tool_workflow, get_pending_tool_workflow, delete_expired_tool_workflows
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
 import memory_extractor as _memory_extractor_module
@@ -46,7 +46,6 @@ from upstream_compat import normalize_chat_request
 from message_pipeline import (
     classify_request,
     combine_system_prompt,
-    leading_user_messages,
     make_persistence_plan,
     reconcile_partition_block,
     repair_stale_tool_chains,
@@ -88,7 +87,7 @@ MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
-MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
+MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "15"))
 
 # 认知模型自动审视（半自动分级：仅 reinforce 自动应用，其余一律挂起待人工确认）
 COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | auto
@@ -250,7 +249,7 @@ def invalidate_system_prompt_cache():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时初始化数据库，关闭时断开连接"""
-    global PARTITION_SESSION_ID
+    global PARTITION_SESSION_ID, MEMORY_EXTRACT_INTERVAL
     # Dashboard configuration lives in PostgreSQL, so load it even when the
     # Zeabur environment currently disables memory; the DB value has priority.
     if MEMORY_ENABLED or _db_module.DATABASE_URL:
@@ -312,6 +311,13 @@ async def lifespan(app: FastAPI):
                             restored.append(key)
                     if restored:
                         print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
+                if MEMORY_EXTRACT_INTERVAL != 15:
+                    MEMORY_EXTRACT_INTERVAL = 15
+                    await set_gateway_config("MEMORY_EXTRACT_INTERVAL", "15")
+                    print("🔄 记忆提取间隔已校正为每15个完整轮次")
+                removed_workflows = await delete_expired_tool_workflows()
+                if removed_workflows:
+                    print(f"🧹 清理了 {removed_workflows} 条过期工具工作流")
             except Exception as e:
                 print(f"[warning] 恢复面板配置失败: {e}")
             
@@ -997,6 +1003,12 @@ def dump_request_debug(model: str, messages: list) -> None:
                 f"仅尾部新增 {len(digest) - common} 条 —— 缓存应命中全部历史",
                 flush=True,
             )
+        elif common == len(digest):
+            print(
+                f"🔍 与上次请求比较: 本次是上次请求的严格前缀 "
+                f"{common}/{len(prev_digests)} 条，历史已缩短",
+                flush=True,
+            )
         else:
             changed = digest[common]
             prev_changed = prev_digests[common] if common < len(prev_digests) else ("-", "-")
@@ -1018,6 +1030,14 @@ def dump_request_debug(model: str, messages: list) -> None:
             "previous": "",
         }
     _last_request_digest = (model, digest)
+
+
+def safe_dump_request_debug(model: str, messages: list) -> None:
+    """Diagnostics must never be able to fail the provider request."""
+    try:
+        dump_request_debug(model, messages)
+    except Exception as exc:
+        print(f"⚠️ 请求摘要诊断失败（已隔离）: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _warn_empty_reasoning_response(session_id: str, body: dict, reasoning_len: int) -> None:
@@ -1308,7 +1328,7 @@ async def build_partitioned_messages(
     b_rounds_count = len(b_round_groups)
     
     rotation_count = 0
-    max_rotations = CACHE_MAX_ROTATIONS if CACHE_PARTITION_TRIGGER == "time" else 999
+    max_rotations = CACHE_MAX_ROTATIONS
     defer_rotation_for_tool_tail = has_closed_tool_tail(history)
     if defer_rotation_for_tool_tail and _should_rotate(b_rounds_count, X, a_msgs):
         print("🔧 工具结果正在回传，暂缓轮转以保留完整工具链")
@@ -1682,41 +1702,81 @@ async def apply_event_state_changes(memory_id: int, state_changes: list, default
     return {"accepted": accepted, "proposals": proposals, "skipped": skipped}
 
 
-# session_id -> 触发工具链的领先 user 消息（内存暂存，整轮完成前不落库）。
-# 单进程部署 + 单一活跃对话线，内存暂存无并发风险，也避免了中途写库。
-_pending_tool_user: dict[str, tuple] = {}
-
-
-def _reconcile_pending_tool_user(
+async def commit_response_state(
     session_id: str,
-    plan,
     current_block: tuple,
     assistant_msg: str,
     assistant_tool_calls,
     assistant_reasoning,
+    model: str,
     skip: bool,
 ):
-    """
-    保留"整轮完成后一次入库"的设计，同时不让触发工具链的用户消息丢失。
+    """Durably stage a tool step or atomically commit one completed logical round."""
+    if skip:
+        return None, None
 
-    - 本轮尚未完成且块以 user 开头（新回合触发工具链）：把领先 user 暂存到
-      内存，本轮仍不落库（与 7fd9b18 的延迟设计一致）。
-    - 本轮完成且块不以 user 开头（工具链 delta 收尾）：把暂存的 user 拼回批次，
-      最终一次原子写入 [user, assistant(tool_calls), tool, …, assistant(final)]。
-    - 其它情况：仅清理过期暂存（普通完整回合 / 继续回传工具结果的 delta）。
-    """
-    if plan.completed_round:
-        if not plan.user_leading and session_id in _pending_tool_user:
-            plan = make_persistence_plan(
-                session_id, current_block, assistant_msg,
-                assistant_tool_calls, assistant_reasoning, skip,
-                leading_user_messages=_pending_tool_user.pop(session_id),
-            )
-        else:
-            _pending_tool_user.pop(session_id, None)
-    elif plan.user_leading:
-        _pending_tool_user[session_id] = leading_user_messages(plan.messages)
-    return plan
+    pending = await get_pending_tool_workflow(session_id)
+    pending_messages = list(pending.get("messages") or []) if pending else []
+    workflow_id = pending.get("workflow_id") if pending else str(uuid.uuid4())
+    block = list(current_block)
+
+    if pending_messages and block and all(m.get("role") == "tool" for m in block):
+        block = pending_messages + block
+
+    plan = make_persistence_plan(
+        session_id, tuple(block), assistant_msg,
+        assistant_tool_calls, assistant_reasoning, skip,
+    )
+    async def with_db_retry(operation, label: str):
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"[gateway-state] session={session_id} workflow={workflow_id} "
+                    f"state={label}_retry attempt={attempt} type={type(exc).__name__}",
+                    flush=True,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(0.1 * attempt)
+        raise last_error
+
+    if assistant_tool_calls:
+        expected_ids = [
+            call.get("id") for call in assistant_tool_calls
+            if isinstance(call, dict) and call.get("id")
+        ]
+        await with_db_retry(
+            lambda: stage_tool_workflow(
+                session_id, workflow_id, list(plan.messages), expected_ids,
+            ),
+            "workflow_stage",
+        )
+        print(
+            f"[gateway-state] session={session_id} workflow={workflow_id} "
+            f"state=awaiting_tool_results calls={len(expected_ids)}",
+            flush=True,
+        )
+        return None, None
+
+    if not plan.completed_round:
+        return None, None
+
+    result = await with_db_retry(
+        lambda: persist_conversation_batch(
+            session_id, list(plan.messages), model,
+            workflow_id=pending.get("workflow_id") if pending else None,
+        ),
+        "conversation_commit",
+    )
+    print(
+        f"[gateway-state] session={session_id} workflow={workflow_id} "
+        f"state=conversation_committed inserted={result['inserted']} rerolled={result['rerolled']}",
+        flush=True,
+    )
+    return plan, result
 
 
 async def process_memories_background(
@@ -1727,6 +1787,7 @@ async def process_memories_background(
     skip_conversation_log: bool = False,
     assistant_tool_calls: list = None,
     persistence_plan=None,
+    persisted_result=None,
 ):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
@@ -1783,10 +1844,8 @@ async def process_memories_background(
             if persistence_plan is None:
                 print("⚠️ 缺少持久化方案，本轮不写入对话", flush=True)
                 return
-            persist_result = await persist_conversation_batch(
-                persistence_plan.session_id,
-                list(persistence_plan.messages),
-                model,
+            persist_result = persisted_result or await persist_conversation_batch(
+                persistence_plan.session_id, list(persistence_plan.messages), model,
             )
             completed_round = (
                 persistence_plan.completed_round
@@ -2025,6 +2084,8 @@ async def chat_completions(request: Request):
 
 async def _chat_completions_inner(request: Request):
     global PARTITION_SESSION_ID
+    request_id = str(uuid.uuid4())[:12]
+    print(f"[gateway-state] request={request_id} state=received", flush=True)
     body = await request.json()
     classified = classify_request(body.get("messages", []))
     messages = [dict(message) for message in classified.ordinary_messages]
@@ -2106,11 +2167,19 @@ async def _chat_completions_inner(request: Request):
             print(f"[warning] 分区模式读取历史失败: {e}")
             db_msgs = []
 
-        reconciled = reconcile_partition_block(db_msgs, messages)
+        try:
+            pending_workflow = await get_pending_tool_workflow(session_id)
+        except Exception as exc:
+            print(f"[warning] 读取临时工具工作流失败: {type(exc).__name__}", flush=True)
+            pending_workflow = None
+        pending_msgs = list(pending_workflow.get("messages") or []) if pending_workflow else []
+        alignment_history = db_msgs + pending_msgs
+        reconciled = reconcile_partition_block(alignment_history, messages)
         print(
             "[message-align] "
             f"client_roles={[m.get('role', '?') for m in messages if m.get('role') != 'system']} "
             f"db_tail_roles={[m.get('role', '?') for m in db_msgs[-8:]]} "
+            f"pending_roles={[m.get('role', '?') for m in pending_msgs]} "
             f"aligned={reconciled.aligned_count}@{reconciled.alignment_end} "
             f"current_roles={[m.get('role', '?') for m in reconciled.provider_messages]} "
             f"tool_chain={reconciled.is_tool_chain} "
@@ -2139,6 +2208,11 @@ async def _chat_completions_inner(request: Request):
         ]
         persistence_block = tuple(reconciled.persistence_messages)
         user_message = reconciled.latest_user_text
+        if not user_message and pending_msgs:
+            user_message = next(
+                (m.get("content", "") for m in pending_msgs if m.get("role") == "user"),
+                "",
+            )
         self_contained_tool_chain = reconciled.is_tool_chain
         memory_task = asyncio.create_task(
             build_memory_text(user_message)
@@ -2176,7 +2250,7 @@ async def _chat_completions_inner(request: Request):
             cognitive_text = ""
 
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
-        db_last = db_msgs[-1] if db_msgs else None
+        db_last = alignment_history[-1] if alignment_history else None
         db_expected_ids = {
             tool_call.get("id")
             for tool_call in (db_last.get("tool_calls", []) if db_last else [])
@@ -2198,6 +2272,15 @@ async def _chat_completions_inner(request: Request):
                     "🔧 请求内工具链闭合，保留完整客户端块："
                     f"{len(client_new_msgs)}条消息 / {len(client_tools)}条tool"
                 )
+        if pending_msgs and client_new_msgs and all(
+            message.get("role") == "tool" for message in client_new_msgs
+        ):
+            client_new_msgs = [dict(message) for message in pending_msgs] + client_new_msgs
+            print(
+                f"[gateway-state] session={session_id} "
+                f"workflow={pending_workflow['workflow_id']} state=restored",
+                flush=True,
+            )
         non_system_count = sum(1 for message in messages if message.get("role") != "system")
         filtered_count = max(0, non_system_count - len(client_new_msgs))
         if filtered_count:
@@ -2243,10 +2326,23 @@ async def _chat_completions_inner(request: Request):
                 f"{client_system_count}条客户端 system（共{client_system_chars}字）",
                 flush=True,
             )
-        messages = await build_partitioned_messages(
-            session_id, all_msgs, partition_prompt, user_message,
-            cognitive_text, memory_text,
-        )
+        try:
+            messages = await build_partitioned_messages(
+                session_id, all_msgs, partition_prompt, user_message,
+                cognitive_text, memory_text,
+            )
+        except Exception as exc:
+            print(
+                f"[gateway-state] request={request_id} session={session_id} "
+                f"state=partition_fallback type={type(exc).__name__}",
+                flush=True,
+            )
+            messages = [
+                {k: v for k, v in message.items() if k != "created_at"}
+                for message in all_msgs
+            ]
+            if partition_prompt:
+                messages.insert(0, {"role": "system", "content": partition_prompt})
         body["messages"] = messages
     
     else:
@@ -2354,7 +2450,7 @@ async def _chat_completions_inner(request: Request):
 
     # ---------- 请求调试转储（排查缓存命中率） ----------
     # 打印最终发给上游的逐条消息摘要；前缀对比默认开启，直接指出缓存断点。
-    dump_request_debug(model, body.get("messages", []))
+    safe_dump_request_debug(model, body.get("messages", []))
 
     # ---------- 转发请求 ----------
     headers = {
@@ -2384,6 +2480,10 @@ async def _chat_completions_inner(request: Request):
         print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
     
     print(f"📡 请求: model={model}, stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}", flush=True)
+    print(
+        f"[gateway-state] request={request_id} session={session_id} state=prepared",
+        flush=True,
+    )
     
     # 调试：打印请求体中的推理相关字段
     debug_keys = {k: v for k, v in body.items() if k in ('reasoning_effort', 'google', 'reasoning')}
@@ -2395,7 +2495,7 @@ async def _chat_completions_inner(request: Request):
             safe_stream_and_capture(
                 headers, body, session_id, user_message, model,
                 skip_conversation_log, persistence_block,
-                drives_user_message_id, drives_run_id,
+                drives_user_message_id, drives_run_id, request_id,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -2405,6 +2505,10 @@ async def _chat_completions_inner(request: Request):
             response = await client.post(API_BASE_URL, headers=headers, json=body)
             
             if response.status_code == 200:
+                print(
+                    f"[gateway-state] request={request_id} session={session_id} state=response_complete",
+                    flush=True,
+                )
                 resp_data = response.json()
                 usage = resp_data.get("usage") or {}
                 if usage.get("total_tokens"):
@@ -2436,24 +2540,19 @@ async def _chat_completions_inner(request: Request):
                     _warn_empty_reasoning_response(session_id, body, len(assistant_reasoning))
 
                 if MEMORY_ENABLED and (user_message or tool_messages):
-                    persistence_plan = make_persistence_plan(
-                        session_id,
-                        persistence_block,
-                        assistant_msg,
-                        assistant_tool_calls,
-                        assistant_reasoning,
+                    persistence_plan, persisted_result = await commit_response_state(
+                        session_id, persistence_block, assistant_msg,
+                        assistant_tool_calls, assistant_reasoning, model,
                         skip_conversation_log,
                     )
-                    persistence_plan = _reconcile_pending_tool_user(
-                        session_id, persistence_plan, persistence_block,
-                        assistant_msg, assistant_tool_calls, assistant_reasoning,
-                        skip_conversation_log,
-                    )
-                    if persistence_plan.completed_round:
+                    if persistence_plan:
                         asyncio.create_task(
-                            process_memories_background(session_id, user_message, assistant_msg, model,
-                                                        assistant_tool_calls=assistant_tool_calls,
-                                                        persistence_plan=persistence_plan)
+                            process_memories_background(
+                                session_id, user_message, assistant_msg, model,
+                                assistant_tool_calls=assistant_tool_calls,
+                                persistence_plan=persistence_plan,
+                                persisted_result=persisted_result,
+                            )
                         )
 
                 # ---------- Drivesoid 情感引擎：回复后上报事件 ----------
@@ -2465,6 +2564,10 @@ async def _chat_completions_inner(request: Request):
                         run_id=drives_run_id,
                     ))
 
+                print(
+                    f"[gateway-state] request={request_id} session={session_id} state=delivered",
+                    flush=True,
+                )
                 return JSONResponse(status_code=200, content=resp_data)
             else:
                 try:
@@ -2618,6 +2721,17 @@ def _upstream_malformed_sse_event(reason: str) -> bytes:
     return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
 
 
+def _persistence_error_event(exc: Exception) -> bytes:
+    payload = {
+        "error": {
+            "message": "Gateway received the complete response but could not commit the conversation",
+            "type": "gateway_persistence_error",
+            "code": type(exc).__name__,
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
 async def safe_stream_and_capture(*args, **kwargs):
     """Keep transport failures inside the already-started SSE response."""
     session_id = args[2] if len(args) > 2 else kwargs.get("session_id", "")
@@ -2643,14 +2757,38 @@ async def safe_stream_and_capture(*args, **kwargs):
         yield _upstream_stream_error_event(exc)
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = (), drives_user_message_id: str = "", drives_run_id: str = ""):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = (), drives_user_message_id: str = "", drives_run_id: str = "", request_id: str = ""):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
     full_reasoning = []
     stream_usage = {}
     upstream_sse_buffer = bytearray()
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
-    
+    response_finalized = False
+
+    async def finalize_complete_response():
+        nonlocal response_finalized
+        if response_finalized:
+            return
+        response_finalized = True
+        assistant_msg = "".join(full_response)
+        assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
+        assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+        tool_messages = [m for m in current_block if m.get("role") == "tool"]
+        if MEMORY_ENABLED and (user_message or tool_messages):
+            plan, persisted_result = await commit_response_state(
+                session_id, current_block, assistant_msg, assistant_tool_calls,
+                assistant_reasoning, model, skip_conversation_log,
+            )
+            if plan:
+                asyncio.create_task(
+                    process_memories_background(
+                        session_id, user_message, assistant_msg, model,
+                        assistant_tool_calls=assistant_tool_calls,
+                        persistence_plan=plan,
+                        persisted_result=persisted_result,
+                    )
+                )
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -2659,6 +2797,10 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
         # 持续发心跳，避免"首字节前静默"被 Zeabur 等边缘代理判定为超时而回 502。
         yield b": keep-alive\n\n"
         request = client.build_request("POST", API_BASE_URL, headers=headers, json=body)
+        print(
+            f"[gateway-state] request={request_id or '-'} session={session_id} state=upstream_started",
+            flush=True,
+        )
         connect_task = asyncio.create_task(client.send(request, stream=True))
         try:
             while not connect_task.done():
@@ -2789,7 +2931,28 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                     if "arguments" in fn:
                                         accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
 
+                    if forwarded_event == b"data: [DONE]\n\n":
+                        print(
+                            f"[gateway-state] request={request_id or '-'} session={session_id} "
+                            "state=response_complete",
+                            flush=True,
+                        )
+                        try:
+                            await finalize_complete_response()
+                        except Exception as exc:
+                            print(
+                                f"[gateway-state] session={session_id} state=persistence_failed "
+                                f"type={type(exc).__name__}",
+                                flush=True,
+                            )
+                            yield _persistence_error_event(exc)
+                            return
                     yield forwarded_event
+                    if forwarded_event == b"data: [DONE]\n\n":
+                        print(
+                            f"[gateway-state] request={request_id or '-'} session={session_id} state=delivered",
+                            flush=True,
+                        )
         finally:
             await response.aclose()
 
@@ -2806,7 +2969,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
 
     if stream_error and (assistant_msg or assistant_reasoning):
         print(
-            f"💾 上游中断前的部分回复将继续保存: content={len(assistant_msg)}字符, "
+            f"ℹ️ 上游中断前捕获到部分回复但不写入正式历史: content={len(assistant_msg)}字符, "
             f"reasoning={len(assistant_reasoning or '')}字符",
             flush=True,
         )
@@ -2840,27 +3003,10 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                 flush=True,
             )
     
-    tool_messages = [message for message in current_block if message.get("role") == "tool"]
-    if MEMORY_ENABLED and (user_message or tool_messages):
-        persistence_plan = make_persistence_plan(
-            session_id,
-            current_block,
-            assistant_msg,
-            assistant_tool_calls,
-            assistant_reasoning,
-            skip_conversation_log,
-        )
-        persistence_plan = _reconcile_pending_tool_user(
-            session_id, persistence_plan, current_block,
-            assistant_msg, assistant_tool_calls, assistant_reasoning,
-            skip_conversation_log,
-        )
-        if persistence_plan.completed_round:
-            asyncio.create_task(
-                process_memories_background(session_id, user_message, assistant_msg, model,
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            persistence_plan=persistence_plan)
-            )
+    # 兼容少数不发送 [DONE]、但正常关闭且事件边界完整的实现。标准 SSE 路径
+    # 已在转发 [DONE] 前提交，这里通过 response_finalized 保证幂等。
+    if not response_finalized and not stream_error and not upstream_sse_buffer.strip():
+        await finalize_complete_response()
 
     # ---------- Drivesoid 情感引擎：流式回复后上报事件 ----------
     if drives.is_enabled() and user_message and not skip_conversation_log:

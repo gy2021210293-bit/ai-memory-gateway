@@ -126,6 +126,7 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         original_client = main.httpx.AsyncClient
         original_memory_enabled = main.MEMORY_ENABLED
         original_background = main.process_memories_background
+        original_commit = main.commit_response_state
 
         _FakeAsyncClient.response = _FakeResponse([
             b'data: {"choices":[{"delta":{"content":"checking"}}]}\n\n',
@@ -137,6 +138,7 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         main.httpx.AsyncClient = _FakeAsyncClient
         main.MEMORY_ENABLED = True
         main.process_memories_background = AsyncMock()
+        main.commit_response_state = AsyncMock(return_value=(None, None))
         try:
             stream = main.stream_and_capture(
                 {}, {"stream": True}, "session", "run", "model",
@@ -149,11 +151,13 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b'"finish_reason":"tool_calls"', await anext(stream))
             self.assertEqual(await anext(stream), b"data: [DONE]\n\n")
             main.process_memories_background.assert_not_called()
+            main.commit_response_state.assert_awaited_once()
             await stream.aclose()
         finally:
             main.httpx.AsyncClient = original_client
             main.MEMORY_ENABLED = original_memory_enabled
             main.process_memories_background = original_background
+            main.commit_response_state = original_commit
 
     async def test_non_stream_tool_call_does_not_schedule_persistence(self):
         original_client = main.httpx.AsyncClient
@@ -164,6 +168,7 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         original_session_id = main.get_active_session_id
         original_system_prompt = main.get_system_prompt
         original_background = main.process_memories_background
+        original_commit = main.commit_response_state
         original_drives_enabled = main.drives.is_enabled
 
         async def system_prompt():
@@ -178,11 +183,13 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         main.get_active_session_id = lambda: "session"
         main.get_system_prompt = system_prompt
         main.process_memories_background = AsyncMock()
+        main.commit_response_state = AsyncMock(return_value=(None, None))
         main.drives.is_enabled = lambda: False
         try:
             response = await main._chat_completions_inner(_FakeRequest())
             self.assertEqual(response.status_code, 200)
             main.process_memories_background.assert_not_called()
+            main.commit_response_state.assert_awaited_once()
         finally:
             main.httpx.AsyncClient = original_client
             main.MEMORY_ENABLED = original_memory_enabled
@@ -192,6 +199,7 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             main.get_active_session_id = original_session_id
             main.get_system_prompt = original_system_prompt
             main.process_memories_background = original_background
+            main.commit_response_state = original_commit
             main.drives.is_enabled = original_drives_enabled
 
     async def test_stream_converts_malformed_sse_to_a_safe_error(self):
@@ -229,132 +237,50 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             main.httpx.AsyncClient = original_client
 
 
-class PendingToolUserTests(unittest.TestCase):
-    """触发工具链的用户消息在整轮完成前暂存，最终入库时拼回批次开头。"""
+class PendingToolWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chain_start_is_staged_durably(self):
+        original_get = main.get_pending_tool_workflow
+        original_stage = main.stage_tool_workflow
+        main.get_pending_tool_workflow = AsyncMock(return_value=None)
+        main.stage_tool_workflow = AsyncMock(return_value={"status": "awaiting_tool_results"})
+        try:
+            plan, result = await main.commit_response_state(
+                "thread-a", ({"role": "user", "content": "run tool"},),
+                "", [{"id": "call-1"}], None, "model", False,
+            )
+            self.assertIsNone(plan)
+            self.assertIsNone(result)
+            staged = main.stage_tool_workflow.await_args.args[2]
+            self.assertEqual([message["role"] for message in staged], ["user", "assistant"])
+        finally:
+            main.get_pending_tool_workflow = original_get
+            main.stage_tool_workflow = original_stage
 
-    def setUp(self):
-        main._pending_tool_user.clear()
-
-    def tearDown(self):
-        main._pending_tool_user.clear()
-
-    def _user_start_plan(self):
-        return main.make_persistence_plan(
-            "thread-a",
-            ({"role": "user", "content": "run tool"},),
-            "",
-            [{"id": "call-1"}],
-            None,
-            False,
-        )
-
-    def _delta_final_plan(self):
-        return main.make_persistence_plan(
-            "thread-a",
-            (
+    async def test_final_tool_answer_commits_staged_workflow(self):
+        original_get = main.get_pending_tool_workflow
+        original_persist = main.persist_conversation_batch
+        main.get_pending_tool_workflow = AsyncMock(return_value={
+            "workflow_id": "wf-1",
+            "messages": [
+                {"role": "user", "content": "run tool"},
                 {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
-                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
-            ),
-            "final answer",
-            None,
-            None,
-            False,
-        )
-
-    def test_chain_start_stashes_user_and_defers_persistence(self):
-        plan = self._user_start_plan()
-        plan = main._reconcile_pending_tool_user(
-            "thread-a", plan, ({"role": "user", "content": "run tool"},),
-            "", [{"id": "call-1"}], None, False,
-        )
-        self.assertFalse(plan.completed_round)
-        self.assertEqual(
-            main._pending_tool_user["thread-a"],
-            ({"role": "user", "content": "run tool"},),
-        )
-
-    def test_chain_completion_prepends_stashed_user(self):
-        # round start: stash the trigger user
-        plan = self._user_start_plan()
-        main._reconcile_pending_tool_user(
-            "thread-a", plan, ({"role": "user", "content": "run tool"},),
-            "", [{"id": "call-1"}], None, False,
-        )
-        # tool delta comes back; assistant replies final -> full round batch
-        plan = self._delta_final_plan()
-        plan = main._reconcile_pending_tool_user(
-            "thread-a", plan,
-            (
-                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
-                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
-            ),
-            "final answer", None, None, False,
-        )
-        self.assertTrue(plan.completed_round)
-        self.assertEqual(
-            [message["role"] for message in plan.messages],
-            ["user", "assistant", "tool", "assistant"],
-        )
-        self.assertEqual(plan.messages[0]["content"], "run tool")
-        self.assertNotIn("thread-a", main._pending_tool_user)
-
-    def test_mid_chain_delta_keeps_stash(self):
-        plan = self._user_start_plan()
-        main._reconcile_pending_tool_user(
-            "thread-a", plan, ({"role": "user", "content": "run tool"},),
-            "", [{"id": "call-1"}], None, False,
-        )
-        # another tool delta with more tool_calls: still incomplete, stash kept
-        plan = main.make_persistence_plan(
-            "thread-a",
-            (
-                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
-                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
-            ),
-            "",
-            [{"id": "call-2"}],
-            None,
-            False,
-        )
-        plan = main._reconcile_pending_tool_user(
-            "thread-a", plan,
-            (
-                {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
-                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
-            ),
-            "", [{"id": "call-2"}], None, False,
-        )
-        self.assertFalse(plan.completed_round)
-        self.assertEqual(
-            main._pending_tool_user["thread-a"],
-            ({"role": "user", "content": "run tool"},),
-        )
-
-    def test_normal_complete_round_clears_stale_stash(self):
-        plan = self._user_start_plan()
-        main._reconcile_pending_tool_user(
-            "thread-a", plan, ({"role": "user", "content": "run tool"},),
-            "", [{"id": "call-1"}], None, False,
-        )
-        # a normal user->assistant round (no tool_calls) supersedes the chain
-        plan = main.make_persistence_plan(
-            "thread-a",
-            ({"role": "user", "content": "new message"},),
-            "plain answer",
-            None,
-            None,
-            False,
-        )
-        plan = main._reconcile_pending_tool_user(
-            "thread-a", plan, ({"role": "user", "content": "new message"},),
-            "plain answer", None, None, False,
-        )
-        self.assertTrue(plan.completed_round)
-        self.assertEqual(
-            [message["role"] for message in plan.messages],
-            ["user", "assistant"],
-        )
-        self.assertNotIn("thread-a", main._pending_tool_user)
+            ],
+        })
+        main.persist_conversation_batch = AsyncMock(return_value={"inserted": 4, "rerolled": False})
+        try:
+            plan, result = await main.commit_response_state(
+                "thread-a", ({"role": "tool", "tool_call_id": "call-1", "content": "result"},),
+                "final answer", None, None, "model", False,
+            )
+            self.assertEqual(
+                [message["role"] for message in plan.messages],
+                ["user", "assistant", "tool", "assistant"],
+            )
+            self.assertEqual(result["inserted"], 4)
+            self.assertEqual(main.persist_conversation_batch.await_args.kwargs["workflow_id"], "wf-1")
+        finally:
+            main.get_pending_tool_workflow = original_get
+            main.persist_conversation_batch = original_persist
 
 
 if __name__ == "__main__":

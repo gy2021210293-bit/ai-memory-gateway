@@ -128,7 +128,7 @@ PostgreSQL 存储对话、记忆、实体、认知与配置；`system_prompt.txt
 | `MEMORY_ENABLED` | 开启记忆 | `true` |
 | `MEMORY_MODEL` | 提取记忆用的模型（推荐便宜的小模型） | `anthropic/claude-haiku-4.5` |
 | `MEMORY_EXTRACT_ENABLED`（可选） | 记忆提取+注入总开关，false 时只存消息不提取记忆 | `true` |
-| `MEMORY_EXTRACT_INTERVAL`（可选） | 每条对话线独立的记忆提取间隔（0=禁用 / 1=每轮 / N=每N轮） | `1` |
+| `MEMORY_EXTRACT_INTERVAL`（可选） | 每条对话线独立的记忆提取间隔（0=禁用 / 1=每轮 / N=每N轮） | `15` |
 | `MAX_MEMORIES_INJECT`（可选） | 每次注入的最大记忆条数 | `15` |
 | `MIN_SCORE_THRESHOLD`（可选） | 记忆搜索最低分数阈值，低于此分数不注入（0=不过滤） | `0.15` |
 | `TIMEZONE_HOURS`（可选） | 时区偏移（小时），用于记忆注入时的日期显示 | `8`（UTC+8）|

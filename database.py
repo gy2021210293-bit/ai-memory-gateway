@@ -529,6 +529,26 @@ async def init_tables():
             );
         """)
 
+        # 未完成的工具工作流。它只保存协议恢复状态，不属于正式对话历史，
+        # 因而不会参与分区、Dashboard 或记忆提取。
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_tool_workflows (
+                session_id      TEXT PRIMARY KEY,
+                workflow_id     TEXT NOT NULL UNIQUE,
+                messages        JSONB NOT NULL,
+                expected_ids    TEXT[] NOT NULL DEFAULT '{}',
+                status          TEXT NOT NULL DEFAULT 'awaiting_tool_results'
+                                CHECK (status IN ('awaiting_tool_results', 'completed')),
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at      TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_tool_workflows_expiry
+            ON pending_tool_workflows (status, expires_at);
+        """)
+
         # 每条对话线独立的记忆提取进度。首次见到旧对话线时从现有末尾开始，
         # 避免部署后把全部历史重复送入提取模型。
         await conn.execute("""
@@ -1244,7 +1264,69 @@ def _conversation_signature(role, content, metadata_text):
     )
 
 
-async def persist_conversation_batch(session_id: str, messages: list, model: str = "") -> dict:
+async def stage_tool_workflow(
+    session_id: str,
+    workflow_id: str,
+    messages: list,
+    expected_ids: list[str],
+) -> dict:
+    """Durably stage one unfinished tool workflow without exposing it as history."""
+    pool = await get_pool()
+    payload = json.dumps(messages, ensure_ascii=False, default=str)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO pending_tool_workflows
+                (session_id, workflow_id, messages, expected_ids, status, updated_at, expires_at)
+            VALUES ($1, $2, $3::jsonb, $4::text[], 'awaiting_tool_results', NOW(), NOW() + INTERVAL '24 hours')
+            ON CONFLICT (session_id) DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                messages = EXCLUDED.messages,
+                expected_ids = EXCLUDED.expected_ids,
+                status = 'awaiting_tool_results',
+                updated_at = NOW(),
+                expires_at = NOW() + INTERVAL '24 hours'
+            RETURNING workflow_id, status
+        """, session_id, workflow_id, payload, expected_ids)
+    return dict(row)
+
+
+async def get_pending_tool_workflow(session_id: str) -> dict | None:
+    """Return the active, non-expired tool workflow for a session."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT workflow_id, session_id, messages, expected_ids, status,
+                   created_at, updated_at, expires_at
+            FROM pending_tool_workflows
+            WHERE session_id = $1
+              AND status = 'awaiting_tool_results'
+              AND expires_at > NOW()
+        """, session_id)
+    if not row:
+        return None
+    result = dict(row)
+    if isinstance(result.get("messages"), str):
+        result["messages"] = json.loads(result["messages"])
+    return result
+
+
+async def delete_expired_tool_workflows() -> int:
+    """Bound temporary workflow storage; completed conversations are untouched."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            DELETE FROM pending_tool_workflows
+            WHERE expires_at <= NOW() OR status = 'completed'
+        """)
+    return int(result.split()[-1])
+
+
+async def persist_conversation_batch(
+    session_id: str,
+    messages: list,
+    model: str = "",
+    workflow_id: str | None = None,
+) -> dict:
     """Persist one logical client/assistant batch atomically and idempotently."""
     if not messages:
         return {"inserted": 0, "rerolled": False}
@@ -1289,6 +1371,12 @@ async def persist_conversation_batch(session_id: str, messages: list, model: str
                         ORDER BY id DESC LIMIT 1
                     )
                 """, parts[1], model, parts[2], session_id)
+                if workflow_id:
+                    await conn.execute("""
+                        UPDATE pending_tool_workflows
+                        SET status = 'completed', updated_at = NOW(), expires_at = NOW()
+                        WHERE session_id = $1 AND workflow_id = $2
+                    """, session_id, workflow_id)
                 return {"inserted": 0, "rerolled": True}
 
             overlap = 0
@@ -1303,6 +1391,12 @@ async def persist_conversation_batch(session_id: str, messages: list, model: str
                     INSERT INTO conversations (session_id, role, content, model, metadata)
                     VALUES ($1, $2, $3, $4, $5)
                 """, session_id, role, content, model, metadata_text)
+            if workflow_id:
+                await conn.execute("""
+                    UPDATE pending_tool_workflows
+                    SET status = 'completed', updated_at = NOW(), expires_at = NOW()
+                    WHERE session_id = $1 AND workflow_id = $2
+                """, session_id, workflow_id)
             return {
                 "inserted": len(incoming_parts) - overlap,
                 "rerolled": False,
@@ -2531,6 +2625,7 @@ async def delete_conversation(session_id: str):
                 "DELETE FROM conversations WHERE session_id = $1 RETURNING id", session_id
             )
             await conn.execute("DELETE FROM session_cache_state WHERE session_id = $1", session_id)
+            await conn.execute("DELETE FROM pending_tool_workflows WHERE session_id = $1", session_id)
             await conn.execute("DELETE FROM memory_extraction_state WHERE session_id = $1", session_id)
             await conn.execute("DELETE FROM token_usage WHERE session_id = $1", session_id)
     return bool(deleted)
@@ -2548,6 +2643,9 @@ async def batch_delete_conversations(session_ids: list):
             )
             await conn.execute(
                 "DELETE FROM session_cache_state WHERE session_id = ANY($1::text[])", session_ids
+            )
+            await conn.execute(
+                "DELETE FROM pending_tool_workflows WHERE session_id = ANY($1::text[])", session_ids
             )
             await conn.execute(
                 "DELETE FROM memory_extraction_state WHERE session_id = ANY($1::text[])", session_ids
@@ -2589,6 +2687,9 @@ async def merge_sessions_to_target(source_ids: list, target_id: str) -> dict:
             )
             await conn.execute(
                 "DELETE FROM session_cache_state WHERE session_id = ANY($1)", source_ids
+            )
+            await conn.execute(
+                "DELETE FROM pending_tool_workflows WHERE session_id = ANY($1)", source_ids
             )
             await conn.execute(
                 "DELETE FROM memory_extraction_state WHERE session_id = ANY($1::text[])",

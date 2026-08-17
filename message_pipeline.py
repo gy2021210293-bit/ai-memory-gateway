@@ -632,7 +632,7 @@ def reconcile_partition_block(
             is_tool_chain=is_tool_chain,
             aligned_count=0,
             alignment_end=0,
-            reason="strict_tail_fallback",
+            reason="new_current_block",
         )
 
     return _empty_reconciled("no_valid_current_block")
