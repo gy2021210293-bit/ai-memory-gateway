@@ -64,6 +64,29 @@ class _FakeRequest:
         }
 
 
+class _FakeTextJSONResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "choices": [{"message": {"content": "normal answer"}}],
+        }
+
+
+class _FakeMalformedJSONResponse:
+    status_code = 200
+
+    def json(self):
+        return []
+
+
+class _FakeInvalidJSONResponse:
+    status_code = 200
+
+    def json(self):
+        raise ValueError("invalid json")
+
+
 class _DelayedFirstResponse:
     def __init__(self):
         self.release_first = asyncio.Event()
@@ -83,6 +106,31 @@ class _InterruptedResponse:
 
     async def aclose(self):
         pass
+
+
+class _UnexpectedFailureResponse:
+    status_code = 200
+    headers = {"content-type": "text/event-stream"}
+
+    async def aiter_bytes(self):
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise RuntimeError("decoder failed")
+
+    async def aclose(self):
+        pass
+
+
+class _DelayedSecondResponse:
+    def __init__(self):
+        self.release_second = asyncio.Event()
+        self.next_calls = 0
+
+    async def aiter_bytes(self):
+        self.next_calls += 1
+        yield b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
+        self.next_calls += 1
+        await self.release_second.wait()
+        yield b'data: {"choices":[{"delta":{"content":"second"}}]}\n\n'
 
 
 class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
@@ -180,6 +228,32 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             main.process_memories_background = original_background
             main.commit_response_state = original_commit
 
+    async def test_stream_tool_stage_failure_is_safe_error_after_tool_event(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_commit = main.commit_response_state
+        _FakeAsyncClient.response = _FakeResponse([
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = True
+        main.commit_response_state = AsyncMock(side_effect=RuntimeError("db unavailable"))
+        try:
+            chunks = [
+                chunk async for chunk in main.safe_stream_and_capture(
+                    {}, {"stream": True}, "session", "run", "model",
+                    current_block=({"role": "user", "content": "run"},),
+                )
+            ]
+            self.assertTrue(any(b'"tool_calls"' in chunk for chunk in chunks))
+            self.assertIn(b'"type": "upstream_stream_error"', chunks[-1])
+            self.assertEqual(sum(b"data: [DONE]" in chunk for chunk in chunks), 1)
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.commit_response_state = original_commit
+
     async def test_non_stream_tool_call_does_not_schedule_persistence(self):
         original_client = main.httpx.AsyncClient
         original_memory_enabled = main.MEMORY_ENABLED
@@ -221,6 +295,153 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
             main.get_system_prompt = original_system_prompt
             main.process_memories_background = original_background
             main.commit_response_state = original_commit
+            main.drives.is_enabled = original_drives_enabled
+
+    async def test_non_stream_database_failure_does_not_hide_normal_response(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_extract_enabled = main.MEMORY_EXTRACT_ENABLED
+        original_partition_enabled = main.CACHE_PARTITION_ENABLED
+        original_force_stream = main.FORCE_STREAM
+        original_session_id = main.get_active_session_id
+        original_system_prompt = main.get_system_prompt
+        original_commit = main.commit_response_state
+        original_drives_enabled = main.drives.is_enabled
+
+        async def system_prompt():
+            return ""
+
+        _FakeAsyncClient.response = _FakeTextJSONResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = True
+        main.MEMORY_EXTRACT_ENABLED = False
+        main.CACHE_PARTITION_ENABLED = False
+        main.FORCE_STREAM = False
+        main.get_active_session_id = lambda: "session"
+        main.get_system_prompt = system_prompt
+        main.commit_response_state = AsyncMock(side_effect=RuntimeError("db unavailable"))
+        main.drives.is_enabled = lambda: False
+        try:
+            response = await main._chat_completions_inner(_FakeRequest())
+            await asyncio.sleep(0)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.body, b'{"choices":[{"message":{"content":"normal answer"}}]}')
+            main.commit_response_state.assert_awaited_once()
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.MEMORY_EXTRACT_ENABLED = original_extract_enabled
+            main.CACHE_PARTITION_ENABLED = original_partition_enabled
+            main.FORCE_STREAM = original_force_stream
+            main.get_active_session_id = original_session_id
+            main.get_system_prompt = original_system_prompt
+            main.commit_response_state = original_commit
+            main.drives.is_enabled = original_drives_enabled
+
+    async def test_non_stream_tool_stage_failure_returns_json_error(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_extract_enabled = main.MEMORY_EXTRACT_ENABLED
+        original_partition_enabled = main.CACHE_PARTITION_ENABLED
+        original_force_stream = main.FORCE_STREAM
+        original_session_id = main.get_active_session_id
+        original_system_prompt = main.get_system_prompt
+        original_commit = main.commit_response_state
+        original_drives_enabled = main.drives.is_enabled
+
+        async def system_prompt():
+            return ""
+
+        _FakeAsyncClient.response = _FakeJSONResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = True
+        main.MEMORY_EXTRACT_ENABLED = False
+        main.CACHE_PARTITION_ENABLED = False
+        main.FORCE_STREAM = False
+        main.get_active_session_id = lambda: "session"
+        main.get_system_prompt = system_prompt
+        main.commit_response_state = AsyncMock(side_effect=RuntimeError("db unavailable"))
+        main.drives.is_enabled = lambda: False
+        try:
+            response = await main._chat_completions_inner(_FakeRequest())
+            self.assertEqual(response.status_code, 503)
+            self.assertIn(b'"type":"gateway_persistence_error"', response.body)
+            main.commit_response_state.assert_awaited_once()
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.MEMORY_EXTRACT_ENABLED = original_extract_enabled
+            main.CACHE_PARTITION_ENABLED = original_partition_enabled
+            main.FORCE_STREAM = original_force_stream
+            main.get_active_session_id = original_session_id
+            main.get_system_prompt = original_system_prompt
+            main.commit_response_state = original_commit
+            main.drives.is_enabled = original_drives_enabled
+
+    async def test_non_stream_rejects_non_object_upstream_json(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_partition_enabled = main.CACHE_PARTITION_ENABLED
+        original_force_stream = main.FORCE_STREAM
+        original_session_id = main.get_active_session_id
+        original_system_prompt = main.get_system_prompt
+        original_drives_enabled = main.drives.is_enabled
+
+        async def system_prompt():
+            return ""
+
+        _FakeAsyncClient.response = _FakeMalformedJSONResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = False
+        main.CACHE_PARTITION_ENABLED = False
+        main.FORCE_STREAM = False
+        main.get_active_session_id = lambda: "session"
+        main.get_system_prompt = system_prompt
+        main.drives.is_enabled = lambda: False
+        try:
+            response = await main._chat_completions_inner(_FakeRequest())
+            self.assertEqual(response.status_code, 502)
+            self.assertIn(b'"type":"upstream_malformed_response"', response.body)
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.CACHE_PARTITION_ENABLED = original_partition_enabled
+            main.FORCE_STREAM = original_force_stream
+            main.get_active_session_id = original_session_id
+            main.get_system_prompt = original_system_prompt
+            main.drives.is_enabled = original_drives_enabled
+
+    async def test_non_stream_rejects_invalid_upstream_json(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_partition_enabled = main.CACHE_PARTITION_ENABLED
+        original_force_stream = main.FORCE_STREAM
+        original_session_id = main.get_active_session_id
+        original_system_prompt = main.get_system_prompt
+        original_drives_enabled = main.drives.is_enabled
+
+        async def system_prompt():
+            return ""
+
+        _FakeAsyncClient.response = _FakeInvalidJSONResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = False
+        main.CACHE_PARTITION_ENABLED = False
+        main.FORCE_STREAM = False
+        main.get_active_session_id = lambda: "session"
+        main.get_system_prompt = system_prompt
+        main.drives.is_enabled = lambda: False
+        try:
+            response = await main._chat_completions_inner(_FakeRequest())
+            self.assertEqual(response.status_code, 502)
+            self.assertIn(b'"type":"upstream_malformed_response"', response.body)
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.CACHE_PARTITION_ENABLED = original_partition_enabled
+            main.FORCE_STREAM = original_force_stream
+            main.get_active_session_id = original_session_id
+            main.get_system_prompt = original_system_prompt
             main.drives.is_enabled = original_drives_enabled
 
     async def test_stream_converts_malformed_sse_to_a_safe_error(self):
@@ -275,6 +496,87 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.httpx.AsyncClient = original_client
 
+    async def test_stream_reassembles_sse_at_every_single_byte_boundary(self):
+        payload = (
+            b'data: {"choices":[{"delta":{"reasoning_content":"\\u601d\\u8003"}}]}\r\n\r\n'
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}\r\n\r\n'
+            b'data: [DONE]\r\n\r\n'
+        )
+        original_client = main.httpx.AsyncClient
+        main.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            for split_at in range(len(payload) + 1):
+                _FakeAsyncClient.response = _FakeResponse([
+                    payload[:split_at], payload[split_at:],
+                ])
+                chunks = [
+                    chunk async for chunk in main.stream_and_capture(
+                        {}, {"stream": True}, "session", "", "model"
+                    )
+                ]
+                self.assertEqual(len(chunks), 3, split_at)
+                self.assertIn(b'"reasoning_content":"\\u601d\\u8003"', chunks[0])
+                self.assertIn(b'"content":"answer"', chunks[1])
+                self.assertEqual(chunks[2], b"data: [DONE]\n\n")
+        finally:
+            main.httpx.AsyncClient = original_client
+
+    async def test_stream_ignores_non_list_tool_calls_and_non_object_delta(self):
+        original_client = main.httpx.AsyncClient
+        _FakeAsyncClient.response = _FakeResponse([
+            b'data: {"choices":[{"delta":null}]}\n\n',
+            b'data: {"choices":[{"delta":{"tool_calls":{}}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        main.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            chunks = [
+                chunk async for chunk in main.safe_stream_and_capture(
+                    {}, {"stream": True}, "session", "", "model"
+                )
+            ]
+            self.assertTrue(any(b'"content":"answer"' in chunk for chunk in chunks))
+            self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+        finally:
+            main.httpx.AsyncClient = original_client
+
+    async def test_unexpected_upstream_iterator_failure_is_safe_sse_error(self):
+        original_client = main.httpx.AsyncClient
+        _FakeAsyncClient.response = _UnexpectedFailureResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            chunks = [
+                chunk async for chunk in main.safe_stream_and_capture(
+                    {}, {"stream": True}, "session", "", "model"
+                )
+            ]
+            self.assertTrue(any(b'"content":"partial"' in chunk for chunk in chunks))
+            self.assertIn(b'"type": "upstream_stream_error"', chunks[-1])
+            self.assertIn(b"data: [DONE]", chunks[-1])
+        finally:
+            main.httpx.AsyncClient = original_client
+
+    async def test_wrapper_converts_unexpected_gateway_error_once(self):
+        original_stream = main.stream_and_capture
+
+        async def broken_stream(*_args, **_kwargs):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise RuntimeError("unexpected gateway failure")
+
+        main.stream_and_capture = broken_stream
+        try:
+            chunks = [
+                chunk async for chunk in main.safe_stream_and_capture(
+                    {}, {"stream": True}, "session", "", "model"
+                )
+            ]
+            self.assertTrue(any(b'"content":"partial"' in chunk for chunk in chunks))
+            self.assertIn(b'"type": "upstream_stream_error"', chunks[-1])
+            self.assertIn(b"data: [DONE]", chunks[-1])
+        finally:
+            main.stream_and_capture = original_stream
+
     async def test_heartbeat_waits_for_real_upstream_first_event(self):
         response = _DelayedFirstResponse()
         stream = main._iterate_upstream_with_heartbeat(response, interval_seconds=0.01)
@@ -284,6 +586,27 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         response.release_first.set()
         chunk, is_heartbeat, error = await first
         self.assertIn(b'"content":"first"', chunk)
+        self.assertFalse(is_heartbeat)
+        self.assertIsNone(error)
+        await stream.aclose()
+
+    async def test_heartbeat_reuses_one_pending_second_read(self):
+        response = _DelayedSecondResponse()
+        stream = main._iterate_upstream_with_heartbeat(response, interval_seconds=0.01)
+        first, is_heartbeat, error = await anext(stream)
+        self.assertIn(b'"content":"first"', first)
+        self.assertFalse(is_heartbeat)
+        self.assertIsNone(error)
+
+        heartbeat, is_heartbeat, error = await anext(stream)
+        self.assertEqual(heartbeat, b": keep-alive\n\n")
+        self.assertTrue(is_heartbeat)
+        self.assertIsNone(error)
+        self.assertEqual(response.next_calls, 2)
+
+        response.release_second.set()
+        second, is_heartbeat, error = await anext(stream)
+        self.assertIn(b'"content":"second"', second)
         self.assertFalse(is_heartbeat)
         self.assertIsNone(error)
         await stream.aclose()

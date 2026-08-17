@@ -388,6 +388,15 @@ async def lifespan(app: FastAPI):
         cognitive_auto_task.cancel()
     if memory_evolution_task is not None:
         memory_evolution_task.cancel()
+    timer_tasks = [
+        task for task in (
+            trait_timer_task, relation_timer_task,
+            cognitive_auto_task, memory_evolution_task,
+        ) if task is not None
+    ]
+    if timer_tasks:
+        await asyncio.gather(*timer_tasks, return_exceptions=True)
+    await _drain_response_persistence_tasks()
     await close_pool()
 
 
@@ -2514,8 +2523,30 @@ async def _chat_completions_inner(request: Request):
                     f"[gateway-state] request={request_id} session={session_id} state=response_complete",
                     flush=True,
                 )
-                resp_data = response.json()
-                usage = resp_data.get("usage") or {}
+                try:
+                    resp_data = response.json()
+                except (TypeError, ValueError):
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": "Upstream returned invalid JSON",
+                                "type": "upstream_malformed_response",
+                            }
+                        },
+                    )
+                if not isinstance(resp_data, dict):
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": "Upstream returned a non-object JSON response",
+                                "type": "upstream_malformed_response",
+                            }
+                        },
+                    )
+                usage = resp_data.get("usage")
+                usage = usage if isinstance(usage, dict) else {}
                 if usage.get("total_tokens"):
                     pt = usage.get("prompt_tokens", 0)
                     hit = _usage_cache_hit(usage)
@@ -2530,14 +2561,19 @@ async def _chat_completions_inner(request: Request):
                 assistant_reasoning = None
                 try:
                     msg_obj = resp_data["choices"][0]["message"]
-                    assistant_msg = msg_obj.get("content") or ""
-                    if msg_obj.get("tool_calls"):
-                        assistant_tool_calls = msg_obj["tool_calls"]
+                    if not isinstance(msg_obj, dict):
+                        raise TypeError("assistant_message_not_object")
+                    content = msg_obj.get("content")
+                    assistant_msg = content if isinstance(content, str) else ""
+                    tool_calls = msg_obj.get("tool_calls")
+                    if isinstance(tool_calls, list) and tool_calls:
+                        assistant_tool_calls = tool_calls
                         print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
-                    if msg_obj.get("reasoning_content"):
-                        assistant_reasoning = msg_obj["reasoning_content"]
+                    reasoning = msg_obj.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        assistant_reasoning = reasoning
                         print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
-                except (KeyError, IndexError):
+                except (KeyError, IndexError, TypeError):
                     pass
 
                 # reasoning-only 空响应：思考了但没正文也没工具调用（同上，非流式路径）
@@ -2545,19 +2581,42 @@ async def _chat_completions_inner(request: Request):
                     _warn_empty_reasoning_response(session_id, body, len(assistant_reasoning))
 
                 if MEMORY_ENABLED and (user_message or tool_messages):
-                    persistence_plan, persisted_result = await commit_response_state(
-                        session_id, persistence_block, assistant_msg,
-                        assistant_tool_calls, assistant_reasoning, model,
-                        skip_conversation_log,
-                    )
-                    if persistence_plan:
-                        asyncio.create_task(
-                            process_memories_background(
+                    async def persist_non_stream_response():
+                        persistence_plan, persisted_result = await commit_response_state(
+                            session_id, persistence_block, assistant_msg,
+                            assistant_tool_calls, assistant_reasoning, model,
+                            skip_conversation_log,
+                        )
+                        if persistence_plan:
+                            await process_memories_background(
                                 session_id, user_message, assistant_msg, model,
                                 assistant_tool_calls=assistant_tool_calls,
                                 persistence_plan=persistence_plan,
                                 persisted_result=persisted_result,
                             )
+
+                    if assistant_tool_calls or tool_messages:
+                        try:
+                            await persist_non_stream_response()
+                        except Exception as exc:
+                            print(
+                                f"[gateway-state] session={session_id} "
+                                f"state=persistence_failed kind=tool type={type(exc).__name__}",
+                                flush=True,
+                            )
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "error": {
+                                        "message": "Gateway could not durably stage the tool workflow",
+                                        "type": "gateway_persistence_error",
+                                        "code": type(exc).__name__,
+                                    }
+                                },
+                            )
+                    else:
+                        _track_response_persistence(
+                            persist_non_stream_response(), session_id, "complete"
                         )
 
                 # ---------- Drivesoid 情感引擎：回复后上报事件 ----------
@@ -2611,6 +2670,12 @@ async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = S
     except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
         yield _upstream_stream_error_event(exc), False, exc
     except httpx.HTTPError as exc:
+        yield _upstream_stream_error_event(exc), False, exc
+    except Exception as exc:
+        print(
+            f"❌ 上游流迭代异常: type={type(exc).__name__}",
+            flush=True,
+        )
         yield _upstream_stream_error_event(exc), False, exc
     finally:
         if pending_chunk is not None and not pending_chunk.done():
@@ -2746,8 +2811,11 @@ def _persistence_error_event(exc: Exception) -> bytes:
 async def safe_stream_and_capture(*args, **kwargs):
     """Keep transport failures inside the already-started SSE response."""
     session_id = args[2] if len(args) > 2 else kwargs.get("session_id", "")
+    done_delivered = False
     try:
         async for chunk in stream_and_capture(*args, **kwargs):
+            if b"data: [DONE]" in chunk:
+                done_delivered = True
             yield chunk
     except asyncio.CancelledError:
         print(f"ℹ️  客户端断开，已取消上游流: session={session_id}", flush=True)
@@ -2766,9 +2834,17 @@ async def safe_stream_and_capture(*args, **kwargs):
             flush=True,
         )
         yield _upstream_stream_error_event(exc)
+    except Exception as exc:
+        print(
+            f"❌ 网关流异常: session={session_id}, type={type(exc).__name__}",
+            flush=True,
+        )
+        if not done_delivered:
+            yield _upstream_stream_error_event(exc)
 
 
 _response_persistence_tasks = set()
+RESPONSE_PERSISTENCE_SHUTDOWN_TIMEOUT = 8.0
 
 
 def _track_response_persistence(coro, session_id: str, kind: str):
@@ -2787,6 +2863,26 @@ def _track_response_persistence(coro, session_id: str, kind: str):
     _response_persistence_tasks.add(task)
     task.add_done_callback(_response_persistence_tasks.discard)
     return task
+
+
+async def _drain_response_persistence_tasks(
+    timeout_seconds: float = RESPONSE_PERSISTENCE_SHUTDOWN_TIMEOUT,
+):
+    """Finish already-delivered response commits before the pool is closed."""
+    tasks = tuple(_response_persistence_tasks)
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+    if pending:
+        print(
+            f"⚠️ 关闭时仍有 {len(pending)} 个回复持久化任务，已在 "
+            f"{timeout_seconds:.1f}s 后取消",
+            flush=True,
+        )
+        for task in pending:
+            task.cancel()
+    await asyncio.gather(*done, *pending, return_exceptions=True)
+    _response_persistence_tasks.difference_update(tasks)
 
 
 async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = (), drives_user_message_id: str = "", drives_run_id: str = "", request_id: str = ""):
@@ -2925,8 +3021,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         return
 
                     if data is not None:
-                        if "usage" in data:
-                            stream_usage = data["usage"]
+                        usage = data.get("usage")
+                        if isinstance(usage, dict):
+                            stream_usage = usage
 
                         choices = data.get("choices")
                         first_choice = (
@@ -2942,15 +3039,18 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                         if not isinstance(delta, dict):
                             delta = {}
                         content = delta.get("content", "")
-                        if content:
+                        if isinstance(content, str) and content:
                             full_response.append(content)
 
                         reasoning = delta.get("reasoning_content", "")
-                        if reasoning:
+                        if isinstance(reasoning, str) and reasoning:
                             full_reasoning.append(reasoning)
 
-                        if delta.get("tool_calls"):
-                            for tc in delta["tool_calls"]:
+                        tool_calls = delta.get("tool_calls")
+                        if isinstance(tool_calls, list):
+                            for tc in tool_calls:
+                                if not isinstance(tc, dict):
+                                    continue
                                 idx = tc.get("index", 0)
                                 if idx not in accumulated_tool_calls:
                                     accumulated_tool_calls[idx] = {
@@ -2961,8 +3061,8 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                     }
                                 if tc.get("id"):
                                     accumulated_tool_calls[idx]["id"] = tc["id"]
-                                if "function" in tc:
-                                    fn = tc["function"]
+                                fn = tc.get("function")
+                                if isinstance(fn, dict):
                                     if fn.get("name"):
                                         accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
                                     if "arguments" in fn:

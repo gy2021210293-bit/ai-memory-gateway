@@ -4,6 +4,7 @@ from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import main
+import database
 
 
 def _candidate(action="create", confidence=0.8, level="explicit", target_id=None):
@@ -503,7 +504,7 @@ class CognitiveDraftPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(items[0]["review_after"])  # 升级成功：无复核日期 = 长期
 
 
-class CognitiveCorrectionTests(unittest.TestCase):
+class CognitiveCorrectionTests(unittest.IsolatedAsyncioTestCase):
     def test_correction_keyword_detection_positive(self):
         positives = [
             "你记错了，我不喜欢香菜",
@@ -537,7 +538,7 @@ class CognitiveCorrectionTests(unittest.TestCase):
 
         conn = _FakeConn()
         pool = database_fake_pool(conn)
-        with patch.object(main, "get_pool", return_value=pool):
+        with patch.object(database, "get_pool", return_value=pool):
             first = await main.record_cognitive_correction("  你记错了，我不吃香菜 ")
             dup = await main.record_cognitive_correction("你记错了，我不吃香菜")
         self.assertEqual(first, 1)
