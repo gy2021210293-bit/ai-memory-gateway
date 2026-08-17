@@ -171,6 +171,30 @@ class DatabaseExtractionProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("id <= $3", sql)
         self.assertEqual(args, ("thread-a", 41, 88))
 
+    async def test_message_batch_excludes_incomplete_assistant(self):
+        conn = ScriptedConnection(rows=[
+            {
+                "id": 42,
+                "role": "user",
+                "content": "hello",
+                "metadata": '{"incomplete": true}',
+                "created_at": object(),
+            },
+            {
+                "id": 43,
+                "role": "assistant",
+                "content": "partial",
+                "metadata": '{"incomplete": true}',
+                "created_at": object(),
+            },
+        ])
+        rows = await self.run_with_connection(
+            conn,
+            lambda: database.get_messages_for_memory_extraction("thread-a", 41, 88),
+        )
+
+        self.assertEqual(rows, [])
+
 
 def _load_background_processor(interval=2):
     source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")

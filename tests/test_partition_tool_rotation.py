@@ -73,6 +73,18 @@ class _DelayedFirstResponse:
         yield b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
 
 
+class _InterruptedResponse:
+    status_code = 200
+    headers = {"content-type": "text/event-stream"}
+
+    async def aiter_bytes(self):
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise main.httpx.RemoteProtocolError("peer closed early")
+
+    async def aclose(self):
+        pass
+
+
 class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.original_x = main.CACHE_PARTITION_X
@@ -255,6 +267,64 @@ class PartitionToolRotationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_heartbeat)
         self.assertIsNone(error)
         await stream.aclose()
+
+    async def test_database_failure_does_not_replace_normal_done(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_commit = main.commit_response_state
+        _FakeAsyncClient.response = _FakeResponse([
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = True
+        main.commit_response_state = AsyncMock(side_effect=RuntimeError("db unavailable"))
+        try:
+            chunks = [
+                chunk async for chunk in main.stream_and_capture(
+                    {}, {"stream": True}, "session", "hello", "model",
+                    current_block=({"role": "user", "content": "hello"},),
+                )
+            ]
+            await asyncio.sleep(0)
+            self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+            self.assertFalse(any(b"gateway_persistence_error" in chunk for chunk in chunks))
+            main.commit_response_state.assert_awaited_once()
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.commit_response_state = original_commit
+
+    async def test_interrupted_stream_persists_incomplete_audit_record(self):
+        original_client = main.httpx.AsyncClient
+        original_memory_enabled = main.MEMORY_ENABLED
+        original_persist = main.persist_conversation_batch
+        _FakeAsyncClient.response = _InterruptedResponse()
+        main.httpx.AsyncClient = _FakeAsyncClient
+        main.MEMORY_ENABLED = True
+        main.persist_conversation_batch = AsyncMock(
+            return_value={"inserted": 2, "rerolled": False}
+        )
+        try:
+            chunks = [
+                chunk async for chunk in main.stream_and_capture(
+                    {}, {"stream": True}, "session", "hello", "model",
+                    current_block=({"role": "user", "content": "hello"},),
+                )
+            ]
+            await asyncio.sleep(0)
+            self.assertTrue(any(b"upstream_stream_error" in chunk for chunk in chunks))
+            messages = main.persist_conversation_batch.await_args.args[1]
+            self.assertTrue(all(message["incomplete"] for message in messages))
+            self.assertEqual(messages[-1]["content"], "partial")
+            self.assertTrue(messages[-1]["incomplete"])
+            self.assertEqual(
+                messages[-1]["interruption_type"], "RemoteProtocolError"
+            )
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.MEMORY_ENABLED = original_memory_enabled
+            main.persist_conversation_batch = original_persist
 
 
 class PendingToolWorkflowTests(unittest.IsolatedAsyncioTestCase):

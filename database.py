@@ -1255,7 +1255,10 @@ def _conversation_message_parts(message: dict):
     role = message.get("role", "")
     content = normalize_content_text(message.get("content"))
     metadata = {}
-    for key in ("tool_calls", "reasoning_content", "tool_call_id", "name"):
+    for key in (
+        "tool_calls", "reasoning_content", "tool_call_id", "name",
+        "incomplete", "interruption_type",
+    ):
         if message.get(key) is not None:
             metadata[key] = message[key]
     metadata_text = json.dumps(metadata, ensure_ascii=False, sort_keys=True) if metadata else None
@@ -1278,6 +1281,7 @@ def _conversation_signature(role, content, metadata_text):
         tool_ids,
         metadata.get("tool_call_id", ""),
         metadata.get("name", ""),
+        bool(metadata.get("incomplete")),
     )
 
 
@@ -1538,7 +1542,10 @@ async def get_messages_for_memory_extraction(
               AND role IN ('user', 'assistant')
             ORDER BY id
         """, session_id, after_message_id, through_message_id)
-        return [dict(row) for row in rows]
+        return [
+            dict(row) for row in rows
+            if not _conversation_metadata_is_incomplete(row.get("metadata"))
+        ]
 
 
 async def complete_memory_extraction(
@@ -2494,7 +2501,25 @@ async def get_all_gateway_config() -> dict:
 # 对话历史读取（分区缓存用）
 # ============================================================
 
-async def get_conversation_messages(session_id: str, limit: int = 100):
+def _conversation_metadata_is_incomplete(metadata_text) -> bool:
+    if not metadata_text:
+        return False
+    try:
+        metadata = (
+            json.loads(metadata_text)
+            if isinstance(metadata_text, str)
+            else metadata_text
+        )
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return bool(metadata.get("incomplete")) if isinstance(metadata, dict) else False
+
+
+async def get_conversation_messages(
+    session_id: str,
+    limit: int = 100,
+    include_incomplete: bool = True,
+):
     """按时间正序读取session的消息"""
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2505,7 +2530,13 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
             ORDER BY id ASC
             LIMIT $2
         """, session_id, limit)
-        return [dict(r) for r in rows]
+        messages = [dict(r) for r in rows]
+        if include_incomplete:
+            return messages
+        return [
+            message for message in messages
+            if not _conversation_metadata_is_incomplete(message.get("metadata"))
+        ]
 
 
 # ============================================================
@@ -2887,6 +2918,10 @@ def db_row_to_message(row: dict) -> dict:
             # 其他可能的字段（name 等）
             if "name" in meta:
                 msg["name"] = meta["name"]
+            if "incomplete" in meta:
+                msg["incomplete"] = bool(meta["incomplete"])
+            if "interruption_type" in meta:
+                msg["interruption_type"] = meta["interruption_type"]
         except Exception:
             pass
     

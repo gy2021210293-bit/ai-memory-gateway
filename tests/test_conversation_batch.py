@@ -33,10 +33,13 @@ def _load_history_function():
     selected = [
         node
         for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "get_conversation_messages"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {
+            "_conversation_metadata_is_incomplete",
+            "get_conversation_messages",
+        }
     ]
-    namespace = {}
+    namespace = {"json": json}
     exec(compile(ast.Module(body=selected, type_ignores=[]), "database.py", "exec"), namespace)
     return namespace
 
@@ -126,6 +129,48 @@ class ConversationBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 2)
         query = connection.fetch_queries[0]
         self.assertIn("ORDER BY id ASC", query)
+
+    async def test_provider_history_excludes_incomplete_assistant(self):
+        namespace = _load_history_function()
+        connection = _Connection([
+            {
+                "role": "user",
+                "content": "hello",
+                "metadata": '{"incomplete": true}',
+            },
+            {
+                "role": "assistant",
+                "content": "partial",
+                "metadata": '{"incomplete": true}',
+            },
+        ])
+
+        async def get_pool():
+            return _Pool(connection)
+
+        namespace["get_pool"] = get_pool
+        rows = await namespace["get_conversation_messages"](
+            "thread-a", 100, include_incomplete=False
+        )
+
+        self.assertEqual(rows, [])
+
+    async def test_incomplete_marker_is_part_of_persistence_identity(self):
+        namespace = _load_batch_functions()
+        complete = namespace["_conversation_message_parts"]({
+            "role": "assistant", "content": "partial"
+        })
+        incomplete = namespace["_conversation_message_parts"]({
+            "role": "assistant",
+            "content": "partial",
+            "incomplete": True,
+            "interruption_type": "RemoteProtocolError",
+        })
+
+        self.assertNotEqual(
+            namespace["_conversation_signature"](*complete),
+            namespace["_conversation_signature"](*incomplete),
+        )
 
     async def test_closed_tool_chain_only_inserts_missing_suffix(self):
         namespace = _load_batch_functions()

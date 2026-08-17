@@ -2157,7 +2157,9 @@ async def _chat_completions_inner(request: Request):
     # ---------- 分区缓存模式 ----------
     if CACHE_PARTITION_ENABLED and not skip_conversation_log:
         history_task = asyncio.create_task(
-            get_conversation_messages(session_id, limit=10000)
+            get_conversation_messages(
+                session_id, limit=10000, include_incomplete=False
+            )
         )
         try:
             db_history = await history_task
@@ -2766,6 +2768,27 @@ async def safe_stream_and_capture(*args, **kwargs):
         yield _upstream_stream_error_event(exc)
 
 
+_response_persistence_tasks = set()
+
+
+def _track_response_persistence(coro, session_id: str, kind: str):
+    """Run persistence independently from client delivery and retain the task."""
+    async def run():
+        try:
+            await coro
+        except Exception as exc:
+            print(
+                f"[gateway-state] session={session_id} state=persistence_failed "
+                f"kind={kind} type={type(exc).__name__}",
+                flush=True,
+            )
+
+    task = asyncio.create_task(run())
+    _response_persistence_tasks.add(task)
+    task.add_done_callback(_response_persistence_tasks.discard)
+    return task
+
+
 async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = (), drives_user_message_id: str = "", drives_run_id: str = "", request_id: str = ""):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
@@ -2775,28 +2798,40 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
     response_finalized = False
 
+    async def persist_complete_response():
+        assistant_msg = "".join(full_response)
+        assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
+        assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+        plan, persisted_result = await commit_response_state(
+            session_id, current_block, assistant_msg, assistant_tool_calls,
+            assistant_reasoning, model, skip_conversation_log,
+        )
+        if plan:
+            await process_memories_background(
+                session_id, user_message, assistant_msg, model,
+                assistant_tool_calls=assistant_tool_calls,
+                persistence_plan=plan,
+                persisted_result=persisted_result,
+            )
+
     async def finalize_complete_response():
         nonlocal response_finalized
         if response_finalized:
             return
         response_finalized = True
-        assistant_msg = "".join(full_response)
-        assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
-        assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
         tool_messages = [m for m in current_block if m.get("role") == "tool"]
         if MEMORY_ENABLED and (user_message or tool_messages):
-            plan, persisted_result = await commit_response_state(
-                session_id, current_block, assistant_msg, assistant_tool_calls,
-                assistant_reasoning, model, skip_conversation_log,
+            assistant_tool_calls = (
+                list(accumulated_tool_calls.values())
+                if accumulated_tool_calls else None
             )
-            if plan:
-                asyncio.create_task(
-                    process_memories_background(
-                        session_id, user_message, assistant_msg, model,
-                        assistant_tool_calls=assistant_tool_calls,
-                        persistence_plan=plan,
-                        persisted_result=persisted_result,
-                    )
+            # Tool workflows must be staged before the client can return results.
+            # Ordinary answers are independent from client delivery.
+            if assistant_tool_calls or tool_messages:
+                await persist_complete_response()
+            else:
+                _track_response_persistence(
+                    persist_complete_response(), session_id, "complete"
                 )
     stream_error = None
     timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
@@ -2937,16 +2972,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                             "state=response_complete",
                             flush=True,
                         )
-                        try:
-                            await finalize_complete_response()
-                        except Exception as exc:
-                            print(
-                                f"[gateway-state] session={session_id} state=persistence_failed "
-                                f"type={type(exc).__name__}",
-                                flush=True,
-                            )
-                            yield _persistence_error_event(exc)
-                            return
+                        await finalize_complete_response()
                     yield forwarded_event
                     if forwarded_event == b"data: [DONE]\n\n":
                         print(
@@ -2967,9 +2993,39 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
 
-    if stream_error and (assistant_msg or assistant_reasoning):
+    if (
+        stream_error
+        and MEMORY_ENABLED
+        and not skip_conversation_log
+        and (current_block or assistant_msg or assistant_reasoning or assistant_tool_calls)
+    ):
+        incomplete_assistant = {
+            "role": "assistant",
+            "content": assistant_msg,
+            "incomplete": True,
+            "interruption_type": type(stream_error).__name__,
+        }
+        if assistant_reasoning:
+            incomplete_assistant["reasoning_content"] = assistant_reasoning
+        if assistant_tool_calls:
+            incomplete_assistant["tool_calls"] = assistant_tool_calls
+        incomplete_block = [
+            {
+                **message,
+                "incomplete": True,
+                "interruption_type": type(stream_error).__name__,
+            }
+            for message in current_block
+        ]
+        _track_response_persistence(
+            persist_conversation_batch(
+                session_id, [*incomplete_block, incomplete_assistant], model
+            ),
+            session_id,
+            "incomplete",
+        )
         print(
-            f"ℹ️ 上游中断前捕获到部分回复但不写入正式历史: content={len(assistant_msg)}字符, "
+            f"ℹ️ 上游中断回复已标记 incomplete 并写入审计历史: content={len(assistant_msg)}字符, "
             f"reasoning={len(assistant_reasoning or '')}字符",
             flush=True,
         )
