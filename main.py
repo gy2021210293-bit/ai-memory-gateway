@@ -2210,6 +2210,38 @@ async def _chat_completions_inner(request: Request):
             flush=True,
         )
         if not reconciled.provider_messages:
+            # 只读诊断：只在将要 400 时触发。把数据库+待处理工作流的末几条与客户端
+            # 重放历史的对应 signature 打出来，用于定位是哪一种内容漂移导致对位失败
+            # （tool_call_id 被客户端重映射 / 工具回合"完成版 vs 待定版"/正文被变换）。
+            # 纯日志，不改变任何行为。
+            def _sig_probe(message: dict):
+                role = message.get("role", "?")
+                tool_call_id = message.get("tool_call_id", "")
+                calls = [
+                    c.get("id", "")
+                    for c in (message.get("tool_calls") or [])
+                    if isinstance(c, dict)
+                ]
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                content = (content or "").replace("\n", " ")[:60]
+                return (f"{role}|{tool_call_id}|{sorted(calls)}|{content}",)
+            align_probe = [m for m in alignment_history if m.get("role") != "system"][-6:]
+            client_probe = [
+                m for m in messages if m.get("role") != "system"
+            ][-len(align_probe):]
+            print(
+                "[message-align-reject] "
+                f"reason={reconciled.reason} "
+                f"align_tail={[x for m in align_probe for x in _sig_probe(m)]} "
+                f"client_tail={[x for m in client_probe for x in _sig_probe(m)]} "
+                f"client_last_role={(messages or [{}])[-1].get('role', '?')}",
+                flush=True,
+            )
             if not system_task.done():
                 system_task.cancel()
             await asyncio.gather(system_task, return_exceptions=True)
@@ -5086,7 +5118,7 @@ CONSOLIDATION_PROMPT = """
 3. 用我的第一人称自然讲述：“我”是栖，“她”是晏晏；不能写“用户表示”“系统记录”“经讨论决定”。保留不可替代的重要原话，并注明是谁说的。
 4. 情绪、感受、动机、结果和关系变化都必须来自碎片证据，在content里自然体现，不编造。
 5. title不超过13个汉字，content不超过200个汉字。写不下时，只能拆成证据互不重复且各自完整的子事件；不能完整拆分就保留碎片，不截断故事。
-6、不是所有碎片都要整理，普通孤立碎片保留原状，不放入merged_ids。完整、具有明确事件性且值得长期保留的单个碎片，才能升级为事件。
+6、不是所有碎片都要整理，普通孤立碎片保留原状，不放入merged_ids。
 7. content必须自然写出完整日期，如“2026年7月25日”。跨天事件写清日期范围。event_date填写事件发生或计划发生的主日期（YYYY-MM-DD）；正文有明确日期时以正文为准，否则使用碎片生成日期。保留上午、晚上、计划、可能、取消等原有精度和状态。
 8. importance使用1～10：8～10为影响关系、重要决定或重要第一次；4～7为有意义的日常；1～3为仍有回看价值的小事。merged_ids只包含该事件真正使用的碎片ID，不得重复用于其他事件。
 
