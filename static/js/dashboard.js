@@ -2204,7 +2204,8 @@ const MEM_PER_PAGE = 50;
 const LAYER_NAMES = {
     1: '碎片',
     2: '事件',
-    3: '核心'
+    3: '核心',
+    4: '推断'
 };
 
 // ============================================
@@ -2314,9 +2315,11 @@ function updateLayerCounts(stats) {
     const el1 = document.getElementById('count-layer-1');
     const el2 = document.getElementById('count-layer-2');
     const el3 = document.getElementById('count-layer-3');
+    const el4 = document.getElementById('count-layer-4');
     if (el1) el1.textContent = stats.layer_1?.active || 0;
     if (el2) el2.textContent = stats.layer_2?.active || 0;
     if (el3) el3.textContent = stats.layer_3?.active || 0;
+    if (el4) el4.textContent = stats.layer_4?.active || 0;
 }
 
 // ============================================
@@ -2350,6 +2353,7 @@ function renderTable(mems, startIndex) {
             '<option value="1"' + (layer === 1 ? ' selected' : '') + '>碎片</option>' +
             '<option value="2"' + (layer === 2 ? ' selected' : '') + '>事件</option>' +
             '<option value="3"' + (layer === 3 ? ' selected' : '') + '>核心</option>' +
+            '<option value="4"' + (layer === 4 ? ' selected' : '') + '>推断</option>' +
             '</select>';
         
         // 合并来源提示
@@ -4484,6 +4488,7 @@ async function decideMemoryDerivation(pendingId, action) {
             ? `已确认写入记忆（#${result.memory_id}，推断记忆）。`
             : '已拒绝，后续不再重复提出。';
         await loadMemoryDerivations();
+        if (action === 'accept') loadMemories();
     } catch (error) {
         status.textContent = error.message;
     }

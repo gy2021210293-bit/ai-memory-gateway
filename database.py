@@ -3420,6 +3420,7 @@ async def get_layer_statistics():
             "layer_1": {"total": 0, "active": 0},  # 原始碎片
             "layer_2": {"total": 0, "active": 0},  # 事件记忆
             "layer_3": {"total": 0, "active": 0},  # 核心记忆
+            "layer_4": {"total": 0, "active": 0},  # 推断记忆（演化确认）
         }
         
         for row in rows:

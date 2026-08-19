@@ -1274,6 +1274,7 @@ async def build_partitioned_messages(
     user_message: str,
     cognitive_text: str = "",
     memory_text: str = "",
+    drives_text: str = "",
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -1325,7 +1326,7 @@ async def build_partitioned_messages(
     if total_rounds < X:
         return await _build_basic_cached(
             history, base_prompt, user_message, current_user_msg,
-            summary_parts, cognitive_text, memory_text,
+            summary_parts, cognitive_text, memory_text, drives_text,
         )
     
     # 计算A/B区（按逻辑轮切片）
@@ -1416,14 +1417,14 @@ async def build_partitioned_messages(
         result.append(m)
     
     if current_user_msg:
-        parts = [build_time_injection()]
-
+        parts = []
         if cognitive_text:
             parts.append(cognitive_text)
-        
+        parts.append(build_time_injection())
         if memory_text:
             parts.append(memory_text)
-        
+        if drives_text:
+            parts.append(drives_text)
         result.append(_assemble_current_user_message(parts, current_user_msg['content']))
 
     bp_count = 1 + (1 if summary_parts else 0) + (1 if cleaned_a else 0) + (1 if b_msgs else 0)
@@ -1442,6 +1443,7 @@ async def _build_basic_cached(
     summary_parts: list = None,
     cognitive_text: str = "",
     memory_text: str = "",
+    drives_text: str = "",
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
     summary_parts = summary_parts or []
@@ -1475,14 +1477,14 @@ async def _build_basic_cached(
         result.append(m)
     
     if current_user_msg:
-        parts = [build_time_injection()]
-
+        parts = []
         if cognitive_text:
             parts.append(cognitive_text)
-        
+        parts.append(build_time_injection())
         if memory_text:
             parts.append(memory_text)
-        
+        if drives_text:
+            parts.append(drives_text)
         result.append(_assemble_current_user_message(parts, current_user_msg['content']))
 
     summary_total = sum(len(p) for p in summary_parts)
@@ -2348,7 +2350,7 @@ async def _chat_completions_inner(request: Request):
         try:
             messages = await build_partitioned_messages(
                 session_id, all_msgs, partition_prompt, user_message,
-                cognitive_text, memory_text,
+                cognitive_text, memory_text, prepared_drives_text,
             )
         except Exception as exc:
             print(
@@ -2427,12 +2429,7 @@ async def _chat_completions_inner(request: Request):
     # ---------- 消息清洗：list类型content转纯文本 ----------
     _sanitize_content_types(body.get("messages", []))
 
-    # ---------- Drivesoid 情感引擎：转发前注入情感状态 ----------
-    if prepared_drives_text:
-        try:
-            drives.inject(body.get("messages", []), prepared_drives_text)
-        except Exception as e:
-            print(f"⚠️  [Drivesoid] 注入失败（不影响转发）: {e}")
+    # ---------- Drivesoid 情感引擎：已在 build_partitioned_messages 内注入 ----------
 
     # ---------- 客户端动态环境：所有转换完成后，仅注入 Provider 临时消息 ----------
     if user_message and _inject_dynamic_environment(
