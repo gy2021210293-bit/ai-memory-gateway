@@ -2120,16 +2120,23 @@ function cancelCognitiveEdit() {
 
 async function removeCognitiveItem(itemId) {
     if (!confirm('删除这条认知？删除后它将不再进入聊天上下文。')) return;
-    const response = await fetch(`/api/cognitive-items/${itemId}`, { method: 'DELETE' });
-    const result = await response.json();
     const status = document.getElementById('cognition-status');
-    if (!response.ok || result.error) {
-        status.textContent = result.error || '删除失败';
-        return;
+    try {
+        const response = await fetch(`/api/cognitive-items/${itemId}`, { method: 'DELETE' });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.error) {
+            const errMsg = result.error || result.detail || `删除失败（HTTP ${response.status}）`;
+            if (status) status.textContent = errMsg;
+            alert(`删除失败: ${errMsg}`);
+            return;
+        }
+        if (editingCognitiveId === itemId) cancelCognitiveEdit();
+        await loadCognitiveItems();
+        if (status) status.textContent = '认知已删除。';
+    } catch (err) {
+        if (status) status.textContent = err.message || '网络请求异常';
+        alert(`删除失败: ${err.message || '网络请求异常'}`);
     }
-    if (editingCognitiveId === itemId) cancelCognitiveEdit();
-    await loadCognitiveItems();
-    status.textContent = '认知已删除。';
 }
 
 async function renderCognitiveRevisions() {

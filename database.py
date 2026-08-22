@@ -454,6 +454,37 @@ async def _migrate_memory_evolution_v7(conn) -> int:
     return 0
 
 
+async def _migrate_cognitive_model_v8(conn) -> int:
+    """Ensure self-referencing FKs on cognitive_items have ON DELETE SET NULL."""
+    await conn.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'cognitive_items'::regclass
+                  AND conname = 'cognitive_items_supersedes_fkey'
+            ) THEN
+                ALTER TABLE cognitive_items DROP CONSTRAINT cognitive_items_supersedes_fkey;
+            END IF;
+            ALTER TABLE cognitive_items
+                ADD CONSTRAINT cognitive_items_supersedes_fkey
+                FOREIGN KEY (supersedes) REFERENCES cognitive_items (id) ON DELETE SET NULL;
+
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'cognitive_items'::regclass
+                  AND conname = 'cognitive_items_superseded_by_fkey'
+            ) THEN
+                ALTER TABLE cognitive_items DROP CONSTRAINT cognitive_items_superseded_by_fkey;
+            END IF;
+            ALTER TABLE cognitive_items
+                ADD CONSTRAINT cognitive_items_superseded_by_fkey
+                FOREIGN KEY (superseded_by) REFERENCES cognitive_items (id) ON DELETE SET NULL;
+        END $$;
+    """)
+    return 0
+
+
 # ============================================================
 # 表结构初始化
 # ============================================================
@@ -907,8 +938,8 @@ async def init_tables():
                 updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 level               TEXT NOT NULL DEFAULT 'explicit' CHECK (level IN ('explicit', 'deductive', 'inductive')),
                 times_derived       INTEGER NOT NULL DEFAULT 1 CHECK (times_derived >= 1),
-                supersedes          INTEGER DEFAULT NULL REFERENCES cognitive_items (id),
-                superseded_by       INTEGER DEFAULT NULL REFERENCES cognitive_items (id)
+                supersedes          INTEGER DEFAULT NULL REFERENCES cognitive_items (id) ON DELETE SET NULL,
+                superseded_by       INTEGER DEFAULT NULL REFERENCES cognitive_items (id) ON DELETE SET NULL
             );
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_cognitive_items_subject_status ON cognitive_items (subject, status);")
@@ -920,6 +951,7 @@ async def init_tables():
         await _migrate_cognitive_model_v5(conn)
         await _migrate_cognitive_model_v6(conn)
         await _migrate_memory_evolution_v7(conn)
+        await _migrate_cognitive_model_v8(conn)
 
         # ---- 认知自动审视的待确认队列：模型自动生成的候选，等待人工确认 ----
         await conn.execute("""
@@ -6560,6 +6592,18 @@ async def delete_cognitive_item(item_id: int):
             )
             if not row:
                 return {"error": "认知项不存在"}
+            await conn.execute(
+                "UPDATE cognitive_items SET supersedes = NULL WHERE supersedes = $1",
+                item_id,
+            )
+            await conn.execute(
+                "UPDATE cognitive_items SET superseded_by = NULL WHERE superseded_by = $1",
+                item_id,
+            )
+            await conn.execute(
+                "UPDATE cognitive_pending SET target_id = NULL WHERE target_id = $1",
+                item_id,
+            )
             await conn.execute("DELETE FROM cognitive_items WHERE id = $1", item_id)
             await _record_cognitive_revision(
                 conn, card_id=row["id"], subject=row["subject"],

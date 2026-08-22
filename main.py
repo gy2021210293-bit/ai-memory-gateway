@@ -4099,7 +4099,10 @@ async def api_update_cognitive_item(item_id: int, request: Request):
 
 @app.delete("/api/cognitive-items/{item_id}")
 async def api_delete_cognitive_item(item_id: int):
-    result = await delete_cognitive_item(item_id)
+    try:
+        result = await delete_cognitive_item(item_id)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"删除失败: {exc}"})
     if result.get("error"):
         return JSONResponse(status_code=404, content=result)
     return result

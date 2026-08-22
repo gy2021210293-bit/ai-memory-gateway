@@ -852,6 +852,11 @@ class CognitiveRevisionLogTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(database, "get_pool", return_value=_FakePool(conn)):
             result = await database.delete_cognitive_item(5)
         self.assertEqual(result["status"], "ok")
+        executed_queries = [query for query, _args in conn.executions]
+        self.assertTrue(any("UPDATE cognitive_items SET supersedes = NULL" in q for q in executed_queries))
+        self.assertTrue(any("UPDATE cognitive_items SET superseded_by = NULL" in q for q in executed_queries))
+        self.assertTrue(any("UPDATE cognitive_pending SET target_id = NULL" in q for q in executed_queries))
+        self.assertTrue(any("DELETE FROM cognitive_items" in q for q in executed_queries))
         rev = self.revision_inserts(conn)[0]
         self.assertEqual(rev[0], 5)                 # card_id
         self.assertEqual(rev[3], "delete")

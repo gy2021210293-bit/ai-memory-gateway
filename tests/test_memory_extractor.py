@@ -407,6 +407,7 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("必须产生新信息", prompt)
         self.assertIn("premise_memory_ids", prompt)
         self.assertIn("反幻觉", prompt)
+        self.assertIn("第一人称", prompt)
 
 
 if __name__ == "__main__":

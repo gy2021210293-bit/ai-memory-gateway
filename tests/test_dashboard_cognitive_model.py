@@ -81,6 +81,11 @@ class DashboardCognitiveModelTests(unittest.TestCase):
         self.assertIn("从证据回喂中移除这条记录", self.js)
         self.assertIn("cognition-revision-list li", self.css)
 
+    def test_dashboard_can_delete_cognitive_item(self):
+        self.assertIn("function removeCognitiveItem(", self.js)
+        self.assertIn("/api/cognitive-items/${itemId}", self.js)
+        self.assertIn("removeCognitiveItem(item.id)", self.js)
+
 
 if __name__ == "__main__":
     unittest.main()
