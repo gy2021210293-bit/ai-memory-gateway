@@ -80,14 +80,18 @@ class ScheduledTaskLoopsTests(unittest.IsolatedAsyncioTestCase):
     """测试后台循环对开关关闭和中断唤醒的响应。"""
 
     async def test_interruptible_sleep_wakes_on_notify(self):
+        current_interval = 100.0
+
         async def _trigger_wake():
+            nonlocal current_interval
             await asyncio.sleep(0.05)
+            # 用户修改配置将间隔缩短到已过时间以内，应即时唤醒并退出
+            current_interval = 0.1
             main.notify_scheduler_config_updated()
 
         wake_task = asyncio.create_task(_trigger_wake())
         start = asyncio.get_running_loop().time()
-        # 即使设置了 100 秒休眠，通知到达后应立即在 0.5 秒内退出
-        await main._interruptible_sleep(lambda: 100.0)
+        await main._interruptible_sleep(lambda: current_interval)
         elapsed = asyncio.get_running_loop().time() - start
         self.assertLess(elapsed, 1.0)
         await wake_task

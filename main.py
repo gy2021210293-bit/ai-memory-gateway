@@ -137,7 +137,7 @@ async def _interruptible_sleep(get_interval_seconds):
     evt = _get_scheduler_config_event()
     while True:
         try:
-            target_seconds = max(1.0, float(get_interval_seconds()))
+            target_seconds = max(0.01, float(get_interval_seconds()))
         except Exception:
             target_seconds = 3600.0
         elapsed = loop.time() - start_time
@@ -147,8 +147,7 @@ async def _interruptible_sleep(get_interval_seconds):
         evt.clear()
         try:
             await asyncio.wait_for(evt.wait(), timeout=min(remaining, 60.0))
-            # 收到设置更新通知，直接退出休眠让外层调度重新评估
-            break
+            # 收到设置更新通知：不直接退出，而是重新循环评估最新间隔与已过时间
         except asyncio.TimeoutError:
             pass
 
