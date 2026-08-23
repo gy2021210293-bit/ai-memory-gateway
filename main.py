@@ -147,7 +147,8 @@ async def _interruptible_sleep(get_interval_seconds):
         evt.clear()
         try:
             await asyncio.wait_for(evt.wait(), timeout=min(remaining, 60.0))
-            # 收到设置更新通知：不直接退出，而是重新循环评估最新间隔与已过时间
+            # 收到设置更新通知：以当前修改时间为新起点重新计时休眠
+            start_time = loop.time()
         except asyncio.TimeoutError:
             pass
 
