@@ -754,18 +754,59 @@
                         <input type="number" id="set-MEMORY_EXTRACT_INTERVAL" class="input" min="0" max="20">
                         <small class="form-hint">0=关闭提取，1=每轮，N=每N轮</small>
                     </div>
-                    <div class="settings-field">
-                        <label>认知模型自动审视 (COGNITIVE_AUTO_MODE)</label>
-                        <select id="set-COGNITIVE_AUTO_MODE" class="input">
-                            <option value="manual">手动（现状，草稿需逐条确认）</option>
-                            <option value="auto">自动审视（AI 生成的认知一律挂起待确认）</option>
-                        </select>
-                        <small class="form-hint">自动模式：仅 reinforce（内容不变的证据累计）自动应用；create / supersede / conflict 一律进待确认队列——只有人工审核过的认知才会被注入</small>
+                </div>
+
+                <!-- 定时后台任务 -->
+                <div class="card settings-card">
+                    <h3 class="settings-group-title">定时后台任务</h3>
+                    <small class="form-hint" style="display:block;margin-bottom:14px;">配置各项后台定时任务的开关与执行周期（小时），修改后立即生效无需重启服务。</small>
+
+                    <!-- 推断模型定时整理 / 记忆演化 -->
+                    <div class="settings-field settings-toggle-row">
+                        <label>推断模型定时整理 (MEMORY_EVOLUTION_ENABLED)</label>
+                        <label class="toggle"><input type="checkbox" id="set-MEMORY_EVOLUTION_ENABLED"><span class="toggle-slider"></span></label>
                     </div>
                     <div class="settings-field">
-                        <label>自动审视间隔小时 (COGNITIVE_AUTO_INTERVAL_HOURS)</label>
+                        <label>推断模型整理间隔小时 (MEMORY_EVOLUTION_INTERVAL_HOURS)</label>
+                        <input type="number" id="set-MEMORY_EVOLUTION_INTERVAL_HOURS" class="input" min="1" max="720">
+                        <small class="form-hint">定时从原文记忆提炼归纳隐含的新认知，生成候选进入待确认队列，人工审核后写入记忆</small>
+                    </div>
+
+                    <!-- 认知模型自动审视 -->
+                    <div class="settings-field">
+                        <label>认知模型自动审视模式 (COGNITIVE_AUTO_MODE)</label>
+                        <select id="set-COGNITIVE_AUTO_MODE" class="input">
+                            <option value="manual">关闭定时审视（手动模式，仅手动触发）</option>
+                            <option value="auto">开启定时审视（自动审视新记忆并生成提案）</option>
+                        </select>
+                        <small class="form-hint">自动模式：仅 reinforce（非破坏性证据累计）自动应用；create / supersede / conflict 一律进待确认队列</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>认知模型审视间隔小时 (COGNITIVE_AUTO_INTERVAL_HOURS)</label>
                         <input type="number" id="set-COGNITIVE_AUTO_INTERVAL_HOURS" class="input" min="1" max="168">
                         <small class="form-hint">仅自动模式生效；书签之后无新记忆时不调用模型，零成本</small>
+                    </div>
+
+                    <!-- 实体卡关系发现 -->
+                    <div class="settings-field settings-toggle-row">
+                        <label>实体卡关系自动发现 (RELATION_RECHECK_ENABLED)</label>
+                        <label class="toggle"><input type="checkbox" id="set-RELATION_RECHECK_ENABLED"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-field">
+                        <label>实体关系发现间隔小时 (RELATION_RECHECK_INTERVAL_HOURS)</label>
+                        <input type="number" id="set-RELATION_RECHECK_INTERVAL_HOURS" class="input" min="1" max="720">
+                        <small class="form-hint">定时扫描具有共享事件或碎片的实体对，通过 LLM 总结描述实体间的关联关系</small>
+                    </div>
+
+                    <!-- 实体特征定时复核 -->
+                    <div class="settings-field settings-toggle-row">
+                        <label>实体特征定时复核 (TRAIT_RECHECK_ENABLED)</label>
+                        <label class="toggle"><input type="checkbox" id="set-TRAIT_RECHECK_ENABLED"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-field">
+                        <label>实体特征复核间隔小时 (TRAIT_RECHECK_INTERVAL_HOURS)</label>
+                        <input type="number" id="set-TRAIT_RECHECK_INTERVAL_HOURS" class="input" min="1" max="720">
+                        <small class="form-hint">定时复核活跃实体的特征状态，对陈旧特征生成刷新提案或退休建议</small>
                     </div>
                 </div>
 

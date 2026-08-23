@@ -3545,7 +3545,7 @@ async def cleanup_low_importance_fragments(days: int = 14, max_importance: int =
             for row in rows:
                 await conn.execute("""
                     UPDATE entities
-                    SET evidence_count = GREATEST(0, evidence_count - $3), updated_at = NOW()
+                    SET evidence_count = GREATEST(0, evidence_count - $2), updated_at = NOW()
                     WHERE id = $1
                 """, row["entity_id"], row["removed"])
             # memory_entities / memory_evidence 均为 ON DELETE CASCADE，随主表删除自动清理

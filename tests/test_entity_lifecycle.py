@@ -254,6 +254,10 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             async def execute(self, sql, *args):
                 self.execute_calls.append((sql, args))
+                import re
+                placeholders = [int(m) for m in re.findall(r"\$(\d+)", sql)]
+                if placeholders:
+                    assert max(placeholders) <= len(args), f"Placeholder ${max(placeholders)} out of range for {len(args)} args in query: {sql}"
                 return "DELETE 2" if "DELETE FROM memories" in sql else "UPDATE 1"
 
         conn = LowImportanceConnection()
@@ -261,7 +265,7 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             deleted = await database.cleanup_low_importance_fragments(14, 3)
         self.assertEqual(deleted, 2)
         self.assertTrue(any(
-            "evidence_count = GREATEST(0, evidence_count - $3)" in sql
+            "evidence_count = GREATEST(0, evidence_count - $2)" in sql
             for sql, _args in conn.execute_calls
         ))
         self.assertTrue(any(

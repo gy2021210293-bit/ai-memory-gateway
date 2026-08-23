@@ -94,19 +94,63 @@ COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | aut
 COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "12"))  # 每轮间隔（小时）
 
 # 记忆演化（从原文记忆推断"没说但正确"的新内容）：后台定时 + 手动按钮
+MEMORY_EVOLUTION_ENABLED = os.getenv("MEMORY_EVOLUTION_ENABLED", "true").lower() == "true"
 MEMORY_EVOLUTION_INTERVAL_HOURS = int(os.getenv("MEMORY_EVOLUTION_INTERVAL_HOURS", "24"))  # 定时间隔
 COGNITIVE_DERIVE_MAX_RESTATEMENT = 0.9  # 结论与任一前提的相似度上限：超过=旧信息重组，丢弃
 
 # 特征定时重确认（P3 后台任务）
+TRAIT_RECHECK_ENABLED = os.getenv("TRAIT_RECHECK_ENABLED", "true").lower() == "true"
 TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
 TRAIT_RECHECK_BATCH = int(os.getenv("TRAIT_RECHECK_BATCH", "10"))                   # 每轮最多处理实体数
 
 # 实体间关系发现（P7 后台任务）
+RELATION_RECHECK_ENABLED = os.getenv("RELATION_RECHECK_ENABLED", "true").lower() == "true"
 RELATION_RECHECK_INTERVAL_HOURS = int(os.getenv("RELATION_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
 RELATION_BATCH = int(os.getenv("RELATION_BATCH", "10"))                                    # 每轮最多判定的实体对数
 
 # 记忆提取+注入总开关（false时数据库仍连接、消息仍存储，但不提取也不注入记忆）
 MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == "true"
+
+_scheduler_config_event = None
+
+
+def _get_scheduler_config_event() -> asyncio.Event:
+    global _scheduler_config_event
+    if _scheduler_config_event is None:
+        _scheduler_config_event = asyncio.Event()
+    return _scheduler_config_event
+
+
+def notify_scheduler_config_updated():
+    """唤醒所有等待中的后台调度循环，使其重新评估定时与启用状态"""
+    try:
+        evt = _get_scheduler_config_event()
+        evt.set()
+    except Exception:
+        pass
+
+
+async def _interruptible_sleep(get_interval_seconds):
+    """可中断休眠：当用户在设置面板修改间隔或开关时，可即时唤醒并重新计算剩余时间。"""
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
+    evt = _get_scheduler_config_event()
+    while True:
+        try:
+            target_seconds = max(1.0, float(get_interval_seconds()))
+        except Exception:
+            target_seconds = 3600.0
+        elapsed = loop.time() - start_time
+        remaining = target_seconds - elapsed
+        if remaining <= 0:
+            break
+        evt.clear()
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=min(remaining, 60.0))
+            # 收到设置更新通知，直接退出休眠让外层调度重新评估
+            break
+        except asyncio.TimeoutError:
+            pass
 
 # 分区缓存
 CACHE_PARTITION_ENABLED = os.getenv("CACHE_PARTITION_ENABLED", "false").lower() == "true"
@@ -268,6 +312,14 @@ async def lifespan(app: FastAPI):
                         "MEMORY_API_BASE_URL": str,
                         "MEMORY_ENABLED": lambda v: _parse_bool(v),
                         "MAX_MEMORIES_INJECT": int, "MEMORY_EXTRACT_INTERVAL": int,
+                        "COGNITIVE_AUTO_MODE": str,
+                        "COGNITIVE_AUTO_INTERVAL_HOURS": int,
+                        "MEMORY_EVOLUTION_ENABLED": lambda v: _parse_bool(v),
+                        "MEMORY_EVOLUTION_INTERVAL_HOURS": int,
+                        "TRAIT_RECHECK_ENABLED": lambda v: _parse_bool(v),
+                        "TRAIT_RECHECK_INTERVAL_HOURS": int,
+                        "RELATION_RECHECK_ENABLED": lambda v: _parse_bool(v),
+                        "RELATION_RECHECK_INTERVAL_HOURS": int,
                         "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
                         "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
                         "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
@@ -3922,7 +3974,9 @@ async def _memory_evolution_loop():
     """后台调度：定时跑一轮记忆演化（候选待人工确认，从不直接写记忆）。"""
     while True:
         try:
-            await asyncio.sleep(MEMORY_EVOLUTION_INTERVAL_HOURS * 3600)
+            await _interruptible_sleep(lambda: MEMORY_EVOLUTION_INTERVAL_HOURS * 3600)
+            if not MEMORY_EVOLUTION_ENABLED or not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
             await _memory_evolution_once()
         except asyncio.CancelledError:
             break
@@ -3999,7 +4053,9 @@ async def _cognitive_auto_loop():
     """Background scheduler for incremental, current-state review only."""
     while True:
         try:
-            await asyncio.sleep(COGNITIVE_AUTO_INTERVAL_HOURS * 3600)
+            await _interruptible_sleep(lambda: COGNITIVE_AUTO_INTERVAL_HOURS * 3600)
+            if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
             await run_cognitive_auto_review_once()
         except asyncio.CancelledError:
             break
@@ -4578,7 +4634,9 @@ async def _trait_requalify_loop():
     """Background scheduler: periodically re-confirm stale active stable traits."""
     while True:
         try:
-            await asyncio.sleep(TRAIT_RECHECK_INTERVAL_HOURS * 3600)
+            await _interruptible_sleep(lambda: TRAIT_RECHECK_INTERVAL_HOURS * 3600)
+            if not TRAIT_RECHECK_ENABLED or not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
             await run_trait_requalify_once()
         except asyncio.CancelledError:
             break
@@ -4690,7 +4748,9 @@ async def _entity_relation_discovery_loop():
     """Background scheduler: periodically discover entity relationships (P7)."""
     while True:
         try:
-            await asyncio.sleep(RELATION_RECHECK_INTERVAL_HOURS * 3600)
+            await _interruptible_sleep(lambda: RELATION_RECHECK_INTERVAL_HOURS * 3600)
+            if not RELATION_RECHECK_ENABLED or not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
             await run_entity_relation_discovery_once()
         except asyncio.CancelledError:
             break
@@ -5121,7 +5181,7 @@ CONSOLIDATION_PROMPT = """
 3. 用我的第一人称自然讲述：“我”是栖，“她”是晏晏；不能写“用户表示”“系统记录”“经讨论决定”。保留不可替代的重要原话，并注明是谁说的。
 4. 情绪、感受、动机、结果和关系变化都必须来自碎片证据，在content里自然体现，不编造。
 5. title不超过13个汉字，content不超过200个汉字。写不下时，只能拆成证据互不重复且各自完整的子事件；不能完整拆分就保留碎片，不截断故事。
-6、不是所有碎片都要整理，普通孤立碎片保留原状，不放入merged_ids。
+6、不是所有碎片都要整理，普通孤立碎片保留原状，不放入merged_ids。单次日常闲聊、氛围感对话或无长期影响的琐碎流水不整理为事件。
 7. content必须自然写出完整日期，如“2026年7月25日”。跨天事件写清日期范围。event_date填写事件发生或计划发生的主日期（YYYY-MM-DD）；正文有明确日期时以正文为准，否则使用碎片生成日期。保留上午、晚上、计划、可能、取消等原有精度和状态。
 8. importance使用1～10：8～10为影响关系、重要决定或重要第一次；4～7为有意义的日常；1～3为仍有回看价值的小事。merged_ids只包含该事件真正使用的碎片ID，不得重复用于其他事件。
 
@@ -6294,9 +6354,15 @@ async def get_settings():
             "MIN_SCORE_THRESHOLD":     float(db.get("MIN_SCORE_THRESHOLD") or _db_module.MIN_SCORE_THRESHOLD),
             "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
 
-            # 认知模型自动审视
+            # 定时后台任务
             "COGNITIVE_AUTO_MODE": db.get("COGNITIVE_AUTO_MODE") or COGNITIVE_AUTO_MODE,
             "COGNITIVE_AUTO_INTERVAL_HOURS": int(db.get("COGNITIVE_AUTO_INTERVAL_HOURS") or COGNITIVE_AUTO_INTERVAL_HOURS),
+            "MEMORY_EVOLUTION_ENABLED": _parse_bool(db.get("MEMORY_EVOLUTION_ENABLED"), MEMORY_EVOLUTION_ENABLED),
+            "MEMORY_EVOLUTION_INTERVAL_HOURS": int(db.get("MEMORY_EVOLUTION_INTERVAL_HOURS") or MEMORY_EVOLUTION_INTERVAL_HOURS),
+            "TRAIT_RECHECK_ENABLED": _parse_bool(db.get("TRAIT_RECHECK_ENABLED"), TRAIT_RECHECK_ENABLED),
+            "TRAIT_RECHECK_INTERVAL_HOURS": int(db.get("TRAIT_RECHECK_INTERVAL_HOURS") or TRAIT_RECHECK_INTERVAL_HOURS),
+            "RELATION_RECHECK_ENABLED": _parse_bool(db.get("RELATION_RECHECK_ENABLED"), RELATION_RECHECK_ENABLED),
+            "RELATION_RECHECK_INTERVAL_HOURS": int(db.get("RELATION_RECHECK_INTERVAL_HOURS") or RELATION_RECHECK_INTERVAL_HOURS),
 
             # 缓存分区
             "CACHE_PARTITION_ENABLED": _parse_bool(db.get("CACHE_PARTITION_ENABLED"), CACHE_PARTITION_ENABLED),
@@ -6355,6 +6421,12 @@ async def save_settings(request: Request):
             "MEMORY_EXTRACT_INTERVAL": int,
             "COGNITIVE_AUTO_MODE":       str,
             "COGNITIVE_AUTO_INTERVAL_HOURS": int,
+            "MEMORY_EVOLUTION_ENABLED":  lambda v: _parse_bool(v),
+            "MEMORY_EVOLUTION_INTERVAL_HOURS": int,
+            "TRAIT_RECHECK_ENABLED":     lambda v: _parse_bool(v),
+            "TRAIT_RECHECK_INTERVAL_HOURS": int,
+            "RELATION_RECHECK_ENABLED":  lambda v: _parse_bool(v),
+            "RELATION_RECHECK_INTERVAL_HOURS": int,
             "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_X":     int,
             "CACHE_PARTITION_TRIGGER": str,
@@ -6440,6 +6512,16 @@ async def save_settings(request: Request):
 
             else:
                 skipped.append(key)
+
+        _SCHEDULER_KEYS = {
+            "COGNITIVE_AUTO_MODE", "COGNITIVE_AUTO_INTERVAL_HOURS",
+            "MEMORY_EVOLUTION_ENABLED", "MEMORY_EVOLUTION_INTERVAL_HOURS",
+            "TRAIT_RECHECK_ENABLED", "TRAIT_RECHECK_INTERVAL_HOURS",
+            "RELATION_RECHECK_ENABLED", "RELATION_RECHECK_INTERVAL_HOURS",
+            "MEMORY_ENABLED", "MEMORY_EXTRACT_ENABLED",
+        }
+        if any(k in _SCHEDULER_KEYS for k in updated):
+            notify_scheduler_config_updated()
 
         return {
             "status": "ok",
