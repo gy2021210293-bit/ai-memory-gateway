@@ -251,8 +251,11 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("画像式，不是记忆复述", prompt)
         self.assertIn("反“伪特别”", prompt)
         self.assertIn("反“先射箭后画靶”", prompt)
-        self.assertIn("reinforce / supersede / conflict / merge 的 target 必须指向同区块的 active 卡", prompt)
-        self.assertIn("不能提出删除", prompt)
+        self.assertIn("【本次为快速审视】", prompt)
+        self.assertIn("reinforce / supersede / conflict 的 target_id 必须指向同区块的 active 卡", prompt)
+        self.assertIn("不能提出删除或退休", prompt)
+        self.assertNotIn("merge：", prompt)
+        self.assertNotIn("retire：", prompt)
 
     async def test_cognitive_draft_prompt_covers_conflict_stability_and_evidence_independence(self):
         response = Mock()
@@ -276,12 +279,41 @@ class MemoryExtractorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, [])
         prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
-        self.assertIn("conflict 冲突", prompt)
+        self.assertIn("· conflict：", prompt)
+        self.assertIn("· 系统性：", prompt)
+        self.assertIn("· action：", prompt)
         self.assertIn("长期/短期分档（review_after）", prompt)
         self.assertIn("[当前]", prompt)  # 现有卡带稳定度标记
         self.assertIn("不要为“正在聊的话题/主题”建卡", prompt)
         self.assertIn("候选内容不得与任一区块现有 active 卡实质重复", prompt)
         self.assertNotIn("level", prompt)  # 认知生成不再分层
+
+    async def test_cognitive_draft_prompt_uses_deep_only_actions(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "[]"}}]}
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with patch.object(memory_extractor, "get_memory_api_key", return_value="test-key"), patch.object(
+            memory_extractor.httpx, "AsyncClient", return_value=_AsyncClientContext(client)
+        ):
+            result = await memory_extractor.generate_cognitive_draft(
+                [{"id": 1, "content": "事件证据", "layer": 2, "importance": 8,
+                  "created_at": "2026-08-30T08:00:00+00:00"}],
+                [{"subject": "user", "cognitive_type": "user_core", "content": "旧认知",
+                  "times_derived": 1, "evidence_memory_ids": [1], "id": 10}],
+                deep=True,
+            )
+
+        self.assertEqual(result, [])
+        prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("【本次为手动深度审视】", prompt)
+        self.assertIn("merge：", prompt)
+        self.assertIn("retire：", prompt)
+        self.assertIn("同源的事件、核心与派生记忆只算一组证据", prompt)
+        self.assertNotIn("【本次为快速审视】", prompt)
+        self.assertNotIn("不能提出删除或退休", prompt)
 
     async def test_cognitive_draft_prompt_feeds_back_human_revisions(self):
         response = Mock()

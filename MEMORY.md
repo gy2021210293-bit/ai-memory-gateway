@@ -16,6 +16,8 @@
 
 ## Decisions
 
+- 2026-09-01 cognitive prompt mode split: fast and deep reviews keep one shared evidence/object/output skeleton but now receive mutually exclusive action instructions and JSON examples. Fast review cannot merge, retire, or rewrite stable cards (stable corrections become conflicts); deep review defines merge/retire explicitly and treats same-source event/core/derivation records as one evidence chain. Fast `review_after` examples are generated from the current local date instead of a hard-coded date. The model-visible prose was reformatted without removing requirements into short `· 关键词：要求` entries to improve instruction scanning. Local verification passed 118 cognition-focused tests, Python compilation, and `git diff --check`.
+
 - 2026-08-17 dynamic-environment freshness boundary: a client-marked snapshot is eligible for Provider-only injection only when it immediately precedes the current request block and carries a parseable `generated_at` no more than 10 minutes old (with one minute of future clock-skew tolerance). Historical, missing-time, malformed-time, expired, and far-future snapshots are removed from ordinary history but never reused as current environment; tool-chain classification still runs after snapshot removal. Local verification passed 478 tests, Python compilation, and `git diff --check`; deployed behavior remains unverified.
 
 - Keep Python string delimiters and JSON examples in prompts as ASCII quotes. Commit `cb44263` changed `CONSOLIDATION_PROMPT` delimiters to smart quotes (`“””`) and its JSON example keys/values to curly quotes, causing a startup `SyntaxError` and invalid model JSON guidance; both were restored to ASCII.
