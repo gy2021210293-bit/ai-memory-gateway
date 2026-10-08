@@ -309,6 +309,7 @@ async def lifespan(app: FastAPI):
                 if db_cfg:
                     _RESTORE_MAIN = {
                         "API_BASE_URL": str, "API_KEY": str, "DEFAULT_MODEL": str,
+                        "UI_USER_NAME": str, "UI_AI_NAME": str,
                         "MEMORY_API_BASE_URL": str,
                         "MEMORY_ENABLED": lambda v: _parse_bool(v),
                         "MAX_MEMORIES_INJECT": int, "MEMORY_EXTRACT_INTERVAL": int,
@@ -328,6 +329,7 @@ async def lifespan(app: FastAPI):
                         "REASONING_EFFORT": str,
                     }
                     _RESTORE_DB = {
+                        "USER_ENTITY_NAMES": str, "AI_ENTITY_NAMES": str,
                         "EMBEDDING_API_KEY": str, "EMBEDDING_BASE_URL": str,
                         "EMBEDDING_MODEL": str, "EMBEDDING_DIM": int,
                         "MIN_SCORE_THRESHOLD": float,
@@ -338,12 +340,23 @@ async def lifespan(app: FastAPI):
                         "MEMORY_SEMANTIC_THRESHOLD": float,
                     }
                     # 显式空值也要恢复的字段：面板清空=关闭该功能，重启后应保持关闭而不是回退到环境变量
-                    _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
+                    _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL", "USER_ENTITY_NAMES", "AI_ENTITY_NAMES"}
                     restored = []
                     for key, val in db_cfg.items():
                         if not val:
                             if key in _ALLOW_EMPTY and key in _RESTORE_MAIN:
                                 globals()[key] = _RESTORE_MAIN[key]("")
+                                restored.append(key + "(显式空)")
+                            elif key in _ALLOW_EMPTY and key in _RESTORE_DB:
+                                setattr(_db_module, key, "")
+                                os.environ[key] = ""
+                                _memory_extractor_module.apply_runtime_config(key, "")
+                                user_names = db_cfg.get("USER_ENTITY_NAMES")
+                                ai_names = db_cfg.get("AI_ENTITY_NAMES")
+                                _db_module.apply_runtime_entity_names(
+                                    os.getenv("USER_ENTITY_NAMES", "用户,user,the user") if user_names is None else user_names,
+                                    os.getenv("AI_ENTITY_NAMES", "AI,assistant,助手") if ai_names is None else ai_names,
+                                )
                                 restored.append(key + "(显式空)")
                             continue
                         if key in _RESTORE_MAIN:
@@ -352,6 +365,15 @@ async def lifespan(app: FastAPI):
                             restored.append(key)
                         elif key in _RESTORE_DB:
                             setattr(_db_module, key, _RESTORE_DB[key](val))
+                            if key in {"USER_ENTITY_NAMES", "AI_ENTITY_NAMES"}:
+                                os.environ[key] = str(val)
+                                _memory_extractor_module.apply_runtime_config(key, val)
+                                user_names = db_cfg.get("USER_ENTITY_NAMES")
+                                ai_names = db_cfg.get("AI_ENTITY_NAMES")
+                                _db_module.apply_runtime_entity_names(
+                                    os.getenv("USER_ENTITY_NAMES", "用户,user,the user") if user_names is None else user_names,
+                                    os.getenv("AI_ENTITY_NAMES", "AI,assistant,助手") if ai_names is None else ai_names,
+                                )
                             restored.append(key)
                         elif key == "MEMORY_MODEL":
                             os.environ["MEMORY_MODEL"] = str(val)
@@ -6344,6 +6366,10 @@ async def get_settings():
             "API_BASE_URL":     db.get("API_BASE_URL") or str(API_BASE_URL),
             "API_KEY":          _mask_key(api_key_raw),
             "DEFAULT_MODEL":    db.get("DEFAULT_MODEL") or str(DEFAULT_MODEL),
+            "UI_USER_NAME": db.get("UI_USER_NAME") or UI_USER_NAME,
+            "UI_AI_NAME": db.get("UI_AI_NAME") or UI_AI_NAME,
+            "USER_ENTITY_NAMES": db.get("USER_ENTITY_NAMES") if db.get("USER_ENTITY_NAMES") is not None else os.getenv("USER_ENTITY_NAMES", "用户,user,the user"),
+            "AI_ENTITY_NAMES": db.get("AI_ENTITY_NAMES") if db.get("AI_ENTITY_NAMES") is not None else os.getenv("AI_ENTITY_NAMES", "AI,assistant,助手"),
 
             # 记忆系统
             "MEMORY_ENABLED":          _parse_bool(db.get("MEMORY_ENABLED"), MEMORY_ENABLED),
@@ -6406,6 +6432,12 @@ async def save_settings(request: Request):
     """保存高级设置（写入数据库 + 热更新运行时变量，立即生效无需重启）"""
     try:
         data = await request.json()
+        empty_display_names = [
+            key for key in ("UI_USER_NAME", "UI_AI_NAME")
+            if key in data and not str(data[key]).strip()
+        ]
+        if empty_display_names:
+            return {"error": "用户和 AI 显示名称不能为空"}
         updated = []
         skipped = []
 
@@ -6414,6 +6446,8 @@ async def save_settings(request: Request):
             "API_BASE_URL":          str,
             "API_KEY":               str,
             "DEFAULT_MODEL":         str,
+            "UI_USER_NAME":          lambda v: str(v).strip(),
+            "UI_AI_NAME":            lambda v: str(v).strip(),
             "MEMORY_API_KEY":        str,
             "MEMORY_API_BASE_URL":   str,
             "MEMORY_ENABLED":        lambda v: _parse_bool(v),
@@ -6439,6 +6473,8 @@ async def save_settings(request: Request):
 
         # database.py 全局变量映射（开源版用 EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
         _DB_VARS = {
+            "USER_ENTITY_NAMES":      str,
+            "AI_ENTITY_NAMES":        str,
             "EMBEDDING_API_KEY":       str,
             "EMBEDDING_BASE_URL":      str,
             "EMBEDDING_MODEL":         str,
@@ -6500,6 +6536,12 @@ async def save_settings(request: Request):
                 typed_value = _DB_VARS[key](value)
                 setattr(_db_module, key, typed_value)
                 os.environ[key] = str(value)
+                if key in {"USER_ENTITY_NAMES", "AI_ENTITY_NAMES"}:
+                    _memory_extractor_module.apply_runtime_config(key, typed_value)
+                    _db_module.apply_runtime_entity_names(
+                        os.getenv("USER_ENTITY_NAMES", "用户,user,the user"),
+                        os.getenv("AI_ENTITY_NAMES", "AI,assistant,助手"),
+                    )
                 updated.append(key)
                 print(f"[settings] {key} = {typed_value} (database)")
 

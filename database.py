@@ -82,6 +82,22 @@ AI_ENTITY_NAMES = {
     if name.strip()
 }
 EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
+
+
+def apply_runtime_entity_names(user_names: str, ai_names: str) -> None:
+    """Update the names excluded from entity extraction after Dashboard settings change."""
+    global USER_ENTITY_NAMES, AI_ENTITY_NAMES, EXCLUDED_ENTITY_NAMES
+
+    def normalize_names(value: str) -> set[str]:
+        return {
+            re.sub(r"\s+", " ", name.strip()).casefold()
+            for name in str(value).split(",")
+            if name.strip()
+        }
+
+    USER_ENTITY_NAMES = normalize_names(user_names)
+    AI_ENTITY_NAMES = normalize_names(ai_names)
+    EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
 COGNITIVE_TYPE_SUBJECTS = {
     "user_core": "user",
     "self_core": "self",

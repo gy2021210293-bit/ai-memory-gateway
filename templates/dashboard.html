@@ -700,6 +700,29 @@
                     <div id="settings-msg" class="msg-box" style="display:none;"></div>
                 </div>
 
+                <!-- 个性化名称 -->
+                <div class="card settings-card">
+                    <h3 class="settings-group-title">个人称呼</h3>
+                    <div class="settings-field">
+                        <label>用户显示名称 (UI_USER_NAME)</label>
+                        <input type="text" id="set-UI_USER_NAME" class="input" placeholder="例如：小明">
+                    </div>
+                    <div class="settings-field">
+                        <label>AI 显示名称 (UI_AI_NAME)</label>
+                        <input type="text" id="set-UI_AI_NAME" class="input" placeholder="例如：小助手">
+                    </div>
+                    <div class="settings-field">
+                        <label>用户名称别名 (USER_ENTITY_NAMES)</label>
+                        <input type="text" id="set-USER_ENTITY_NAMES" class="input" placeholder="用户,user,the user">
+                        <small class="form-hint">英文逗号分隔；这些称呼不会被单独建成普通实体。</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>AI 名称别名 (AI_ENTITY_NAMES)</label>
+                        <input type="text" id="set-AI_ENTITY_NAMES" class="input" placeholder="AI,assistant,助手">
+                        <small class="form-hint">英文逗号分隔；星图显示名与记忆实体过滤别名分开设置。</small>
+                    </div>
+                </div>
+
                 <!-- 基础连接 -->
                 <div class="card settings-card">
                     <h3 class="settings-group-title">基础连接</h3>
@@ -942,6 +965,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=7.6"></script>
+    <script src="/static/js/dashboard.js?v=7.7"></script>
 </body>
 </html>

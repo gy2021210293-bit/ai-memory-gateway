@@ -33,6 +33,64 @@ class ScheduledTasksSettingsApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(s["RELATION_RECHECK_ENABLED"])
             self.assertEqual(s["RELATION_RECHECK_INTERVAL_HOURS"], 72)
 
+    async def test_get_settings_returns_custom_names_and_preserves_empty_aliases(self):
+        fake_db_cfg = {
+            "UI_USER_NAME": "小明",
+            "UI_AI_NAME": "小助手",
+            "USER_ENTITY_NAMES": "",
+            "AI_ENTITY_NAMES": "小助手,assistant",
+        }
+        with patch.object(main, "get_all_gateway_config", AsyncMock(return_value=fake_db_cfg)):
+            resp = await main.get_settings()
+        settings = resp["settings"]
+        self.assertEqual(settings["UI_USER_NAME"], "小明")
+        self.assertEqual(settings["UI_AI_NAME"], "小助手")
+        self.assertEqual(settings["USER_ENTITY_NAMES"], "")
+        self.assertEqual(settings["AI_ENTITY_NAMES"], "小助手,assistant")
+
+    async def test_save_settings_hot_updates_names_and_entity_exclusions(self):
+        import os
+
+        database = main._db_module
+        extractor = main._memory_extractor_module
+        original = {
+            "ui_user": main.UI_USER_NAME,
+            "ui_ai": main.UI_AI_NAME,
+            "db_user": database.USER_ENTITY_NAMES,
+            "db_ai": database.AI_ENTITY_NAMES,
+            "db_excluded": database.EXCLUDED_ENTITY_NAMES,
+            "extractor_user": extractor.USER_ENTITY_NAMES,
+            "extractor_ai": extractor.AI_ENTITY_NAMES,
+            "extractor_excluded": extractor.EXCLUDED_ENTITY_NAMES,
+        }
+        payload = {
+            "UI_USER_NAME": " 小明 ",
+            "UI_AI_NAME": "小助手",
+            "USER_ENTITY_NAMES": "小明, user",
+            "AI_ENTITY_NAMES": "小助手, assistant",
+        }
+        mock_request = MagicMock()
+        mock_request.json = AsyncMock(return_value=payload)
+        try:
+            with patch.dict(os.environ), patch.object(main, "set_gateway_config", AsyncMock()):
+                resp = await main.save_settings(mock_request)
+                self.assertEqual(resp["status"], "ok")
+                self.assertEqual(main.UI_USER_NAME, "小明")
+                self.assertEqual(main.UI_AI_NAME, "小助手")
+                self.assertEqual(database.USER_ENTITY_NAMES, {"小明", "user"})
+                self.assertEqual(database.AI_ENTITY_NAMES, {"小助手", "assistant"})
+                self.assertEqual(extractor.USER_ENTITY_NAMES, {"小明", "user"})
+                self.assertEqual(extractor.AI_ENTITY_NAMES, {"小助手", "assistant"})
+        finally:
+            main.UI_USER_NAME = original["ui_user"]
+            main.UI_AI_NAME = original["ui_ai"]
+            database.USER_ENTITY_NAMES = original["db_user"]
+            database.AI_ENTITY_NAMES = original["db_ai"]
+            database.EXCLUDED_ENTITY_NAMES = original["db_excluded"]
+            extractor.USER_ENTITY_NAMES = original["extractor_user"]
+            extractor.AI_ENTITY_NAMES = original["extractor_ai"]
+            extractor.EXCLUDED_ENTITY_NAMES = original["extractor_excluded"]
+
     async def test_save_settings_updates_scheduled_task_fields_and_notifies(self):
         payload = {
             "MEMORY_EVOLUTION_ENABLED": False,

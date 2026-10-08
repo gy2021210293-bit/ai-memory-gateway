@@ -68,6 +68,21 @@ def apply_runtime_config(key: str, value: str) -> None:
         "MEMORY_MODEL",
     }:
         globals()[key] = str(value)
+    elif key in {"USER_ENTITY_NAMES", "AI_ENTITY_NAMES"}:
+        global USER_ENTITY_NAMES, AI_ENTITY_NAMES, EXCLUDED_ENTITY_NAMES
+
+        def normalize_names(names: str) -> set[str]:
+            return {
+                re.sub(r"\s+", " ", name.strip()).casefold()
+                for name in str(names).split(",")
+                if name.strip()
+            }
+
+        if key == "USER_ENTITY_NAMES":
+            USER_ENTITY_NAMES = normalize_names(value)
+        else:
+            AI_ENTITY_NAMES = normalize_names(value)
+        EXCLUDED_ENTITY_NAMES = USER_ENTITY_NAMES | AI_ENTITY_NAMES
 
 def should_defer_extraction(assistant_tool_calls: Optional[list]) -> bool:
     """A response that requests another tool is not the final conversation turn."""
