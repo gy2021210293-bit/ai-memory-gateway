@@ -32,7 +32,30 @@ flowchart LR
 
 ## 部署
 
-### 方式一：Docker Compose 自托管
+### 推荐：Zeabur 部署
+
+本项目作者个人使用 Zeabur 部署。一个 Zeabur 项目中放置 **PostgreSQL 服务**和**从本 GitHub 仓库部署的网关服务**，网关通过项目内网连接数据库。仓库根目录已有 `Dockerfile`；Zeabur 会识别它，**不要把下面的 `compose.yaml` 当作 Zeabur 部署文件**。
+
+1. 在 Zeabur 创建项目，添加 **Databases → PostgreSQL** 服务。
+2. 在同一项目中添加 **GitHub** 服务，选择本仓库的 `main` 分支。仓库根目录就是构建目录，无需另填子目录。等待 Zeabur 使用根目录 `Dockerfile` 构建网关。
+3. 打开网关服务的 **Variables**，至少设置下表。`DATABASE_URL` 的值填 Zeabur 变量引用 `${POSTGRES_CONNECTION_STRING}`，引用同一项目 PostgreSQL 的内部连接串。项目中有多个 PostgreSQL 服务时，请核对引用指向哪一个。
+
+   | 变量 | 填写内容 |
+   | --- | --- |
+   | `DATABASE_URL` | `${POSTGRES_CONNECTION_STRING}` |
+   | `MEMORY_ENABLED` | `true` |
+   | `API_KEY` | 上游 LLM 服务的 API Key |
+   | `API_BASE_URL` | 上游 OpenAI 兼容的完整聊天补全地址，例如 `https://openrouter.ai/api/v1/chat/completions` |
+   | `DEFAULT_MODEL` | 该上游服务可用的模型名 |
+   | `MEMORY_MODEL` | 同一上游可用的记忆提取模型名；如使用独立服务，另设 `MEMORY_API_KEY` 与 `MEMORY_API_BASE_URL` |
+   | `GATEWAY_SECRET` | 自己生成的强随机网关密钥，用于客户端和 Dashboard 鉴权 |
+
+4. 在网关服务的 **Domains** 生成 `zeabur.app` 域名，或绑定自己的域名。Zeabur 会提供 `PORT`；程序读取它并监听 `0.0.0.0`，无需在仓库里写死公网端口。
+5. 打开 `https://你的域名/` 查看健康状态，再用 `https://你的域名/dashboard?gateway_key=你的GATEWAY_SECRET` 首次进入管理面板。不要分享含密钥的链接。客户端连接方法见[下文](#客户端连接)。
+
+更详细的变量填写、端口和常见错误见 [Zeabur 部署说明](docs/zeabur.md)。部署流程也可对照 [Zeabur 快速开始](https://zeabur.com/docs/zh-CN/get-started/quick-start)与[PostgreSQL 服务说明](https://zeabur.com/zh-CN/templates/B20CX0)。
+
+### 其他方式：Docker Compose 自托管
 
 需要安装 Docker Engine 和 Docker Compose。以下方式同时启动网关和 PostgreSQL，适合本地或自有服务器部署。
 
@@ -43,6 +66,7 @@ POSTGRES_PASSWORD=replace-with-a-long-url-safe-password
 API_KEY=your-upstream-llm-api-key
 API_BASE_URL=https://openrouter.ai/api/v1/chat/completions
 DEFAULT_MODEL=your-provider/model-name
+MEMORY_MODEL=your-provider/memory-model-name
 GATEWAY_SECRET=replace-with-a-separate-long-random-secret
 ~~~
 
@@ -82,7 +106,7 @@ services:
       GATEWAY_SECRET: ${GATEWAY_SECRET:?Set GATEWAY_SECRET in .env}
       MEMORY_ENABLED: "true"
       MEMORY_EXTRACT_ENABLED: "true"
-      MEMORY_MODEL: anthropic/claude-haiku-4
+      MEMORY_MODEL: ${MEMORY_MODEL:?Set MEMORY_MODEL in .env}
 
 volumes:
   postgres_data:
@@ -112,9 +136,9 @@ docker compose down
 
 此命令会保留数据库卷。不要加 <code>-v</code>，除非你确实要删除本地 PostgreSQL 数据。
 
-### 方式二：部署到支持 Docker 的平台
+### 其他 Docker 平台
 
-Zeabur、Render、Railway 等平台可从仓库根目录的 <code>Dockerfile</code> 构建服务。创建 PostgreSQL 实例后，将下列变量填入平台的服务配置：
+支持从根目录 `Dockerfile` 构建的其他平台，也可以分别部署网关和 PostgreSQL。请按平台实际提供的端口及数据库连接串配置：
 
 | 变量 | 用途 |
 | --- | --- |
