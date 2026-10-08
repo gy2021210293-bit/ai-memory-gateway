@@ -1,0 +1,6559 @@
+"""
+AI Memory Gateway — 带记忆系统的 LLM 转发网关
+=============================================
+让你的 AI 拥有长期记忆。
+
+工作原理：
+1. 接收客户端（Kelivo / ChatBox / 任何 OpenAI 兼容客户端）的消息
+2. 自动搜索数据库中的相关记忆，注入 system prompt
+3. 转发给 LLM API（支持 OpenRouter / OpenAI / 任何兼容接口）
+4. 后台自动存储对话 + 用 AI 提取新记忆
+
+环境变量 MEMORY_ENABLED=false 时退化为纯转发网关（第一阶段）。
+"""
+
+import os
+import json
+import re
+import traceback
+import hashlib
+from llm_json import parse_json_array, valid_merged_ids
+import uuid
+import asyncio
+import secrets
+import httpx
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager, suppress
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from database import init_tables, close_pool, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, get_memories_for_cognitive_draft, advance_cognitive_draft_cursor, get_memories_for_portrait_review, advance_cognitive_deep_review_cursor, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, copy_tail_messages, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, get_fragments_by_date_range, reactivate_orphan_fragments_by_date_range, create_event_memory, deactivate_memories, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, cleanup_low_importance_fragments, revert_merge
+from database import link_memory_entities, auto_link_entities_by_name, get_entities_for_memory_ids, list_entities, list_entities_without_card, list_entity_roster, find_duplicate_entities, get_entity_detail, get_entity_memories, get_unlinked_memories, merge_entities, mark_memories_entity_scanned, save_entity_profile, update_entity, delete_entity, set_entity_status, find_directly_mentioned_entities
+from database import get_entity_card, apply_entity_snapshot, update_entity_card_description, update_entity_card_snapshot, delete_entity_card_snapshot, create_entity_card_proposal, list_entity_card_proposals, accept_entity_card_proposal, reject_entity_card_proposal, record_memory_evidence, add_entity_card_trait, update_entity_card_trait, retire_entity_card_trait, get_memory_evidence_message_ids
+from database import upsert_entity_relation, delete_entity_relation, list_entity_relations, relations_of_entity, save_manual_entity_relation, suppress_entity_relation, restore_entity_relation, find_entity_relation_candidates, fetch_shared_memory_evidence
+from database import list_cognitive_items, save_cognitive_item, delete_cognitive_item, normalize_cognitive_item_input, _normalize_cognitive_content, format_cognitive_items_for_prompt, COGNITIVE_PER_TYPE_LIMIT, COGNITIVE_DRAFT_TOTAL_LIMIT, get_recent_cognitive_revisions, record_cognitive_rejection, delete_cognitive_revision, get_cognitive_item, queue_cognitive_pending, list_cognitive_pending, accept_cognitive_pending, reject_cognitive_pending
+from database import record_cognitive_correction, get_recent_cognitive_corrections
+from database import get_verbatim_memories_for_derivation, queue_memory_derivation, list_memory_derivation_pending, accept_memory_derivation, reject_memory_derivation, deactivate_derivations_with_dangling_premises, memory_derivation_content_exists
+from database import compute_embeddings_batch, cognitive_content_similarity, cognitive_overlap_score, COGNITIVE_DUP_EMBED_THRESHOLD, COGNITIVE_MERGE_SIMILARITY, COGNITIVE_OVERLAP_MIN, COGNITIVE_OVERLAP_MIN_RUN, COGNITIVE_EVIDENCE_SIM_MIN
+from database import ensure_memory_extraction_state, record_memory_extraction_round, get_messages_for_memory_extraction, complete_memory_extraction, release_memory_extraction_claim, persist_conversation_batch, stage_tool_workflow, get_pending_tool_workflow, delete_expired_tool_workflows
+import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
+from memory_extractor import extract_memories, score_memories, extract_entities_from_memories, generate_entity_profile, generate_cognitive_draft, normalize_entity_profile, should_defer_extraction, classify_snapshot_suggestion, suggest_entity_snapshots_batch, suggest_entity_trait_candidates, _render_entity_roster, describe_entity_relations, BACKFILL_SNAPSHOT_CHUNK, ENTITY_PRIOR_SNAPSHOT_LIMIT
+import memory_extractor as _memory_extractor_module
+import drives_integration as drives
+from upstream_compat import normalize_chat_request
+from message_pipeline import (
+    classify_request,
+    combine_system_prompt,
+    make_persistence_plan,
+    reconcile_partition_block,
+    repair_stale_tool_chains,
+    has_closed_tool_tail,
+    validate_tool_sequence,
+)
+
+# ============================================================
+# 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
+# ============================================================
+
+# 你的 API Key（OpenRouter / OpenAI / 其他兼容服务）
+API_KEY = os.getenv("API_KEY", "")
+
+# API 地址（改这个就能切换不同的 LLM 服务商）
+# OpenRouter: https://openrouter.ai/api/v1/chat/completions
+# OpenAI:     https://api.openai.com/v1/chat/completions
+# 本地 Ollama: http://localhost:11434/v1/chat/completions
+API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+
+# 默认模型（如果客户端没指定就用这个）
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
+
+# 网关端口
+PORT = int(os.getenv("PORT", "8080"))
+
+# 网关访问密钥（强烈建议设置！）
+# 设置后所有非公开端点都需要鉴权，三选一：
+#   - 标准方式：Authorization: Bearer 你的密钥（OpenAI 兼容客户端）
+#   - 请求头方式：X-Gateway-Key: 你的密钥（客户端/API 调用）
+#   - URL参数方式：?gateway_key=你的密钥（方便浏览器访问 dashboard）
+# 不设置则跳过鉴权（兼容旧部署，仅建议内网环境使用）
+GATEWAY_SECRET = os.getenv("GATEWAY_SECRET", "")
+
+# 记忆系统开关（数据库出问题时可以临时关掉）
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
+
+# 每次注入的最大记忆条数
+MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
+
+# 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
+MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "15"))
+
+# 认知模型自动审视（半自动分级：仅 reinforce 自动应用，其余一律挂起待人工确认）
+COGNITIVE_AUTO_MODE = os.getenv("COGNITIVE_AUTO_MODE", "manual")  # manual | auto
+COGNITIVE_AUTO_INTERVAL_HOURS = int(os.getenv("COGNITIVE_AUTO_INTERVAL_HOURS", "12"))  # 每轮间隔（小时）
+
+# 记忆演化（从原文记忆推断"没说但正确"的新内容）：后台定时 + 手动按钮
+MEMORY_EVOLUTION_ENABLED = os.getenv("MEMORY_EVOLUTION_ENABLED", "true").lower() == "true"
+MEMORY_EVOLUTION_INTERVAL_HOURS = int(os.getenv("MEMORY_EVOLUTION_INTERVAL_HOURS", "24"))  # 定时间隔
+COGNITIVE_DERIVE_MAX_RESTATEMENT = 0.9  # 结论与任一前提的相似度上限：超过=旧信息重组，丢弃
+
+# 特征定时重确认（P3 后台任务）
+TRAIT_RECHECK_ENABLED = os.getenv("TRAIT_RECHECK_ENABLED", "true").lower() == "true"
+TRAIT_RECHECK_INTERVAL_HOURS = int(os.getenv("TRAIT_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
+TRAIT_RECHECK_BATCH = int(os.getenv("TRAIT_RECHECK_BATCH", "10"))                   # 每轮最多处理实体数
+
+# 实体间关系发现（P7 后台任务）
+RELATION_RECHECK_ENABLED = os.getenv("RELATION_RECHECK_ENABLED", "true").lower() == "true"
+RELATION_RECHECK_INTERVAL_HOURS = int(os.getenv("RELATION_RECHECK_INTERVAL_HOURS", "24"))  # 每轮间隔
+RELATION_BATCH = int(os.getenv("RELATION_BATCH", "10"))                                    # 每轮最多判定的实体对数
+
+# 记忆提取+注入总开关（false时数据库仍连接、消息仍存储，但不提取也不注入记忆）
+MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == "true"
+
+_scheduler_config_event = None
+
+
+def _get_scheduler_config_event() -> asyncio.Event:
+    global _scheduler_config_event
+    if _scheduler_config_event is None:
+        _scheduler_config_event = asyncio.Event()
+    return _scheduler_config_event
+
+
+def notify_scheduler_config_updated():
+    """唤醒所有等待中的后台调度循环，使其重新评估定时与启用状态"""
+    try:
+        evt = _get_scheduler_config_event()
+        evt.set()
+    except Exception:
+        pass
+
+
+async def _interruptible_sleep(get_interval_seconds):
+    """可中断休眠：当用户在设置面板修改间隔或开关时，可即时唤醒并重新计算剩余时间。"""
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
+    evt = _get_scheduler_config_event()
+    while True:
+        try:
+            target_seconds = max(0.01, float(get_interval_seconds()))
+        except Exception:
+            target_seconds = 3600.0
+        elapsed = loop.time() - start_time
+        remaining = target_seconds - elapsed
+        if remaining <= 0:
+            break
+        evt.clear()
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=min(remaining, 60.0))
+            # 收到设置更新通知：以当前修改时间为新起点重新计时休眠
+            start_time = loop.time()
+        except asyncio.TimeoutError:
+            pass
+
+# 分区缓存
+CACHE_PARTITION_ENABLED = os.getenv("CACHE_PARTITION_ENABLED", "false").lower() == "true"
+CACHE_PARTITION_X = int(os.getenv("CACHE_PARTITION_X", "15"))
+CACHE_SUMMARY_MODEL = os.getenv("CACHE_SUMMARY_MODEL", "")  # 留空=不生成摘要，轮转时A区直接滑出（纯轮转模式）
+CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # rounds=按轮次 | time=按时间窗口
+CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
+CACHE_TTL = os.getenv("CACHE_TTL", "5m")  # 缓存TTL：5m(默认) | 1h。1h写入费2x(5m是1.25x)读都0.1x，消息间隔常超5分钟的慢聊场景1h更划算
+PARTITION_SESSION_ID = os.getenv("PARTITION_SESSION_ID", "")
+UI_USER_NAME = os.getenv("UI_USER_NAME", "用户")
+UI_AI_NAME = os.getenv("UI_AI_NAME", "AI")
+
+
+def make_cache_control() -> dict:
+    """构造cache_control块。CACHE_TTL=1h时显式带ttl字段，其余值不带（上游默认5m）"""
+    if CACHE_TTL == "1h":
+        return {"type": "ephemeral", "ttl": "1h"}
+    return {"type": "ephemeral"}
+
+def get_active_session_id() -> str:
+    return PARTITION_SESSION_ID
+
+
+async def _replace_active_session_before_deletion(session_ids: set[str]) -> str:
+    """Move the active pointer before its conversation is deleted."""
+    global PARTITION_SESSION_ID
+    active_session = get_active_session_id()
+    if active_session and active_session in session_ids:
+        PARTITION_SESSION_ID = f"thread-{str(uuid.uuid4())[:8]}"
+        await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
+        print("🔗 删除前已切换到新的活跃对话线", flush=True)
+    return PARTITION_SESSION_ID
+
+# 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
+TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
+
+# 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
+FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
+
+# 下游 SSE 心跳间隔（秒）。Zeabur 等边缘代理会对"首字节前静默"和"无数据空闲"超时并回 502，
+# 心跳间隔必须短于边缘 idle 超时。环境变量 STREAM_HEARTBEAT_INTERVAL 可覆盖（默认 5 秒）。
+try:
+    # 环境变量必须是非空正数；非法或非正数值回退到 5 秒，避免启动时崩溃。
+    STREAM_HEARTBEAT_INTERVAL = float(os.getenv("STREAM_HEARTBEAT_INTERVAL", "5"))
+    if STREAM_HEARTBEAT_INTERVAL <= 0:
+        STREAM_HEARTBEAT_INTERVAL = 5.0
+except (TypeError, ValueError):
+    STREAM_HEARTBEAT_INTERVAL = 5.0
+
+# 推理/思维链参数（部分客户端走网关时不会自动添加reasoning参数，导致上游不返回thinking数据）
+# 设为 low/medium/high 会在转发请求时注入 reasoning_effort 参数
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
+
+# 记忆模型专用 API Key（不设则回退到主 API_KEY）
+# 适用于中转站按模型分组、不同模型需要不同 Key 的场景
+MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
+
+def get_memory_api_key() -> str:
+    return MEMORY_API_KEY or API_KEY
+
+# 记忆模型专用 API Base URL（不设则回退到主 API_BASE_URL）
+MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
+
+def get_memory_api_base_url() -> str:
+    return MEMORY_API_BASE_URL or API_BASE_URL
+
+# 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
+EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
+EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
+
+
+# ============================================================
+# 人设加载
+# ============================================================
+
+def load_system_prompt():
+    """从 system_prompt.txt 文件读取人设内容"""
+    prompt_path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if content:
+                return content
+    except FileNotFoundError:
+        pass
+    print("ℹ️  未找到 system_prompt.txt 或文件为空，将不注入 system prompt")
+    return ""
+
+
+SYSTEM_PROMPT = load_system_prompt()
+_DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT  # 保留文件原始版本
+if SYSTEM_PROMPT:
+    print(f"✅ 人设已加载，长度：{len(SYSTEM_PROMPT)} 字符")
+else:
+    print("ℹ️  无人设，纯转发模式")
+
+# System Prompt 缓存（支持设置面板热更新）
+_cached_system_prompt = None
+_cached_system_prompt_loaded = False
+
+def _normalize_ai_identity_prompt(prompt: str) -> str:
+    for legacy_prefix in ("我是AI。", "你是AI。"):
+        if prompt.startswith(legacy_prefix):
+            return "我是AI。" + prompt[len(legacy_prefix):]
+    return prompt
+
+async def get_system_prompt() -> str:
+    """获取 system prompt（数据库优先，fallback 到文件）"""
+    global _cached_system_prompt, _cached_system_prompt_loaded
+    if _cached_system_prompt_loaded:
+        return _cached_system_prompt or ""
+    try:
+        db_prompt = await get_gateway_config("systemPrompt", "")
+        if db_prompt:
+            _cached_system_prompt = _normalize_ai_identity_prompt(db_prompt)
+            if _cached_system_prompt != db_prompt:
+                await set_gateway_config("systemPrompt", _cached_system_prompt)
+        else:
+            _cached_system_prompt = _DEFAULT_SYSTEM_PROMPT
+            if _DEFAULT_SYSTEM_PROMPT:
+                await set_gateway_config("systemPrompt", _DEFAULT_SYSTEM_PROMPT)
+        _cached_system_prompt_loaded = True
+        return _cached_system_prompt or ""
+    except Exception:
+        _cached_system_prompt = _DEFAULT_SYSTEM_PROMPT
+        _cached_system_prompt_loaded = True
+        return _cached_system_prompt or ""
+
+def invalidate_system_prompt_cache():
+    """清除 system prompt 缓存（设置面板更新后调用）"""
+    global _cached_system_prompt, _cached_system_prompt_loaded
+    _cached_system_prompt = None
+    _cached_system_prompt_loaded = False
+
+
+# ============================================================
+# 应用生命周期管理
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用启动时初始化数据库，关闭时断开连接"""
+    global PARTITION_SESSION_ID, MEMORY_EXTRACT_INTERVAL
+    # Dashboard configuration lives in PostgreSQL, so load it even when the
+    # Zeabur environment currently disables memory; the DB value has priority.
+    if MEMORY_ENABLED or _db_module.DATABASE_URL:
+        try:
+            await init_tables()
+            await ensure_token_usage_table()
+            count = await get_all_memories_count()
+            print(f"✅ 记忆系统已启动，当前记忆数量：{count}")
+            
+            # 从数据库恢复面板配置（重启后保持Dashboard修改过的值）
+            try:
+                db_cfg = await get_all_gateway_config()
+                if db_cfg:
+                    _RESTORE_MAIN = {
+                        "API_BASE_URL": str, "API_KEY": str, "DEFAULT_MODEL": str,
+                        "MEMORY_API_BASE_URL": str,
+                        "MEMORY_ENABLED": lambda v: _parse_bool(v),
+                        "MAX_MEMORIES_INJECT": int, "MEMORY_EXTRACT_INTERVAL": int,
+                        "COGNITIVE_AUTO_MODE": str,
+                        "COGNITIVE_AUTO_INTERVAL_HOURS": int,
+                        "MEMORY_EVOLUTION_ENABLED": lambda v: _parse_bool(v),
+                        "MEMORY_EVOLUTION_INTERVAL_HOURS": int,
+                        "TRAIT_RECHECK_ENABLED": lambda v: _parse_bool(v),
+                        "TRAIT_RECHECK_INTERVAL_HOURS": int,
+                        "RELATION_RECHECK_ENABLED": lambda v: _parse_bool(v),
+                        "RELATION_RECHECK_INTERVAL_HOURS": int,
+                        "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
+                        "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
+                        "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
+                        "CACHE_TTL": str,
+                        "FORCE_STREAM": lambda v: _parse_bool(v),
+                        "REASONING_EFFORT": str,
+                    }
+                    _RESTORE_DB = {
+                        "EMBEDDING_API_KEY": str, "EMBEDDING_BASE_URL": str,
+                        "EMBEDDING_MODEL": str, "EMBEDDING_DIM": int,
+                        "MIN_SCORE_THRESHOLD": float,
+                        "MEMORY_VECTOR_ENABLED": lambda v: _parse_bool(v),
+                        "MEMORY_HW_KEYWORD": float, "MEMORY_HW_SEMANTIC": float,
+                        "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
+                        "MEMORY_HW_ENTITY": float,
+                        "MEMORY_SEMANTIC_THRESHOLD": float,
+                    }
+                    # 显式空值也要恢复的字段：面板清空=关闭该功能，重启后应保持关闭而不是回退到环境变量
+                    _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
+                    restored = []
+                    for key, val in db_cfg.items():
+                        if not val:
+                            if key in _ALLOW_EMPTY and key in _RESTORE_MAIN:
+                                globals()[key] = _RESTORE_MAIN[key]("")
+                                restored.append(key + "(显式空)")
+                            continue
+                        if key in _RESTORE_MAIN:
+                            globals()[key] = _RESTORE_MAIN[key](val)
+                            _memory_extractor_module.apply_runtime_config(key, val)
+                            restored.append(key)
+                        elif key in _RESTORE_DB:
+                            setattr(_db_module, key, _RESTORE_DB[key](val))
+                            restored.append(key)
+                        elif key == "MEMORY_MODEL":
+                            os.environ["MEMORY_MODEL"] = str(val)
+                            _memory_extractor_module.apply_runtime_config(key, val)
+                            restored.append(key)
+                        elif key == "MEMORY_API_KEY":
+                            globals()[key] = str(val)
+                            _memory_extractor_module.apply_runtime_config(key, val)
+                            restored.append(key)
+                    if restored:
+                        print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
+                if MEMORY_EXTRACT_INTERVAL != 15:
+                    MEMORY_EXTRACT_INTERVAL = 15
+                    await set_gateway_config("MEMORY_EXTRACT_INTERVAL", "15")
+                    print("🔄 记忆提取间隔已校正为每15个完整轮次")
+                removed_workflows = await delete_expired_tool_workflows()
+                if removed_workflows:
+                    print(f"🧹 清理了 {removed_workflows} 条过期工具工作流")
+            except Exception as e:
+                print(f"[warning] 恢复面板配置失败: {e}")
+            
+            if not MEMORY_ENABLED:
+                print("ℹ️  记忆系统已由 Dashboard 配置关闭")
+            elif not MEMORY_EXTRACT_ENABLED:
+                print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
+            
+            # 活跃对话线独立于分区开关，所有聊天模式共用稳定 session。
+            db_sid = await get_gateway_config("partition_session_id", "")
+            if db_sid:
+                PARTITION_SESSION_ID = db_sid
+                print(f"🔗 活跃对话线(DB): {PARTITION_SESSION_ID}")
+            elif PARTITION_SESSION_ID:
+                await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
+                print(f"🔗 活跃对话线(ENV→DB): {PARTITION_SESSION_ID}")
+            if CACHE_PARTITION_ENABLED:
+                print(f"🔒 分区缓存已启用: X={CACHE_PARTITION_X}, 摘要模型={CACHE_SUMMARY_MODEL or '（未配置，纯轮转模式）'}")
+        except Exception as e:
+            print(f"⚠️  数据库初始化失败: {e}")
+            print("⚠️  记忆系统将不可用，但网关仍可正常转发")
+    else:
+        print("ℹ️  记忆系统已关闭（设置 MEMORY_ENABLED=true 开启）")
+
+    # P3 特征定时重确认（后台调度；仅当记忆系统可用时启动）
+    trait_timer_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            trait_timer_task = asyncio.create_task(_trait_requalify_loop())
+            print(f"🔄 特征定时重确认已启动（间隔 {TRAIT_RECHECK_INTERVAL_HOURS}h，批量 {TRAIT_RECHECK_BATCH}）")
+        except Exception as exc:
+            print(f"⚠️ 特征定时重确认启动失败: {exc}")
+
+    # P7 实体关系发现（后台调度；仅当记忆系统可用时启动）
+    relation_timer_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            relation_timer_task = asyncio.create_task(_entity_relation_discovery_loop())
+            print(f"🔗 实体关系发现已启动（间隔 {RELATION_RECHECK_INTERVAL_HOURS}h，批量 {RELATION_BATCH}）")
+        except Exception as exc:
+            print(f"⚠️ 实体关系发现启动失败: {exc}")
+
+    # 认知模型自动审视（后台调度；模式在面板热切换，循环常驻）
+    cognitive_auto_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            cognitive_auto_task = asyncio.create_task(_cognitive_auto_loop())
+            print(f"🧠 认知自动审视已启动（间隔 {COGNITIVE_AUTO_INTERVAL_HOURS}h，模式 {COGNITIVE_AUTO_MODE}）")
+        except Exception as exc:
+            print(f"⚠️ 认知自动审视启动失败: {exc}")
+
+    # 记忆演化（后台调度；候选进待确认队列，人工确认才写记忆）
+    memory_evolution_task = None
+    if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
+        try:
+            memory_evolution_task = asyncio.create_task(_memory_evolution_loop())
+            print(f"🧠 记忆演化已启动（间隔 {MEMORY_EVOLUTION_INTERVAL_HOURS}h，候选待人工确认）")
+        except Exception as exc:
+            print(f"⚠️ 记忆演化启动失败: {exc}")
+
+    yield
+
+    if trait_timer_task is not None:
+        trait_timer_task.cancel()
+    if relation_timer_task is not None:
+        relation_timer_task.cancel()
+    if cognitive_auto_task is not None:
+        cognitive_auto_task.cancel()
+    if memory_evolution_task is not None:
+        memory_evolution_task.cancel()
+    timer_tasks = [
+        task for task in (
+            trait_timer_task, relation_timer_task,
+            cognitive_auto_task, memory_evolution_task,
+        ) if task is not None
+    ]
+    if timer_tasks:
+        await asyncio.gather(*timer_tasks, return_exceptions=True)
+    await _drain_response_persistence_tasks()
+    await close_pool()
+
+
+app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
+
+# 静态文件和模板配置
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+
+# ============================================================
+# 网关鉴权中间件
+# ============================================================
+
+# 不需要鉴权的路径（根路径精确匹配，其余按前缀匹配）
+PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico")
+
+
+def _get_provided_gateway_key(headers, query_params):
+    """读取自定义密钥、URL 参数或 OpenAI 客户端使用的 Bearer 密钥。"""
+    provided_key = (
+        headers.get("X-Gateway-Key", "")
+        or query_params.get("gateway_key", "")
+    )
+    if provided_key:
+        return provided_key
+
+    authorization = headers.get("Authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer":
+        return token.strip()
+    return ""
+
+
+@app.middleware("http")
+async def gateway_auth_middleware(request: Request, call_next):
+    """检查 GATEWAY_SECRET，保护所有非公开端点"""
+    # 未设置密钥时跳过鉴权（兼容旧部署，但会打印警告）
+    if not GATEWAY_SECRET:
+        if not hasattr(gateway_auth_middleware, "_warned"):
+            print("⚠️  GATEWAY_SECRET 未设置！所有 API 端点不受保护！")
+            print("⚠️  请在环境变量中设置 GATEWAY_SECRET 以启用鉴权")
+            gateway_auth_middleware._warned = True
+        return await call_next(request)
+
+    path = request.url.path
+
+    # 公开路径不需要鉴权（根路径精确匹配）
+    if path == "/":
+        return await call_next(request)
+    for prefix in PUBLIC_PATHS[1:]:
+        if path.startswith(prefix):
+            return await call_next(request)
+
+    # OPTIONS 预检请求放行（CORS 需要）
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # 兼容 OpenAI 客户端的 Authorization: Bearer，也保留原有鉴权方式
+    provided_key = _get_provided_gateway_key(request.headers, request.query_params)
+
+    # compare_digest 防时序侧信道攻击
+    if not secrets.compare_digest(provided_key, GATEWAY_SECRET):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": (
+                    "Unauthorized. Provide Authorization: Bearer <gateway key>, "
+                    "X-Gateway-Key header, or gateway_key parameter."
+                )
+            },
+        )
+
+    return await call_next(request)
+
+
+# ============================================================
+# 记忆注入
+# ============================================================
+
+# 实体卡注入的关键词驱动意图分类（纯字符串规则，聊天路径无 LLM）。
+# 原话/日期/具体经历问题优先事件与碎片，不把实体卡当作证据替代品——卡片只含
+# 现状与快照摘要，没有原文/原话/精确日期，注入只会浪费 token 或误导模型拿现状
+# 去答过去的问题；其余问题（含历史问题）统一注入 description + 最近快照。
+ENTITY_SPECIFIC_QUERY_KEYWORDS = (
+    "原话", "原话是", "说过", "当时说", "怎么说的", "怎么回答", "如何回答",
+    "具体", "哪一天", "什么时候", "几号", "日期", "细节", "原文",
+)
+
+
+def _classify_entity_query(user_message: str) -> bool:
+    """是否原文/日期类具体问题（无 LLM）。
+
+    Returns True（跳过实体卡）| False（注入卡片）。Specific (quote/date)
+    questions take precedence so a sentence like "他当时说的原话是什么" skips
+    the card; everything else — ordinary or history — injects description +
+    recent snapshots.
+    """
+    text = str(user_message or "")
+    return any(keyword in text for keyword in ENTITY_SPECIFIC_QUERY_KEYWORDS)
+
+
+def _card_date_is_stale(date_str: str, days: int) -> bool:
+    """True when a YYYY-MM-DD date is older than `days`. Empty/invalid → fresh."""
+    if not date_str:
+        return False
+    try:
+        d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return (datetime.now() - d).days > days
+
+
+def _format_matched_entity_overview(
+    memories: list,
+    user_message: str = "",
+    relation_map: dict = None,
+    direct_entities: list = None,
+) -> str:
+    """Render the matched-entity block from entity cards.
+
+    The legacy profile_json (summary / relationship / stable_facts / recent_updates
+    / preferences / uncertainties) is never injected here. All non-specific
+    questions get the card's short description plus the most recent 3 snapshots by
+    fact date; specific quote/date questions skip the card so the existing Top-K
+    events/fragments answer directly. Aging guards ride along so the AI treats
+    stale content cautiously: active stable traits with a `last_confirmed` older
+    than TRAIT_STALE_DAYS are labelled "（较早确认，可能已不适用）"; the tail
+    (current-state) snapshot whose fact_date is older than SNAPSHOT_STALE_DAYS is
+    labelled "（最后更新于 X，可能已过时）"; ambiguous (non-exact-name) matches
+    still label the tail "（不确定是否仍为最新）".
+
+    Entity relationships (P7) render as a `↳ 关联` line right after the card
+    description — only relations whose other end is still active, at most 3, so
+    the AI can follow the thread without the block bloating. `relation_map` comes
+    from the async caller (`relations_of_entity`); None renders no relation lines.
+    """
+    entities = {}
+    for entity in direct_entities or []:
+        if entity.get("retrieval_status") == "active":
+            entities[entity["id"]] = entity
+    for memory in memories:
+        for entity in memory.get("matched_entities", []):
+            if entity.get("retrieval_status") == "active":
+                entities.setdefault(entity["id"], entity)
+    skip_card = _classify_entity_query(user_message)
+    lines = []
+    for entity in entities.values():
+        if skip_card:
+            continue
+        card = entity.get("entity_card_json") or {}
+        if isinstance(card, str):
+            try:
+                card = json.loads(card)
+            except json.JSONDecodeError:
+                card = {}
+        snapshots = card.get("snapshots") or []
+        try:
+            snapshots = sorted(
+                (snap for snap in snapshots if isinstance(snap, dict) and snap.get("state")),
+                key=lambda snap: (str(snap.get("fact_date") or ""), str(snap.get("recorded_at") or "")),
+            )
+        except Exception:
+            snapshots = []
+        description = (card.get("description") or entity.get("description") or "").strip()
+        aliases = f"，别名：{'、'.join(entity.get('aliases', []))}" if entity.get("aliases") else ""
+        header = f"- {entity['name']}（{entity.get('type', 'other')}{aliases}）"
+        if description:
+            header += f"—— {description}"
+        lines.append(header)
+        # 注入顺序：实体说明 → 关联实体（仅关联端活跃，≤3 条）→ 长期稳定特征 → 最近状态快照
+        related = []
+        if relation_map:
+            related = [
+                rel for rel in relation_map.get(int(entity["id"]), [])
+                if rel.get("retrieval_status") == "active"
+            ]
+        for relation_index, rel in enumerate(related):
+            rel_name = str(rel.get("name") or "").strip()
+            rel_text = str(rel.get("relation") or "").strip()
+            if not rel_name:
+                continue
+            if rel_text:
+                lines.append(f"  ↳ 关联：{rel_name}（{rel_text}）")
+            else:
+                lines.append(f"  ↳ 关联：{rel_name}")
+            if relation_index >= 3 or rel.get("entity_id") in entities:
+                continue
+            related_card = rel.get("entity_card_json") or {}
+            if isinstance(related_card, str):
+                try:
+                    related_card = json.loads(related_card)
+                except json.JSONDecodeError:
+                    related_card = {}
+            related_description = (related_card.get("description") or rel.get("description") or "").strip()
+            related_snapshots = related_card.get("snapshots") or []
+            try:
+                related_snapshots = sorted(
+                    (snap for snap in related_snapshots if isinstance(snap, dict) and snap.get("state")),
+                    key=lambda snap: (str(snap.get("fact_date") or ""), str(snap.get("recorded_at") or "")),
+                )
+            except Exception:
+                related_snapshots = []
+            if related_description:
+                lines.append(f"    · {rel_name}（{rel.get('type', 'other')}）— {related_description}")
+            if related_snapshots:
+                snapshot = related_snapshots[-1]
+                state_text = snapshot["state"]
+                if _card_date_is_stale(str(snapshot.get("fact_date") or ""), _db_module.SNAPSHOT_STALE_DAYS):
+                    state_text += f"（最后更新于 {snapshot.get('fact_date') or '未知日期'}，可能已过时）"
+                lines.append(f"    · 最近：{snapshot.get('fact_date') or '未知日期'}：{state_text}")
+        # 注入顺序：实体说明 → 长期稳定特征（仅 active，retired/pending/rejected 一律不注入）→ 最近状态快照
+        for trait in (card.get("stable_traits") or []):
+            if not isinstance(trait, dict) or trait.get("status") != "active":
+                continue
+            trait_text = str(trait.get("text") or "").strip()
+            if not trait_text:
+                continue
+            if _card_date_is_stale(str(trait.get("last_confirmed") or ""), _db_module.TRAIT_STALE_DAYS):
+                trait_text += "（较早确认，可能已不适用）"
+            lines.append(f"  · 长期稳定特征：{trait_text}")
+        recent = snapshots[-3:]
+        exact_match = bool(entity.get("exact_name_match"))
+        for i, snapshot in enumerate(recent):
+            state_text = snapshot["state"]
+            tail = i == len(recent) - 1
+            extras = []
+            if tail and not exact_match:
+                extras.append("不确定是否仍为最新")
+            if tail and _card_date_is_stale(str(snapshot.get("fact_date") or ""), _db_module.SNAPSHOT_STALE_DAYS):
+                extras.append(f"最后更新于 {snapshot.get('fact_date') or '未知日期'}，可能已过时")
+            diary = []
+            if snapshot.get("user_view"):
+                diary.append(f"用户：{snapshot['user_view']}")
+            if snapshot.get("ai_view"):
+                diary.append(f"我：{snapshot['ai_view']}")
+            if diary:
+                extras.append("；".join(diary))
+            if extras:
+                state_text += "（" + "；".join(extras) + "）"
+            lines.append(f"  · {snapshot.get('fact_date') or '未知日期'}：{state_text}")
+    return "\n".join(lines)
+
+
+async def _build_entity_overview(memories: list, user_message: str, direct_entities: list) -> str:
+    """Render direct entity cards independently of memory Top-K, plus one-hop relations."""
+    relation_map = {}
+    try:
+        matched_ids = {
+            entity["id"]
+            for entity in direct_entities
+            if entity.get("retrieval_status") == "active"
+        }
+        matched_ids.update(
+            entity["id"]
+            for memory in memories
+            for entity in memory.get("matched_entities", [])
+            if entity.get("retrieval_status") == "active"
+        )
+        if matched_ids:
+            relation_map = await relations_of_entity(list(matched_ids))
+    except Exception as exc:
+        print(f"⚠️ 实体关联读取失败: {exc}")
+    return _format_matched_entity_overview(memories, user_message, relation_map, direct_entities)
+
+
+async def build_system_prompt_with_memories(user_message: str, base_system_prompt: str) -> str:
+    """
+    构建带记忆的 system prompt
+    1. 用用户消息搜索相关记忆
+    2. 格式化成文本拼接到人设后面
+    """
+    if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+        return base_system_prompt
+    
+    try:
+        direct_entities = await find_directly_mentioned_entities(user_message)
+        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
+        cognitive_text = format_cognitive_items_for_prompt(
+            await list_cognitive_items(active_only=True, reviewed_only=True)
+        )
+
+        if not memories and not cognitive_text and not direct_entities:
+            return base_system_prompt
+        
+        # 格式化记忆文本（带日期，帮助模型判断新旧）
+        entity_map = {
+            mem["id"]: [
+                entity for entity in mem.get("entities", [])
+                if entity.get("retrieval_status") == "active"
+            ]
+            for mem in memories
+        }
+        memory_lines = []
+        for mem in memories:
+            date_str = ""
+            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆", 4: "推断记忆"}.get(mem.get("layer", 1), "记忆")
+            if mem.get("created_at"):
+                try:
+                    utc_str = str(mem['created_at'])[:19]
+                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
+                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
+                except:
+                    date_str = f"[{str(mem['created_at'])[:10]}] "
+            names = [entity["name"] for entity in entity_map.get(mem["id"], [])]
+            entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
+            memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
+        memory_text = "\n".join(memory_lines)
+        entity_overview = await _build_entity_overview(memories, user_message, direct_entities)
+        entity_section = f"\n【命中的相关实体】\n{entity_overview}\n" if entity_overview else ""
+        
+        cognitive_section = f"\n{cognitive_text}\n" if cognitive_text else ""
+        enhanced_prompt = f"""{base_system_prompt}
+
+{cognitive_section}
+
+【从过往对话中检索到的相关记忆】
+{entity_section}
+{memory_text}
+
+# 记忆应用
+- 像朋友般自然运用这些记忆，不刻意展示
+- 仅在相关话题出现时引用，避免主动提及
+- 对重要信息（如健康、日期、约定）保持一致性
+- 新信息与记忆冲突时，以新信息为准
+- 模糊记忆可表达不确定性："记得你似乎说过..."
+
+# 交流方式
+- 自然引用："记得你说过..."或"上次我们聊到..."
+- 避免机械式表达如"根据我的记忆..."或"检索到的信息显示..."
+- 共同经历可温情回忆："上次那个事挺好玩的"
+
+记忆是丰富对话的工具，而非对话焦点。"""
+        
+        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        return enhanced_prompt
+        
+    except Exception as e:
+        print(f"⚠️  记忆检索失败: {e}，使用纯人设")
+        return base_system_prompt
+
+
+# ============================================================
+# 分区缓存（Partition Cache）
+# ============================================================
+
+def _is_anthropic_model(model: str) -> bool:
+    """判断是否为 Anthropic Claude 系列模型（只有 Claude 支持 cache_control）"""
+    model_lower = model.lower()
+    return "claude" in model_lower or "anthropic" in model_lower
+
+
+def _strip_cache_control(messages: list):
+    """
+    剥掉消息中的 cache_control 字段，非 Claude 模型用不了。
+    如果 content 数组只剩纯文本 block，降级回字符串格式。
+    """
+    stripped = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and "cache_control" in block:
+                del block["cache_control"]
+                stripped += 1
+        if len(content) == 1 and isinstance(content[0], dict) and content[0].get("type") == "text":
+            msg["content"] = content[0]["text"]
+    if stripped > 0:
+        print(f"🔧 兼容性处理: 剥离了 {stripped} 个 cache_control 字段（非 Claude 模型）")
+
+
+def _sanitize_content_types(messages: list):
+    """把 content 为 list 的消息转为纯文本，防止上游API报错。"""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            msg["content"] = "\n".join(text_parts) if text_parts else "[图片]"
+            print(f"🧹 [消息清洗] content: list → str ({len(msg['content'])}字)")
+
+
+def _assemble_current_user_message(parts: list, raw_content) -> dict:
+    """
+    组装当前轮 user 消息：注入文本（时间/记忆，parts）+ 客户端原始 content。
+    content 为多模态数组时保留图片等非文本块，只把文本块并进注入文本，
+    否则 image_url 块会在拼接时被丢弃，模型永远看不到图。
+    """
+    if isinstance(raw_content, list):
+        media_blocks = [
+            b for b in raw_content
+            if not (isinstance(b, dict) and b.get("type") == "text")
+        ]
+        text_joined = " ".join(
+            b.get("text", "") for b in raw_content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        if media_blocks:
+            merged = "\n\n".join(parts + ([text_joined] if text_joined else []))
+            return {"role": "user", "content": media_blocks + [{"type": "text", "text": merged}]}
+        raw_content = text_joined
+    parts.append(raw_content)
+    return {"role": "user", "content": "\n\n".join(parts)}
+
+
+def _message_text(message: dict) -> str:
+    """Extract text from an OpenAI-compatible message."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return ""
+
+
+def _inject_dynamic_environment(
+    messages: list,
+    snapshot: str,
+    merge_with_user: bool = False,
+) -> bool:
+    """Insert a transient snapshot immediately before the latest real user message."""
+    if not snapshot:
+        return False
+
+    target_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if target_index is None:
+        print(
+            "[warning] 动态环境快照未找到对应的真实 user 消息，本次不注入",
+            flush=True,
+        )
+        return False
+
+    if merge_with_user:
+        target = messages[target_index]
+        messages[target_index] = _assemble_current_user_message(
+            [snapshot],
+            target.get("content", ""),
+        )
+    else:
+        messages.insert(target_index, {"role": "user", "content": snapshot})
+    return True
+
+
+def _is_title_generation_request(messages: list) -> bool:
+    """Detect client-side title generation prompts that must not enter chat history."""
+    user_texts = [
+        _message_text(message).strip()
+        for message in messages
+        if message.get("role") == "user"
+    ]
+    user_texts = [text for text in user_texts if text]
+    if len(user_texts) != 1:
+        return False
+
+    text = user_texts[0].lower()
+    strong_signatures = (
+        "summarize the conversation between user and assistant into a short title",
+        "summarize the conversation into a short title",
+        "generate a concise title for the conversation",
+        "generate a short title for the conversation",
+    )
+    if any(signature in text for signature in strong_signatures):
+        return True
+
+    # Some clients localize or slightly rewrite the boilerplate. Requiring three
+    # independent markers avoids treating an ordinary title request as metadata.
+    marker_groups = (
+        ("<content>", "</content>"),
+        ("reply directly with the title", "only output the title", "只输出标题", "直接输出标题"),
+        ("title should not exceed", "title must not exceed", "标题不超过", "标题不得超过"),
+        ("conversation between user and assistant", "dialogue between user and assistant", "用户和助手的对话", "用户与助手的对话"),
+        ("short title", "concise title", "简短标题", "简洁标题"),
+    )
+    matched_groups = sum(
+        1 for markers in marker_groups if any(marker in text for marker in markers)
+    )
+    return matched_groups >= 3
+
+
+# 分区缓存模式下拼接到 system prompt 尾部的记忆使用说明。
+# 非缓存模式的对应说明在 build_system_prompt_with_memories 里（记忆和说明都在 system）；
+# 分区缓存模式记忆走 user 消息注入（<retrieved_memories> 块），这里只补静态说明，
+# 内容固定所以不破坏 system 缓存。
+MEMORY_USAGE_GUIDE = """
+
+# 记忆应用
+用户消息中的 <retrieved_memories> 块是网关自动检索的过往记忆，使用时：
+- 像朋友般自然运用，不刻意展示；仅在相关话题出现时引用，避免主动提及
+- 对重要信息（如健康、日期、约定）保持一致性
+- 新信息与记忆冲突时，以新信息为准
+- 模糊记忆可表达不确定性："记得你似乎说过..."
+- 自然引用："记得你说过..."，避免机械式表达如"根据检索到的信息..."
+"""
+
+
+def build_time_injection() -> str:
+    """构建时间注入文本（东八区）"""
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc + timedelta(hours=TIMEZONE_HOURS)
+    weekday_names = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    weekday = weekday_names[now_local.weekday()]
+    time_str = now_local.strftime("%Y年%m月%d日 %H:%M")
+    return (
+        f"<gateway_context>当前时间：{time_str} {weekday}。"
+        f"此块由网关自动注入，不是用户发送的内容，无需回应或提及；"
+        f"回答涉及日期、年份、时间时以此为准。</gateway_context>"
+    )
+
+
+# ============================================================
+# 请求调试转储（排查缓存命中率 / 检查实际发给上游的内容）
+# ============================================================
+# DEBUG_DUMP_REQUEST=1 时打印最终请求的逐条消息摘要；
+# 前缀对比（与上次请求找分歧点）默认总是打印，直接指出缓存断点在哪条消息。
+DEBUG_DUMP_REQUEST = os.getenv("DEBUG_DUMP_REQUEST", "false").lower() == "true"
+_last_request_digest = None  # (model, [(role, content_md5), ...])
+# reasoning-only 空响应标记用：记录"上次请求相比本次，system 消息是否变化"。
+_last_system_change = {
+    "known": False,
+    "changed": False,
+    "current": "",
+    "previous": "",
+}
+
+
+def _message_content_digest(message: dict) -> str:
+    """对消息做确定性摘要（md5），用于对比两次请求的逐条内容"""
+    return hashlib.md5(
+        json.dumps(
+            message, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def dump_request_debug(model: str, messages: list) -> None:
+    """
+    打印最终发给上游的请求摘要，并与上次请求对比找出缓存前缀断点。
+    只读不修改。messages 为最终 body（含系统提示词）。
+    """
+    global _last_request_digest, _last_system_change
+    digest = [
+        (m.get("role", ""), _message_content_digest(m))
+        for m in messages
+    ]
+
+    if DEBUG_DUMP_REQUEST:
+        print(f"🔍 [请求转储] model={model}, 共{len(messages)}条消息", flush=True)
+        for i, m in enumerate(messages):
+            content = m.get("content", "")
+            if isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+                fmt = f"list[{len(content)}块]"
+            else:
+                text = content or ""
+                fmt = "str"
+            head = text[:60].replace("\n", "⏎")
+            extra = []
+            if m.get("tool_calls"):
+                extra.append(f"tool_calls×{len(m['tool_calls'])}")
+            if m.get("tool_call_id"):
+                extra.append(f"tool_call_id={m['tool_call_id']}")
+            print(
+                f"   [{i:>3}] {m.get('role', '?'):<9} {fmt:<11} len={len(text):<6}"
+                + (f" {' '.join(extra)}" if extra else "")
+                + f" | {head!r}",
+                flush=True,
+            )
+
+    # 与上次请求逐条对比：共同前缀长度 = 上游自动缓存最多能命中的部分
+    if _last_request_digest and _last_request_digest[0] == model:
+        prev_digests = _last_request_digest[1]
+        _last_system_change = {
+            "known": True,
+            "changed": bool(
+                digest and prev_digests
+                and digest[0][0] == "system"
+                and digest[0][1] != prev_digests[0][1]
+            ),
+            "current": digest[0][1] if digest else "",
+            "previous": prev_digests[0][1] if prev_digests else "",
+        }
+        common = 0
+        for a, b in zip(prev_digests, digest):
+            if a == b:
+                common += 1
+            else:
+                break
+        if common == len(digest) == len(prev_digests):
+            print("🔍 与上次请求逐条一致（无新增）", flush=True)
+        elif common == len(prev_digests):
+            print(
+                f"🔍 与上次请求比较: 前缀一致 {common}/{len(digest)} 条，"
+                f"仅尾部新增 {len(digest) - common} 条 —— 缓存应命中全部历史",
+                flush=True,
+            )
+        elif common == len(digest):
+            print(
+                f"🔍 与上次请求比较: 本次是上次请求的严格前缀 "
+                f"{common}/{len(prev_digests)} 条，历史已缩短",
+                flush=True,
+            )
+        else:
+            changed = digest[common]
+            prev_changed = prev_digests[common] if common < len(prev_digests) else ("-", "-")
+            tail_note = "（注意：末条 user 消息总是不同，属正常）" if common == len(digest) - 1 else ""
+            print(
+                f"🔍 与上次请求比较: 前缀一致 {common}/{len(digest)} 条，"
+                f"第{common}条起不同 —— 此处之后缓存全部失效{tail_note}",
+                flush=True,
+            )
+            print(
+                f"🔍 分歧消息: role={changed[0]} 本次={changed[1]} vs 上次={prev_changed[1]}",
+                flush=True,
+            )
+    else:
+        _last_system_change = {
+            "known": False,
+            "changed": False,
+            "current": "",
+            "previous": "",
+        }
+    _last_request_digest = (model, digest)
+
+
+def safe_dump_request_debug(model: str, messages: list) -> None:
+    """Diagnostics must never be able to fail the provider request."""
+    try:
+        dump_request_debug(model, messages)
+    except Exception as exc:
+        print(f"⚠️ 请求摘要诊断失败（已隔离）: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _warn_empty_reasoning_response(session_id: str, body: dict, reasoning_len: int) -> None:
+    """reasoning-only 空响应：上游只思考（reasoning_content）、没有正文、也没有工具调用。
+
+    这种响应客户端会一直等一个不存在的工具结果/正文——表现就是"工具调用没回传结果"。
+    醒目标记本次请求是否带 tools 定义、system 是否相比上次变化，方便抓到失败现场。
+    """
+    model = body.get("model", "")
+    tools = body.get("tools")
+    tools_desc = f"有（{len(tools)}个）" if tools else "无"
+    sys_info = _last_system_change
+    if sys_info["known"] and sys_info["changed"]:
+        sys_desc = f"是（本次={sys_info['current']} vs 上次={sys_info['previous']}）"
+    elif sys_info["known"]:
+        sys_desc = "否"
+    else:
+        sys_desc = "无法对比（首次请求/模型切换）"
+    print(
+        "🚨 reasoning-only 空响应：思考了"
+        f"{reasoning_len}字，但无正文且无工具调用\n"
+        f"    model={model} session={session_id} "
+        f"tools定义={tools_desc} system变化={sys_desc}",
+        flush=True,
+    )
+
+
+def _usage_cache_hit(usage: dict) -> int:
+    """从上游 usage 里读取缓存命中 token 数（DeepSeek / Anthropic 两种字段）"""
+    if not usage:
+        return 0
+    return (
+        usage.get("prompt_cache_hit_tokens", 0)
+        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        or 0
+    )
+
+
+async def generate_summary(messages: list, session_id: str = "") -> str:
+    """调用轻量模型压缩A区消息为摘要"""
+    if not messages:
+        return ""
+    if not CACHE_SUMMARY_MODEL:
+        print("📝 摘要模型未配置，跳过摘要生成（纯轮转模式：A区直接滑出上下文）")
+        return ""
+    
+    conversation_text = ""
+    for msg in messages:
+        role_label = "用户" if msg['role'] == 'user' else "AI"
+        content = msg['content'] if isinstance(msg['content'], str) else str(msg['content'])
+        conversation_text += f"{role_label}: {content}\n\n"
+    
+    prompt = f"""我是AI，正在把自己的对话压缩成记忆摘要。请以我的第一人称视角叙述（“我”指AI，用户用对话中的称呼）。
+优先保留：情感节点、关系里程碑、双方的约定和决定、正在进行的话题。
+保留双方的关键原话，用引号标注是谁说的。
+去掉日常寒暄和重复内容。控制在300字以内。
+
+---
+{conversation_text}
+---
+
+摘要："""
+    
+    try:
+        # 摘要请求发往主API_BASE_URL，直接用主API_KEY（MEMORY_API_KEY可能是其他提供商的key）
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in API_BASE_URL:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(API_BASE_URL, headers=headers, json={
+                "model": CACHE_SUMMARY_MODEL,
+                # 推理模型的思考也消耗max_tokens，给足空间避免content为空
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            if response.status_code == 200:
+                data = response.json()
+                if "choices" in data:
+                    # 推理模型偶发返回content为None（思考吃光token或只返回reasoning_content）
+                    content = data["choices"][0]["message"].get("content") or ""
+                    summary = content.strip()
+                    if summary:
+                        print(f"📝 摘要生成完成: {len(summary)}字 (压缩{len(messages)}条消息)")
+                        return summary
+                    print(f"⚠️ 摘要生成失败: 模型返回空content（推理模型思考可能吃光了max_tokens），本次轮转将推迟重试")
+                    return ""
+
+        print(f"⚠️ 摘要生成失败: HTTP {response.status_code}")
+        return ""
+    except Exception as e:
+        print(f"⚠️ 摘要生成异常: {e}")
+        return ""
+
+
+_partition_summary_tasks = {}
+
+
+async def _run_partition_summary(
+    session_id: str,
+    messages: list,
+    expected_start: int,
+    existing_parts: list,
+):
+    try:
+        summary = await generate_summary(messages, session_id)
+        if not summary:
+            return
+        state = await get_session_cache_state(session_id)
+        if state["a_start_round"] != expected_start:
+            return
+        await save_session_cache_state(
+            session_id,
+            existing_parts + [summary],
+            expected_start + CACHE_PARTITION_X,
+        )
+        print(f"📝 后台摘要轮转完成: session={session_id}", flush=True)
+    finally:
+        _partition_summary_tasks.pop(session_id, None)
+
+
+def _schedule_partition_summary(
+    session_id: str,
+    messages: list,
+    expected_start: int,
+    existing_parts: list,
+):
+    if session_id in _partition_summary_tasks:
+        return
+    task = asyncio.create_task(
+        _run_partition_summary(
+            session_id,
+            [dict(message) for message in messages],
+            expected_start,
+            list(existing_parts),
+        )
+    )
+    _partition_summary_tasks[session_id] = task
+    print(f"📝 摘要轮转已转入后台: session={session_id}", flush=True)
+
+
+def group_by_rounds(history: list) -> list:
+    """
+    按逻辑轮分组：每个user消息开始一轮，到下一个user前结束。
+    一轮可能包含: [user, assistant] 或 [user, assistant(tool_calls), tool, assistant] 等。
+    """
+    rounds = []
+    current_round = []
+    for msg in history:
+        if msg['role'] == 'user' and current_round:
+            rounds.append(current_round)
+            current_round = []
+        current_round.append(msg)
+    if current_round:
+        rounds.append(current_round)
+    return rounds
+
+
+def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
+    """
+    判断是否应该触发A区→摘要的轮转。
+    
+    rounds模式（默认）：B区轮数 >= X 时触发
+    time模式：A区最早消息距今 >= 时间窗口 时触发（短时间内大量消息不频繁摘要）
+    """
+    if b_rounds_count == 0:
+        return False
+    
+    if CACHE_PARTITION_TRIGGER == "time":
+        a_first_time = None
+        for msg in a_msgs:
+            t = msg.get('created_at')
+            if t:
+                a_first_time = t
+                break
+        
+        if a_first_time:
+            now = datetime.now(timezone.utc)
+            if a_first_time.tzinfo is None:
+                a_first_time = a_first_time.replace(tzinfo=timezone.utc)
+            age_minutes = (now - a_first_time).total_seconds() / 60
+            return age_minutes >= CACHE_PARTITION_WINDOW
+        
+        return b_rounds_count >= X
+    
+    return b_rounds_count >= X
+
+# 时间窗口模式下单次请求最大轮转次数（防止一口气压完所有历史）
+CACHE_MAX_ROTATIONS = int(os.getenv("CACHE_MAX_ROTATIONS", "2"))
+
+
+def _apply_breakpoint(msg: dict) -> bool:
+    """
+    给消息打上 cache_control breakpoint。
+    支持 content 为 str 或 list（多模态block数组）两种格式。
+    返回 True 表示成功打上，False 表示无法打（比如content为空）。
+    """
+    content = msg.get('content')
+    
+    # content 是纯字符串
+    if isinstance(content, str) and content.strip():
+        msg['content'] = [{"type": "text", "text": content, "cache_control": make_cache_control()}]
+        return True
+    
+    # content 是 block 数组（多模态消息）
+    if isinstance(content, list):
+        # 从后往前找最后一个 text block
+        for i in range(len(content) - 1, -1, -1):
+            block = content[i]
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                block["cache_control"] = make_cache_control()
+                return True
+    
+    return False
+
+
+async def build_partitioned_messages(
+    session_id: str,
+    all_messages: list,
+    base_prompt: str,
+    user_message: str,
+    cognitive_text: str = "",
+    memory_text: str = "",
+    drives_text: str = "",
+) -> list:
+    """
+    分区缓存模式：构建带breakpoint的messages数组。
+    
+    结构：
+    system: [{人设, BP1}]                        ← 永远命中
+    messages:
+      [摘要blocks（每段一个block）, 最后BP]       ← 尾部追加，前面命中
+      [摘要assistant]
+      [A区消息... 最后一条BP2]                    ← 正常轮次不变
+      [B区消息... 最后一条BP3]                    ← lookback命中
+      [当前user: 时间+记忆+消息]                  ← 不缓存
+    """
+    X = CACHE_PARTITION_X
+    
+    non_system = [m for m in all_messages if m.get('role') != 'system']
+    
+    current_user_msg = None
+    history = non_system[:]
+    if history and history[-1].get('role') == 'user':
+        current_user_msg = history.pop()
+    
+    # 清洗孤立的tool消息（前面不是 assistant(tool_calls) 或另一条 tool 的）
+    # 防止DB里的重复tool消息导致消息乱序
+    cleaned = []
+    orphan_count = 0
+    for msg in history:
+        if msg.get('role') == 'tool':
+            prev = cleaned[-1] if cleaned else None
+            if prev and (prev.get('role') == 'tool' or 
+                        (prev.get('role') == 'assistant' and prev.get('tool_calls'))):
+                cleaned.append(msg)
+            else:
+                orphan_count += 1
+        else:
+            cleaned.append(msg)
+    if orphan_count > 0:
+        print(f"⚠️ 清理了 {orphan_count} 条孤立tool消息")
+    history = cleaned
+    
+    # 按逻辑轮分组（解决tool消息导致的轮计数错乱）
+    rounds = group_by_rounds(history)
+    total_rounds = len(rounds)
+    
+    state = await get_session_cache_state(session_id)
+    summary_parts = state['summary_parts']
+    a_start_round = state['a_start_round']
+    
+    if total_rounds < X:
+        return await _build_basic_cached(
+            history, base_prompt, user_message, current_user_msg,
+            summary_parts, cognitive_text, memory_text, drives_text,
+        )
+    
+    # 计算A/B区（按逻辑轮切片）
+    a_end_round = a_start_round + X
+    a_round_groups = rounds[a_start_round : a_end_round]
+    b_round_groups = rounds[a_end_round :]
+    a_msgs = [msg for rnd in a_round_groups for msg in rnd]
+    b_msgs = [msg for rnd in b_round_groups for msg in rnd]
+    b_rounds_count = len(b_round_groups)
+    
+    rotation_count = 0
+    max_rotations = CACHE_MAX_ROTATIONS
+    defer_rotation_for_tool_tail = has_closed_tool_tail(history)
+    if defer_rotation_for_tool_tail and _should_rotate(b_rounds_count, X, a_msgs):
+        print("🔧 工具结果正在回传，暂缓轮转以保留完整工具链")
+    while (
+        not defer_rotation_for_tool_tail
+        and _should_rotate(b_rounds_count, X, a_msgs)
+        and rotation_count < max_rotations
+    ):
+        if CACHE_SUMMARY_MODEL:
+            _schedule_partition_summary(
+                session_id, a_msgs, a_start_round, summary_parts
+            )
+            break
+        rotation_count += 1
+        trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{CACHE_PARTITION_WINDOW}分钟窗口"
+        print(f"🔄 轮转#{rotation_count}: session={session_id}, {trigger_info}")
+        
+        a_start_round += X
+        a_end_round = a_start_round + X
+        a_round_groups = rounds[a_start_round : a_end_round]
+        b_round_groups = rounds[a_end_round :]
+        a_msgs = [msg for rnd in a_round_groups for msg in rnd]
+        b_msgs = [msg for rnd in b_round_groups for msg in rnd]
+        b_rounds_count = len(b_round_groups)
+    
+    if rotation_count > 0:
+        await save_session_cache_state(session_id, summary_parts, a_start_round)
+        summary_total = sum(len(p) for p in summary_parts)
+        print(f"🔄 轮转完成(共{rotation_count}次): 摘要{len(summary_parts)}段/{summary_total}字, A区{len(a_msgs)}条, B区{len(b_msgs)}条")
+    
+    # 拼装messages
+    result = []
+    if base_prompt:
+        result.append({
+            "role": "system",
+            "content": [{"type": "text", "text": base_prompt, "cache_control": make_cache_control()}]
+        })
+    
+    # 摘要区（多block，尾部追加模式）
+    if summary_parts:
+        blocks = [{"type": "text", "text": "[以下是之前对话的摘要，帮助你回忆上下文]"}]
+        for i, part in enumerate(summary_parts):
+            item = {"type": "text", "text": part}
+            if i == len(summary_parts) - 1:
+                item["cache_control"] = make_cache_control()
+            blocks.append(item)
+        result.append({"role": "user", "content": blocks})
+        result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
+    
+    # A区：剥离tool消息和tool_calls，只保留有文本的user/assistant（节省上下文）
+    cleaned_a = []
+    for msg in a_msgs:
+        if msg.get('role') == 'tool':
+            continue
+        m = {k: v for k, v in msg.items() if k not in ('created_at', 'tool_calls')}
+        if m.get('role') == 'assistant' and not (m.get('content') or '').strip():
+            continue
+        cleaned_a.append(m)
+    
+    # A区：从末尾往前找第一条非tool消息打BP
+    for j in range(len(cleaned_a) - 1, -1, -1):
+        if cleaned_a[j].get('role') != 'tool' and _apply_breakpoint(cleaned_a[j]):
+            break
+    
+    for m in cleaned_a:
+        result.append(m)
+    
+    # B区：先构建去掉created_at的副本，再从末尾往前打BP
+    b_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in b_msgs]
+    
+    for j in range(len(b_cleaned) - 1, -1, -1):
+        if b_cleaned[j].get('role') != 'tool' and _apply_breakpoint(b_cleaned[j]):
+            break
+    
+    for m in b_cleaned:
+        result.append(m)
+    
+    if current_user_msg:
+        parts = []
+        if cognitive_text:
+            parts.append(cognitive_text)
+        parts.append(build_time_injection())
+        if memory_text:
+            parts.append(memory_text)
+        if drives_text:
+            parts.append(drives_text)
+        result.append(_assemble_current_user_message(parts, current_user_msg['content']))
+
+    bp_count = 1 + (1 if summary_parts else 0) + (1 if cleaned_a else 0) + (1 if b_msgs else 0)
+    summary_total = sum(len(p) for p in summary_parts)
+    tool_stripped = len(a_msgs) - len(cleaned_a)
+    a_info = f"A区{len(cleaned_a)}条({len(a_round_groups)}轮)" + (f"[剥离{tool_stripped}条tool]" if tool_stripped else "")
+    print(f"🔒 分区缓存: BP×{bp_count} | 摘要{'有' if summary_parts else '无'}({len(summary_parts)}段/{summary_total}字) | {a_info} | B区{len(b_msgs)}条({b_rounds_count}轮) | 总{len(result)}条messages")
+    return result
+
+
+async def _build_basic_cached(
+    history: list,
+    base_prompt: str,
+    user_message: str,
+    current_user_msg: dict,
+    summary_parts: list = None,
+    cognitive_text: str = "",
+    memory_text: str = "",
+    drives_text: str = "",
+) -> list:
+    """基础版prompt caching（历史不够分区时的降级模式）"""
+    summary_parts = summary_parts or []
+    result = []
+    if base_prompt:
+        result.append({
+            "role": "system",
+            "content": [{"type": "text", "text": base_prompt, "cache_control": make_cache_control()}]
+        })
+
+    # 新建/继承的对话线在历史不足 X 轮时也必须读到继承摘要。
+    # 否则 dashboard 和 DB 都显示摘要存在，但首轮请求不会注入。
+    if summary_parts:
+        blocks = [{"type": "text", "text": "[以下是之前对话的摘要，帮助你回忆上下文]"}]
+        for i, part in enumerate(summary_parts):
+            item = {"type": "text", "text": part}
+            if i == len(summary_parts) - 1:
+                item["cache_control"] = make_cache_control()
+            blocks.append(item)
+        result.append({"role": "user", "content": blocks})
+        result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
+    
+    h_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in history]
+    
+    # 从末尾往前找第一条非tool消息打BP
+    for j in range(len(h_cleaned) - 1, -1, -1):
+        if h_cleaned[j].get('role') != 'tool' and _apply_breakpoint(h_cleaned[j]):
+            break
+    
+    for m in h_cleaned:
+        result.append(m)
+    
+    if current_user_msg:
+        parts = []
+        if cognitive_text:
+            parts.append(cognitive_text)
+        parts.append(build_time_injection())
+        if memory_text:
+            parts.append(memory_text)
+        if drives_text:
+            parts.append(drives_text)
+        result.append(_assemble_current_user_message(parts, current_user_msg['content']))
+
+    summary_total = sum(len(p) for p in summary_parts)
+    bp_count = 1 + (1 if summary_parts else 0) + (1 if history else 0)
+    print(f"🔒 基础缓存(降级): BP×{bp_count} | 摘要{'有' if summary_parts else '无'}({len(summary_parts)}段/{summary_total}字) | 历史{len(history)}条 | 总{len(result)}条messages")
+    return result
+
+
+async def build_memory_text(user_message: str) -> dict:
+    """搜索记忆并格式化为注入文本（分区缓存模式用）。
+
+    返回 {"text": 注入文本, "memory_ids": 本次检索到的记忆 ID}，
+    供认知注入按当前话题做证据关联筛选（零额外检索成本）。
+    """
+    try:
+        direct_entities = await find_directly_mentioned_entities(user_message)
+        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT) if MAX_MEMORIES_INJECT > 0 else []
+        if not memories and not direct_entities:
+            return {"text": "", "memory_ids": []}
+        
+        entity_map = {
+            mem["id"]: [
+                entity for entity in mem.get("entities", [])
+                if entity.get("retrieval_status") == "active"
+            ]
+            for mem in memories
+        }
+        memory_lines = []
+        for mem in memories:
+            date_str = ""
+            layer_name = {1: "原始事实", 2: "叙述事件", 3: "核心记忆", 4: "推断记忆"}.get(mem.get("layer", 1), "记忆")
+            if mem.get("created_at"):
+                try:
+                    utc_str = str(mem['created_at'])[:19]
+                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
+                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
+                except:
+                    date_str = f"[{str(mem['created_at'])[:10]}] "
+            names = [entity["name"] for entity in entity_map.get(mem["id"], [])]
+            entity_suffix = f" [相关实体: {', '.join(names)}]" if names else ""
+            memory_lines.append(f"- [{layer_name}] {date_str}{mem['content']}{entity_suffix}")
+        
+        entity_overview = await _build_entity_overview(memories, user_message, direct_entities)
+        entity_block = f"<matched_entities>\n{entity_overview}\n</matched_entities>\n" if entity_overview else ""
+        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        return {
+            "text": (
+                "<retrieved_memories>\n"
+                "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
+                + entity_block
+                + "\n".join(memory_lines)
+                + "\n</retrieved_memories>"
+            ),
+            "memory_ids": [mem["id"] for mem in memories],
+        }
+    except Exception as e:
+        print(f"⚠️ 记忆检索失败: {e}")
+        return {"text": "", "memory_ids": []}
+
+
+async def build_cognitive_text(user_message: str = "", related_memory_ids=None) -> str:
+    """Format confirmed active cognition for chat requests.
+
+    全量注入：认知是独立于当前话题的抽象层（性格/价值观/习惯/情绪模式/关系模式），
+    每轮完整呈现，不做检索筛选。只注入"人工审核过"的卡（created_by <> 'auto'）——
+    AI 自动生成的认知一律先进待确认队列，确认后才生效。`user_message` /
+    `related_memory_ids` 参数保留仅为兼容旧调用方，实际被忽略。
+    """
+    try:
+        return format_cognitive_items_for_prompt(
+            await list_cognitive_items(active_only=True, reviewed_only=True)
+        )
+    except Exception as e:
+        print(f"⚠️ 认知模型读取失败: {e}")
+        return ""
+
+
+# ============================================================
+# 后台记忆处理
+# ============================================================
+
+async def apply_entity_card_suggestions(memory_id: int, entities: list, messages: list) -> dict:
+    """Apply entity-card snapshot suggestions produced by the same extraction call.
+
+    Harness gate (background path only, never on the chat request path):
+      - verbatim-provable user facts → 'direct' snapshot on the linked entity card;
+      - same-date-as-tail conflicts, inferred content, and anything not provable
+        verbatim → pending proposal awaiting human confirmation.
+    Entities that did not get persisted (one-off events, weak candidates) have no
+    card and are skipped — a one-off event never creates a card by itself.
+    """
+    suggestions = [
+        entity for entity in (entities or [])
+        if isinstance(entity, dict) and entity.get("snapshot")
+    ]
+    if not suggestions:
+        return {"accepted": 0, "proposals": 0}
+    try:
+        linked = await get_entities_for_memory_ids([memory_id])
+    except Exception as exc:
+        print(f"⚠️ 实体卡建议：读取记忆 {memory_id} 的关联实体失败: {exc}")
+        return {"accepted": 0, "proposals": 0}
+    entity_ids = {}
+    for linked_entity in linked.get(memory_id, []):
+        key = _db_module.normalize_entity_name(linked_entity.get("name") or "")
+        if key:
+            entity_ids.setdefault(key, linked_entity["id"])
+    accepted = 0
+    proposals = 0
+    for entity in suggestions:
+        snapshot = entity.get("snapshot") or {}
+        entity_id = entity_ids.get(_db_module.normalize_entity_name(entity.get("name") or ""))
+        if entity_id is None:
+            continue  # 未落库的实体（一次性事件/弱候选）没有卡
+        verdict = classify_snapshot_suggestion(snapshot, messages)
+        if verdict[0] == "accept":
+            _, message_id, fact_date = verdict
+            try:
+                result = await apply_entity_snapshot(
+                    entity_id, snapshot.get("state"), fact_date,
+                    memory_id, message_id, source="direct", force=False,
+                )
+            except Exception as exc:
+                print(f"⚠️ 实体卡快照写入失败: {exc}")
+                continue
+            if result.get("status") == "conflict":
+                proposals += 1
+                try:
+                    await create_entity_card_proposal(
+                        entity_id, snapshot.get("state"), fact_date,
+                        memory_id, message_id, "user", "与既有快照同日冲突，需人工确认",
+                    )
+                except Exception as exc:
+                    print(f"⚠️ 实体卡冲突提案创建失败: {exc}")
+            elif result.get("status") == "ok":
+                accepted += 1
+            # duplicate → 已存在相同快照，无需操作
+        else:
+            proposals += 1
+            try:
+                await create_entity_card_proposal(
+                    entity_id, snapshot.get("state"), snapshot.get("fact_date"),
+                    memory_id, None, "user", verdict[1],
+                )
+            except Exception as exc:
+                print(f"⚠️ 实体卡提案创建失败: {exc}")
+    if accepted or proposals:
+        print(f"📇 实体卡更新: {accepted} 条已直接入卡，{proposals} 条转为待确认提案")
+    return {"accepted": accepted, "proposals": proposals}
+
+
+async def apply_event_state_changes(memory_id: int, state_changes: list, default_date: str = "") -> dict:
+    """Write event-extracted entity state changes to entity card snapshots.
+
+    事件层取代碎片层成为实体状态的来源：合并事件时模型提炼的 state_changes，
+    在这里映射到已关联的实体并写入实体卡快照。fact_date 缺省时用事件日期；
+    与既有快照同日冲突时转待确认提案（与手动添加走同一 Harness 语义）。
+    """
+    if not memory_id or not state_changes:
+        return {"accepted": 0, "proposals": 0, "skipped": 0}
+    try:
+        linked = await get_entities_for_memory_ids([memory_id])
+    except Exception as exc:
+        print(f"⚠️ 事件状态写卡：读取记忆 {memory_id} 的关联实体失败: {exc}")
+        return {"accepted": 0, "proposals": 0, "skipped": 0}
+    entity_ids = {}
+    for linked_entity in linked.get(memory_id, []):
+        key = _db_module.normalize_entity_name(linked_entity.get("name") or "")
+        if key:
+            entity_ids.setdefault(key, linked_entity["id"])
+    accepted = 0
+    proposals = 0
+    skipped = 0
+    for change in state_changes:
+        if not isinstance(change, dict):
+            skipped += 1
+            continue
+        raw_name = str(change.get("entity") or "").strip()
+        state = " ".join(str(change.get("state") or "").split()).strip()
+        entity_key = _db_module.normalize_entity_name(raw_name)
+        entity_id = entity_ids.get(entity_key)
+        if entity_id is None and len(entity_key.replace(" ", "")) >= 2:
+            # 模型可能只在状态里提到实体、忘了放进 entities：自动挂一个身份再写卡
+            try:
+                await link_memory_entities(memory_id, [{"name": raw_name, "type": "other"}])
+                refreshed = await get_entities_for_memory_ids([memory_id])
+                for linked_entity in refreshed.get(memory_id, []):
+                    key = _db_module.normalize_entity_name(linked_entity.get("name") or "")
+                    if key:
+                        entity_ids.setdefault(key, linked_entity["id"])
+                entity_id = entity_ids.get(entity_key)
+            except Exception as exc:
+                print(f"⚠️ 事件状态写卡：自动挂接实体失败: {exc}")
+        if entity_id is None or not state:
+            skipped += 1
+            continue
+        fact_date = str(change.get("fact_date") or "").strip() or default_date
+        user_view = str(change.get("user_view") or "").strip()
+        ai_view = str(change.get("ai_view") or "").strip()
+        try:
+            result = await apply_entity_snapshot(
+                entity_id, state, fact_date,
+                memory_id, None, source="confirmed", force=False,
+                user_view=user_view, ai_view=ai_view,
+            )
+        except Exception as exc:
+            print(f"⚠️ 事件状态快照写入失败: {exc}")
+            skipped += 1
+            continue
+        if result.get("status") == "conflict":
+            proposals += 1
+            try:
+                await create_entity_card_proposal(
+                    entity_id, state, fact_date,
+                    memory_id, None, "event", "与既有快照同日冲突，需人工确认",
+                    user_view=user_view, ai_view=ai_view,
+                )
+            except Exception as exc:
+                print(f"⚠️ 事件状态冲突提案创建失败: {exc}")
+        elif result.get("status") == "ok":
+            accepted += 1
+        # duplicate → 已存在相同快照，无需操作
+    if accepted or proposals:
+        print(f"📇 事件实体状态写卡: {accepted} 条已入卡，{proposals} 条转待确认提案，{skipped} 条跳过")
+    return {"accepted": accepted, "proposals": proposals, "skipped": skipped}
+
+
+async def commit_response_state(
+    session_id: str,
+    current_block: tuple,
+    assistant_msg: str,
+    assistant_tool_calls,
+    assistant_reasoning,
+    model: str,
+    skip: bool,
+):
+    """Durably stage a tool step or atomically commit one completed logical round."""
+    if skip:
+        return None, None
+
+    # Ordinary chat rounds do not depend on the temporary tool-workflow table.
+    # Only a tool-result request can be completing a previously staged chain.
+    has_tool_results = any(message.get("role") == "tool" for message in current_block)
+    pending = await get_pending_tool_workflow(session_id) if has_tool_results else None
+    pending_messages = list(pending.get("messages") or []) if pending else []
+    workflow_id = pending.get("workflow_id") if pending else str(uuid.uuid4())
+    block = list(current_block)
+
+    if pending_messages and block and all(m.get("role") == "tool" for m in block):
+        block = pending_messages + block
+
+    plan = make_persistence_plan(
+        session_id, tuple(block), assistant_msg,
+        assistant_tool_calls, assistant_reasoning, skip,
+    )
+    async def with_db_retry(operation, label: str):
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"[gateway-state] session={session_id} workflow={workflow_id} "
+                    f"state={label}_retry attempt={attempt} type={type(exc).__name__}",
+                    flush=True,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(0.1 * attempt)
+        raise last_error
+
+    if assistant_tool_calls:
+        expected_ids = [
+            call.get("id") for call in assistant_tool_calls
+            if isinstance(call, dict) and call.get("id")
+        ]
+        await with_db_retry(
+            lambda: stage_tool_workflow(
+                session_id, workflow_id, list(plan.messages), expected_ids,
+            ),
+            "workflow_stage",
+        )
+        print(
+            f"[gateway-state] session={session_id} workflow={workflow_id} "
+            f"state=awaiting_tool_results calls={len(expected_ids)}",
+            flush=True,
+        )
+        return None, None
+
+    if not plan.completed_round:
+        return None, None
+
+    result = await with_db_retry(
+        lambda: persist_conversation_batch(
+            session_id, list(plan.messages), model,
+            workflow_id=pending.get("workflow_id") if pending else None,
+        ),
+        "conversation_commit",
+    )
+    print(
+        f"[gateway-state] session={session_id} workflow={workflow_id} "
+        f"state=conversation_committed inserted={result['inserted']} rerolled={result['rerolled']}",
+        flush=True,
+    )
+    return plan, result
+
+
+async def process_memories_background(
+    session_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    model: str,
+    skip_conversation_log: bool = False,
+    assistant_tool_calls: list = None,
+    persistence_plan=None,
+    persisted_result=None,
+):
+    """
+    后台异步：存储对话 + 提取记忆（不阻塞主流程）
+    记忆提取受 MEMORY_EXTRACT_INTERVAL 控制：
+    - 0: 禁用自动提取
+    - 1: 每轮提取（默认）
+    - N: 每条对话线各自累计 N 轮后提取一次
+    对话记录始终保存，不受间隔影响（除非 skip_conversation_log=True）。
+    
+    skip_conversation_log: 跳过对话存储（标题生成等辅助请求时使用）
+    assistant_tool_calls: response中assistant的工具调用列表（如果有）
+    """
+    extraction_claim = None
+
+    try:
+        # Debug: 打印存储分支判断依据
+        print(
+            f"💾 process_memories_background: user_msg={bool(user_msg)}, "
+            f"assistant_tool_calls={len(assistant_tool_calls) if assistant_tool_calls else 0}, "
+            f"skip={skip_conversation_log}"
+        )
+
+        # Tool-call-only responses are an in-flight workflow, not durable history.
+        if should_defer_extraction(assistant_tool_calls):
+            print("⏭️  工具链尚未完成，等待最终回答后再整批持久化")
+            return
+
+        if not skip_conversation_log and (
+            persistence_plan is None or not persistence_plan.completed_round
+        ):
+            print("⏭️  本轮尚未完整，不持久化")
+            return
+
+        progress_ready = False
+        should_track_progress = (
+            not skip_conversation_log
+            and MEMORY_EXTRACT_ENABLED
+            and MEMORY_EXTRACT_INTERVAL > 0
+        )
+        if should_track_progress:
+            try:
+                # 必须在本轮消息写入前建立基线，避免首次部署时重放旧历史。
+                await ensure_memory_extraction_state(session_id)
+                progress_ready = True
+            except Exception as e:
+                print(f"⚠️ 初始化对话线 {session_id} 的记忆提取进度失败: {e}")
+
+        completed_round = False
+
+        # 1. 存储对话记录（除非明确跳过）
+        if skip_conversation_log:
+            print(f"⏭️  跳过对话存储（辅助请求）")
+        else:
+            if persistence_plan is None:
+                print("⚠️ 缺少持久化方案，本轮不写入对话", flush=True)
+                return
+            persist_result = persisted_result or await persist_conversation_batch(
+                persistence_plan.session_id, list(persistence_plan.messages), model,
+            )
+            completed_round = (
+                persistence_plan.completed_round
+                and persist_result["inserted"] > 0
+                and not persist_result["rerolled"]
+            )
+            print(
+                "💾 持久化方案: "
+                f"写入{persist_result['inserted']}条"
+                + ("，重新生成覆盖" if persist_result["rerolled"] else "")
+            )
+
+        if skip_conversation_log:
+            return
+
+        # 2. 检查是否需要提取记忆
+        if not MEMORY_EXTRACT_ENABLED:
+            print(f"⏭️  记忆提取已关闭（MEMORY_EXTRACT_ENABLED=false）")
+            return
+        
+        if MEMORY_EXTRACT_INTERVAL == 0:
+            print(f"⏭️  记忆自动提取已禁用，跳过")
+            return
+
+        if not completed_round:
+            print("⏭️  本次没有形成新的完整对话轮，不累计记忆提取进度")
+            return
+
+        if not progress_ready:
+            print(f"⚠️ 对话线 {session_id} 的持久化进度不可用，本轮不执行记忆提取")
+            return
+
+        claim_token = str(uuid.uuid4())
+        extraction_claim = await record_memory_extraction_round(
+            session_id,
+            MEMORY_EXTRACT_INTERVAL,
+            claim_token,
+        )
+        if not extraction_claim["should_extract"]:
+            print(
+                f"⏭️  对话线 {session_id} 的记忆提取进度 "
+                f"{extraction_claim['pending_rounds']}/{MEMORY_EXTRACT_INTERVAL}"
+            )
+            return
+
+        print(
+            f"📝 对话线 {session_id} 已累计 {extraction_claim['claimed_rounds']} 轮，"
+            "执行持久化批次提取"
+        )
+
+        # 3. 获取已有记忆，传给提取模型做对比去重
+        existing = await get_recent_memories(limit=80)
+        existing_contents = [r["content"] for r in existing]
+
+        # 4. 只读取该对话线上次成功游标之后、本次 claim 边界以内的消息。
+        messages_for_extraction = await get_messages_for_memory_extraction(
+            session_id,
+            extraction_claim["last_extracted_message_id"],
+            extraction_claim["through_message_id"],
+        )
+        if not messages_for_extraction:
+            print(f"ℹ️ 对话线 {session_id} 本批次没有可提取的 user/assistant 消息，直接推进游标")
+            await complete_memory_extraction(
+                session_id,
+                extraction_claim["claim_token"],
+                extraction_claim["through_message_id"],
+                extraction_claim["claimed_rounds"],
+            )
+            extraction_claim = None
+            return
+
+        # 认知纠正信号：用户在聊天里纠正既往认知 → 记录，供认知审视优先处理
+        # （零额外 LLM 成本，纯关键词判定）。
+        try:
+            for msg in messages_for_extraction:
+                if msg.get("role") == "user" and _is_cognitive_correction(msg.get("content")):
+                    await record_cognitive_correction(str(msg.get("content") or ""))
+        except Exception as exc:
+            print(f"⚠️ 认知纠正信号检测失败: {exc}")
+
+        print(
+            f"📝 提取对话线 {session_id} 尚未处理的 {extraction_claim['claimed_rounds']} 轮"
+            f"（{len(messages_for_extraction)} 条 user/assistant 消息，"
+            f"ID {extraction_claim['last_extracted_message_id'] + 1}"
+            f"-{extraction_claim['through_message_id']}）"
+        )
+
+        # 已有实体清单：让提取模型复用规范名，避免为同一事物新建重复实体。
+        # 拉取失败不阻塞提取，回退为 None（不带 roster 照常提取）。
+        try:
+            entity_roster = await list_entity_roster()
+        except Exception:
+            entity_roster = None
+            print("⚠️ 已有实体清单拉取失败，本次提取不带 roster")
+
+        new_memories = await extract_memories(
+            messages_for_extraction,
+            existing_memories=existing_contents,
+            existing_entities=entity_roster,
+        )
+        if new_memories is None:
+            await release_memory_extraction_claim(
+                session_id,
+                extraction_claim["claim_token"],
+            )
+            extraction_claim = None
+            print(f"⚠️ 对话线 {session_id} 提取失败（{_memory_extractor_module.MEMORY_EXTRACTION_LAST_ERROR or '原因未知'}），进度保留，等待下轮重试")
+            return
+        
+        # 过滤垃圾记忆（不靠模型自觉，硬过滤）
+        META_BLACKLIST = [
+            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取",
+            "记忆遗漏", "尚未被记录", "写入不完整", "检索功能",
+            "系统没有返回", "关键词匹配", "语义匹配", "语义检索",
+            "阈值", "数据库", "seed", "导入", "部署",
+            "bug", "debug", "端口", "网关",
+        ]
+        
+        filtered_memories = []
+        for mem in new_memories:
+            content = mem["content"]
+            if any(kw in content for kw in META_BLACKLIST):
+                print(f"🚫 过滤掉meta记忆: {content[:60]}...")
+                continue
+            filtered_memories.append(mem)
+        
+        # 本次已认领批次的用户消息：作为新记忆回链到原始对话的证据。
+        batch_user_ids = [
+            msg["id"] for msg in (messages_for_extraction or [])
+            if msg.get("role") == "user" and msg.get("id")
+        ]
+        for mem in filtered_memories:
+            memory_id = await save_memory(
+                content=mem["content"],
+                importance=mem["importance"],
+                source_session=session_id,
+            )
+            await link_memory_entities(memory_id, mem.get("entities", []))
+            try:
+                await record_memory_evidence(memory_id, batch_user_ids)
+            except Exception as exc:
+                print(f"⚠️ 记忆证据回链失败（记忆 {memory_id}）: {exc}")
+            await mark_memories_entity_scanned([memory_id])
+            # 规则式自动补关联：扫描碎片文本，命中已有实体名/别名（≥2字）就补挂关联（零 LLM）
+            try:
+                await auto_link_entities_by_name(memory_id, mem["content"])
+            except Exception as exc:
+                print(f"⚠️ 碎片规则补关联失败（记忆 {memory_id}）: {exc}")
+
+        progress_completed = await complete_memory_extraction(
+            session_id,
+            extraction_claim["claim_token"],
+            extraction_claim["through_message_id"],
+            extraction_claim["claimed_rounds"],
+        )
+        extraction_claim = None
+        if not progress_completed:
+            print(f"⚠️ 对话线 {session_id} 的提取 claim 已失效，游标未推进")
+
+        if filtered_memories:
+            total = await get_all_memories_count()
+            print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
+
+    except Exception as e:
+        if extraction_claim and extraction_claim.get("claim_token"):
+            try:
+                await release_memory_extraction_claim(
+                    session_id,
+                    extraction_claim["claim_token"],
+                )
+            except Exception as release_error:
+                print(f"⚠️ 释放对话线 {session_id} 的提取 claim 失败: {release_error}")
+        print(f"⚠️  后台记忆处理失败: {e}")
+
+
+# ============================================================
+# API 接口
+# ============================================================
+
+@app.get("/")
+async def health_check():
+    """健康检查"""
+    memory_count = 0
+    if MEMORY_ENABLED:
+        try:
+            memory_count = await get_all_memories_count()
+        except:
+            pass
+    
+    return {
+        "status": "running",
+        "gateway": "AI Memory Gateway v2.0",
+        "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
+        "system_prompt_length": len(SYSTEM_PROMPT),
+        "memory_enabled": MEMORY_ENABLED,
+        "memory_count": memory_count,
+        "memory_extract_interval": MEMORY_EXTRACT_INTERVAL,
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
+    """模型列表（让客户端不报错）"""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": DEFAULT_MODEL,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "ai-memory-gateway",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """核心转发接口"""
+    if not API_KEY:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "API_KEY 未设置，请在环境变量中配置"},
+        )
+    
+    try:
+        return await _chat_completions_inner(request)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": f"Gateway internal error: {type(e).__name__}: {e}", "type": "gateway_error"}},
+        )
+
+
+async def _chat_completions_inner(request: Request):
+    global PARTITION_SESSION_ID
+    request_id = str(uuid.uuid4())[:12]
+    print(f"[gateway-state] request={request_id} state=received", flush=True)
+    body = await request.json()
+    classified = classify_request(body.get("messages", []))
+    messages = [dict(message) for message in classified.ordinary_messages]
+    dynamic_environment = classified.dynamic_environment
+    body["messages"] = messages
+    if classified.invalid_dynamic_count:
+        print(
+            f"[warning] 忽略 {classified.invalid_dynamic_count} 个无效动态环境标记，原消息已保留",
+            flush=True,
+        )
+    if classified.stale_dynamic_count:
+        print(
+            f"[dynamic-environment] 已丢弃 {classified.stale_dynamic_count} 个过期动态环境快照",
+            flush=True,
+        )
+    
+    # ---------- 检测是否应跳过对话存储 ----------
+    # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。
+    explicit_skip = request.headers.get("X-Skip-Conversation-Log", "").lower() == "true"
+    auxiliary_title_request = _is_title_generation_request(messages)
+    skip_conversation_log = explicit_skip or auxiliary_title_request
+    if auxiliary_title_request:
+        print("⏭️  检测到标题生成请求：跳过分区缓存、记忆注入、对话存储和会话 Token 统计")
+    
+    # ---------- 提取用户最新消息 ----------
+    user_message = classified.latest_user_text
+    persistence_block = tuple(classified.current_block)
+    
+    # ---------- 检测工具调用消息 ----------
+    tool_messages = [
+        message for message in persistence_block
+        if message.get("role") == "tool"
+    ]
+    if tool_messages:
+        print(f"🔧 检测到 {len(tool_messages)} 条工具结果消息")
+    
+    # ---------- 解析稳定活动会话（独立于分区开关） ----------
+    session_id = get_active_session_id()
+    if (
+        not session_id
+        and persistence_block
+        and not skip_conversation_log
+        and MEMORY_ENABLED
+    ):
+        session_id = f"thread-{str(uuid.uuid4())[:8]}"
+        PARTITION_SESSION_ID = session_id
+        await set_gateway_config("partition_session_id", session_id)
+        print(f"🔗 自动创建活跃对话线: {session_id}", flush=True)
+    if not session_id:
+        session_id = str(uuid.uuid4())[:8]
+
+    drives_user_message_id = ""
+    drives_run_id = ""
+    if drives.is_enabled() and user_message and not skip_conversation_log:
+        drives_user_message_id = f"gateway-{uuid.uuid4()}"
+        drives_run_id = f"{drives_user_message_id}:assistant"
+
+    system_task = asyncio.create_task(get_system_prompt())
+    drives_task = (
+        asyncio.create_task(drives.fetch_context())
+        if (
+            not CACHE_PARTITION_ENABLED
+            and drives.is_enabled()
+            and user_message
+            and not skip_conversation_log
+        )
+        else None
+    )
+    prepared_drives_text = ""
+    
+    # ---------- 分区缓存模式 ----------
+    if CACHE_PARTITION_ENABLED and not skip_conversation_log:
+        history_task = asyncio.create_task(
+            get_conversation_messages(
+                session_id, limit=10000, include_incomplete=False
+            )
+        )
+        try:
+            db_history = await history_task
+            db_msgs = []
+            for m in (db_history or []):
+                msg = db_row_to_message(m)
+                msg['created_at'] = m.get('created_at')  # 保留时间戳供分区时间窗口判断
+                db_msgs.append(msg)
+        except Exception as e:
+            print(f"[warning] 分区模式读取历史失败: {e}")
+            db_msgs = []
+
+        try:
+            pending_workflow = await get_pending_tool_workflow(session_id)
+        except Exception as exc:
+            print(f"[warning] 读取临时工具工作流失败: {type(exc).__name__}", flush=True)
+            pending_workflow = None
+        pending_msgs = list(pending_workflow.get("messages") or []) if pending_workflow else []
+        alignment_history = db_msgs + pending_msgs
+        reconciled = reconcile_partition_block(alignment_history, messages)
+        print(
+            "[message-align] "
+            f"client_roles={[m.get('role', '?') for m in messages if m.get('role') != 'system']} "
+            f"db_tail_roles={[m.get('role', '?') for m in db_msgs[-8:]]} "
+            f"pending_roles={[m.get('role', '?') for m in pending_msgs]} "
+            f"aligned={reconciled.aligned_count}@{reconciled.alignment_end} "
+            f"current_roles={[m.get('role', '?') for m in reconciled.provider_messages]} "
+            f"tool_chain={reconciled.is_tool_chain} "
+            f"tool_calls={sum(len(m.get('tool_calls') or []) for m in reconciled.provider_messages)} "
+            f"tool_results={sum(m.get('role') == 'tool' for m in reconciled.provider_messages)} "
+            f"result={reconciled.reason}",
+            flush=True,
+        )
+        if not reconciled.provider_messages:
+            # 只读诊断：只在将要 400 时触发。把数据库+待处理工作流的末几条与客户端
+            # 重放历史的对应 signature 打出来，用于定位是哪一种内容漂移导致对位失败
+            # （tool_call_id 被客户端重映射 / 工具回合"完成版 vs 待定版"/正文被变换）。
+            # 纯日志，不改变任何行为。
+            def _sig_probe(message: dict):
+                role = message.get("role", "?")
+                tool_call_id = message.get("tool_call_id", "")
+                calls = [
+                    c.get("id", "")
+                    for c in (message.get("tool_calls") or [])
+                    if isinstance(c, dict)
+                ]
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                content = (content or "").replace("\n", " ")[:60]
+                return (f"{role}|{tool_call_id}|{sorted(calls)}|{content}",)
+            align_probe = [m for m in alignment_history if m.get("role") != "system"][-6:]
+            client_probe = [
+                m for m in messages if m.get("role") != "system"
+            ][-len(align_probe):]
+            print(
+                "[message-align-reject] "
+                f"reason={reconciled.reason} "
+                f"align_tail={[x for m in align_probe for x in _sig_probe(m)]} "
+                f"client_tail={[x for m in client_probe for x in _sig_probe(m)]} "
+                f"client_last_role={(messages or [{}])[-1].get('role', '?')}",
+                flush=True,
+            )
+            if not system_task.done():
+                system_task.cancel()
+            await asyncio.gather(system_task, return_exceptions=True)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "无法识别本次客户端请求块，请检查消息角色和工具调用顺序",
+                        "type": "invalid_message_sequence",
+                        "reason": reconciled.reason,
+                    }
+                },
+            )
+
+        client_new_msgs = [
+            dict(message) for message in reconciled.provider_messages
+        ]
+        persistence_block = tuple(reconciled.persistence_messages)
+        user_message = reconciled.latest_user_text
+        if not user_message and pending_msgs:
+            user_message = next(
+                (m.get("content", "") for m in pending_msgs if m.get("role") == "user"),
+                "",
+            )
+        self_contained_tool_chain = reconciled.is_tool_chain
+        memory_task = asyncio.create_task(
+            build_memory_text(user_message)
+            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message
+            else asyncio.sleep(0, result={"text": "", "memory_ids": []})
+        )
+        drives_task = (
+            asyncio.create_task(drives.fetch_context())
+            if drives.is_enabled() and user_message
+            else None
+        )
+        gathered = await asyncio.gather(
+            system_task,
+            memory_task,
+            *(tuple([drives_task]) if drives_task else tuple()),
+            return_exceptions=True,
+        )
+        effective_system_prompt = gathered[0] if not isinstance(gathered[0], Exception) else ""
+        memory_result = gathered[1] if not isinstance(gathered[1], Exception) else {}
+        memory_text = memory_result.get("text", "") if isinstance(memory_result, dict) else ""
+        if drives_task:
+            prepared_drives_text = (
+                gathered[2] if not isinstance(gathered[2], Exception) else ""
+            )
+        # 认知全量注入：独立于记忆检索结果，只做 DB 读 + 内存格式化，零额外 LLM/向量成本。
+        try:
+            related_memory_ids = (
+                memory_result.get("memory_ids")
+                if isinstance(memory_result, dict)
+                else None
+            )
+            cognitive_text = await build_cognitive_text(user_message, related_memory_ids)
+        except Exception as exc:
+            print(f"⚠️ 认知注入构建失败: {exc}")
+            cognitive_text = ""
+
+        client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
+        db_last = alignment_history[-1] if alignment_history else None
+        db_expected_ids = {
+            tool_call.get("id")
+            for tool_call in (db_last.get("tool_calls", []) if db_last else [])
+            if tool_call.get("id")
+        }
+
+        if self_contained_tool_chain:
+            tool_ids = {tool.get("tool_call_id") for tool in client_tools}
+            if (
+                db_last
+                and db_last.get("role") == "assistant"
+                and tool_ids
+                and tool_ids == db_expected_ids
+            ):
+                client_new_msgs = client_tools
+                print(f"🔧 当前工具链已在DB中，保留{len(client_tools)}条tool结果")
+            else:
+                print(
+                    "🔧 请求内工具链闭合，保留完整客户端块："
+                    f"{len(client_new_msgs)}条消息 / {len(client_tools)}条tool"
+                )
+        if pending_msgs and client_new_msgs and all(
+            message.get("role") == "tool" for message in client_new_msgs
+        ):
+            client_new_msgs = [dict(message) for message in pending_msgs] + client_new_msgs
+            print(
+                f"[gateway-state] session={session_id} "
+                f"workflow={pending_workflow['workflow_id']} state=restored",
+                flush=True,
+            )
+        non_system_count = sum(1 for message in messages if message.get("role") != "system")
+        filtered_count = max(0, non_system_count - len(client_new_msgs))
+        if filtered_count:
+            print(f"🔧 去重: 过滤{filtered_count}条客户端历史，保留当前块{len(client_new_msgs)}条")
+        all_msgs = db_msgs + client_new_msgs
+
+        # ---------- 陈旧工具链自愈（请求侧，零DB写回） ----------
+        # 当前块被识别即可修复（普通 user 结尾或工具结果回传均可）：正在闭合的
+        # 链（DB 的 assistant + 本次 delta 的结果）在组装列表中必然闭合，zone 逻辑
+        # 自动保护；只有零结果的陈旧链（DB 里积累的悬挂链）会被中和。
+        # 部分闭合/错配/重复仍留给 validate_tool_sequence 严格把关。
+        if reconciled.provider_messages:
+            all_msgs, repair = repair_stale_tool_chains(all_msgs, len(client_new_msgs))
+            if repair.changed:
+                print(
+                    f"🧹 陈旧工具链自愈: 剥tool_calls×{repair.stripped_assistants} "
+                    f"删空assistant×{repair.dropped_assistants} "
+                    f"删无主tool×{repair.dropped_orphan_tools} "
+                    f"留校验×{repair.left_for_validator}",
+                    flush=True,
+                )
+        
+        # 同步更新tool_messages，避免process_memories_background存重复的旧tool
+        tool_messages = [
+            message for message in persistence_block
+            if message.get("role") == "tool"
+        ]
+        
+        print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
+        
+        partition_prompt = effective_system_prompt
+        if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
+            partition_prompt = (effective_system_prompt or "") + MEMORY_USAGE_GUIDE
+        partition_prompt = combine_system_prompt(
+            partition_prompt,
+            classified.client_system_prompts,
+        )
+        client_system_count = len(classified.client_system_prompts)
+        client_system_chars = len("\n\n".join(classified.client_system_prompts))
+        if client_system_count:
+            print(
+                "[client-system] 分区模式已保留"
+                f"{client_system_count}条客户端 system（共{client_system_chars}字）",
+                flush=True,
+            )
+        try:
+            messages = await build_partitioned_messages(
+                session_id, all_msgs, partition_prompt, user_message,
+                cognitive_text, memory_text, prepared_drives_text,
+            )
+        except Exception as exc:
+            print(
+                f"[gateway-state] request={request_id} session={session_id} "
+                f"state=partition_fallback type={type(exc).__name__}",
+                flush=True,
+            )
+            messages = [
+                {k: v for k, v in message.items() if k != "created_at"}
+                for message in all_msgs
+            ]
+            if partition_prompt:
+                messages.insert(0, {"role": "system", "content": partition_prompt})
+        body["messages"] = messages
+    
+    else:
+        # ---------- 原有逻辑：system prompt + 记忆注入 ----------
+        effective_system_prompt = await system_task
+        if not skip_conversation_log:
+            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
+                enhanced_prompt = await build_system_prompt_with_memories(user_message, effective_system_prompt)
+            else:
+                enhanced_prompt = effective_system_prompt
+
+            final_system_prompt = combine_system_prompt(
+                enhanced_prompt,
+                classified.client_system_prompts,
+            )
+            messages = [
+                dict(message)
+                for message in messages
+                if message.get("role") != "system"
+            ]
+            if final_system_prompt:
+                messages.insert(0, {
+                    "role": "system",
+                    "content": final_system_prompt,
+                })
+
+        # ---------- 陈旧工具链自愈（请求侧，零DB写回） ----------
+        # 门控与分区模式一致：当前块被识别即可修复（zone 逻辑保护活跃链）。
+        if classified.current_block:
+            messages, repair = repair_stale_tool_chains(
+                messages, len(classified.current_block)
+            )
+            if repair.changed:
+                print(
+                    f"🧹 陈旧工具链自愈: 剥tool_calls×{repair.stripped_assistants} "
+                    f"删空assistant×{repair.dropped_assistants} "
+                    f"删无主tool×{repair.dropped_orphan_tools} "
+                    f"留校验×{repair.left_for_validator}",
+                    flush=True,
+                )
+
+        body["messages"] = messages
+        if drives_task:
+            prepared_drives_text = await drives_task
+    
+    # ---------- 模型处理 ----------
+    model = body.get("model", DEFAULT_MODEL)
+    if not model:
+        model = DEFAULT_MODEL
+    body["model"] = model
+
+    removed_temperature = normalize_chat_request(body, API_BASE_URL)
+    if removed_temperature is not None:
+        print(
+            f"ℹ️  Moonshot {model} 不接受客户端 temperature={removed_temperature}，已移除并使用模型默认值",
+            flush=True,
+        )
+    
+    # ---------- cache_control 兼容性处理 ----------
+    if CACHE_PARTITION_ENABLED and not _is_anthropic_model(model):
+        _strip_cache_control(body.get("messages", []))
+
+    # ---------- 消息清洗：list类型content转纯文本 ----------
+    _sanitize_content_types(body.get("messages", []))
+
+    # ---------- Drivesoid 情感引擎：已在 build_partitioned_messages 内注入 ----------
+
+    # ---------- 客户端动态环境：所有转换完成后，仅注入 Provider 临时消息 ----------
+    if user_message and _inject_dynamic_environment(
+        body.get("messages", []),
+        dynamic_environment,
+        merge_with_user=_is_anthropic_model(model),
+    ):
+        print(
+            "[dynamic-environment] 动态环境快照已注入 Provider 临时消息"
+            + ("（已与真实 user 消息合并）" if _is_anthropic_model(model) else ""),
+            flush=True,
+        )
+
+    tool_sequence = validate_tool_sequence(body.get("messages", []))
+    if not tool_sequence.valid:
+        print(
+            "[message-sequence] invalid "
+            f"index={tool_sequence.index} "
+            f"role={tool_sequence.role or '?'} "
+            f"reason={tool_sequence.reason} "
+            f"pending_ids={list(tool_sequence.pending_ids)} "
+            f"tool_call_id={tool_sequence.tool_call_id or '-'}",
+            flush=True,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "工具调用消息顺序无效，请新建会话或清理损坏的会话尾部",
+                    "type": "invalid_message_sequence",
+                }
+            },
+        )
+
+    # ---------- 请求调试转储（排查缓存命中率） ----------
+    # 打印最终发给上游的逐条消息摘要；前缀对比默认开启，直接指出缓存断点。
+    safe_dump_request_debug(model, body.get("messages", []))
+
+    # ---------- 转发请求 ----------
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    # OpenRouter 需要的额外头
+    if "openrouter" in API_BASE_URL:
+        headers["HTTP-Referer"] = EXTRA_REFERER
+        headers["X-Title"] = EXTRA_TITLE
+    
+    is_stream = body.get("stream", False)
+    
+    # 强制流式传输（解决部分客户端不发stream=true的问题）
+    if FORCE_STREAM and not is_stream:
+        is_stream = True
+        body["stream"] = True
+        print(f"⚡ 强制开启流式传输（FORCE_STREAM=true）")
+    
+    # 注入推理参数（解决客户端走网关时不带reasoning参数的问题）
+    if REASONING_EFFORT and not skip_conversation_log:
+        # 统一用 reasoning_effort（Claude/OpenAI/Google Gemini OpenAI兼容端点都支持）
+        # 先删除客户端可能已带的值，确保用我们配置的
+        body.pop("reasoning_effort", None)
+        body.pop("google", None)
+        body["reasoning_effort"] = REASONING_EFFORT
+        print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
+    
+    print(f"📡 请求: model={model}, stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}", flush=True)
+    print(
+        f"[gateway-state] request={request_id} session={session_id} state=prepared",
+        flush=True,
+    )
+    
+    # 调试：打印请求体中的推理相关字段
+    debug_keys = {k: v for k, v in body.items() if k in ('reasoning_effort', 'google', 'reasoning')}
+    if debug_keys:
+        print(f"📡 推理字段: {debug_keys}", flush=True)
+    
+    if is_stream:
+        return StreamingResponse(
+            safe_stream_and_capture(
+                headers, body, session_id, user_message, model,
+                skip_conversation_log, persistence_block,
+                drives_user_message_id, drives_run_id, request_id,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    else:
+        async with httpx.AsyncClient(timeout=300) as client:
+            response = await client.post(API_BASE_URL, headers=headers, json=body)
+            
+            if response.status_code == 200:
+                print(
+                    f"[gateway-state] request={request_id} session={session_id} state=response_complete",
+                    flush=True,
+                )
+                try:
+                    resp_data = response.json()
+                except (TypeError, ValueError):
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": "Upstream returned invalid JSON",
+                                "type": "upstream_malformed_response",
+                            }
+                        },
+                    )
+                if not isinstance(resp_data, dict):
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": "Upstream returned a non-object JSON response",
+                                "type": "upstream_malformed_response",
+                            }
+                        },
+                    )
+                usage = resp_data.get("usage")
+                usage = usage if isinstance(usage, dict) else {}
+                if usage.get("total_tokens"):
+                    pt = usage.get("prompt_tokens", 0)
+                    hit = _usage_cache_hit(usage)
+                    print(
+                        f"📊 Token: {pt} + {usage.get('completion_tokens', 0)}"
+                        f" = {usage.get('total_tokens', 0)}"
+                        + (f"（缓存命中 {hit} / {pt} = {hit / pt * 100:.1f}%）" if pt and hit else ""),
+                        flush=True,
+                    )
+                assistant_msg = ""
+                assistant_tool_calls = None
+                assistant_reasoning = None
+                try:
+                    msg_obj = resp_data["choices"][0]["message"]
+                    if not isinstance(msg_obj, dict):
+                        raise TypeError("assistant_message_not_object")
+                    content = msg_obj.get("content")
+                    assistant_msg = content if isinstance(content, str) else ""
+                    tool_calls = msg_obj.get("tool_calls")
+                    if isinstance(tool_calls, list) and tool_calls:
+                        assistant_tool_calls = tool_calls
+                        print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
+                    reasoning = msg_obj.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        assistant_reasoning = reasoning
+                        print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
+                except (KeyError, IndexError, TypeError):
+                    pass
+
+                # reasoning-only 空响应：思考了但没正文也没工具调用（同上，非流式路径）
+                if assistant_reasoning and not assistant_msg and not assistant_tool_calls:
+                    _warn_empty_reasoning_response(session_id, body, len(assistant_reasoning))
+
+                if MEMORY_ENABLED and (user_message or tool_messages):
+                    async def persist_non_stream_response():
+                        persistence_plan, persisted_result = await commit_response_state(
+                            session_id, persistence_block, assistant_msg,
+                            assistant_tool_calls, assistant_reasoning, model,
+                            skip_conversation_log,
+                        )
+                        if persistence_plan:
+                            await process_memories_background(
+                                session_id, user_message, assistant_msg, model,
+                                assistant_tool_calls=assistant_tool_calls,
+                                persistence_plan=persistence_plan,
+                                persisted_result=persisted_result,
+                            )
+
+                    if assistant_tool_calls or tool_messages:
+                        try:
+                            await persist_non_stream_response()
+                        except Exception as exc:
+                            print(
+                                f"[gateway-state] session={session_id} "
+                                f"state=persistence_failed kind=tool type={type(exc).__name__}",
+                                flush=True,
+                            )
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "error": {
+                                        "message": "Gateway could not durably stage the tool workflow",
+                                        "type": "gateway_persistence_error",
+                                        "code": type(exc).__name__,
+                                    }
+                                },
+                            )
+                    else:
+                        _track_response_persistence(
+                            persist_non_stream_response(), session_id, "complete"
+                        )
+
+                # ---------- Drivesoid 情感引擎：回复后上报事件 ----------
+                if drives.is_enabled() and user_message and not skip_conversation_log:
+                    asyncio.create_task(drives.report_events(
+                        user_message,
+                        assistant_msg,
+                        user_message_id=drives_user_message_id,
+                        run_id=drives_run_id,
+                    ))
+
+                print(
+                    f"[gateway-state] request={request_id} session={session_id} state=delivered",
+                    flush=True,
+                )
+                return JSONResponse(status_code=200, content=resp_data)
+            else:
+                try:
+                    error_content = response.json()
+                except Exception:
+                    error_content = {"error": {"message": response.text[:500], "type": "upstream_error"}}
+                return JSONResponse(status_code=response.status_code, content=error_content)
+
+
+async def _iterate_upstream_with_heartbeat(response, interval_seconds: float = STREAM_HEARTBEAT_INTERVAL):
+    """Yield upstream bytes and SSE comments while the upstream is silent."""
+    iterator = response.aiter_bytes().__aiter__()
+    pending_chunk = None
+    received_first_chunk = False
+    try:
+        while True:
+            if pending_chunk is None:
+                pending_chunk = asyncio.create_task(anext(iterator))
+
+            done, _ = await asyncio.wait({pending_chunk}, timeout=interval_seconds)
+            if not done:
+                # Some OpenAI clients terminate when the first SSE body frame
+                # is synthetic. Let the real upstream establish the stream;
+                # heartbeats are safe only after at least one real event.
+                if received_first_chunk:
+                    yield b": keep-alive\n\n", True, None
+                continue
+
+            try:
+                chunk = pending_chunk.result()
+            except StopAsyncIteration:
+                return
+            pending_chunk = None
+            received_first_chunk = True
+            yield chunk, False, None
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+        yield _upstream_stream_error_event(exc), False, exc
+    except httpx.HTTPError as exc:
+        yield _upstream_stream_error_event(exc), False, exc
+    except Exception as exc:
+        print(
+            f"❌ 上游流迭代异常: type={type(exc).__name__}",
+            flush=True,
+        )
+        yield _upstream_stream_error_event(exc), False, exc
+    finally:
+        if pending_chunk is not None and not pending_chunk.done():
+            pending_chunk.cancel()
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await pending_chunk
+
+
+def _upstream_stream_error_event(exc: Exception) -> bytes:
+    error_payload = {
+        "error": {
+            "message": f"Upstream stream interrupted: {type(exc).__name__}",
+            "type": "upstream_stream_error",
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+def _upstream_http_error_event(status_code: int, raw_body: str) -> bytes:
+    """将上游非200响应（如纯文本 "Bad Gateway"）转换为 OpenAI 兼容的 SSE 错误事件。
+
+    直接透传原文会导致客户端把 "Bad Gateway" 当 JSON 解析而崩溃。
+    若上游返回的是合法 OpenAI 风格 JSON 错误，则复用其 message/type。
+    """
+    message = raw_body or f"Upstream returned HTTP {status_code}"
+    error_type = "upstream_http_error"
+    if raw_body:
+        try:
+            parsed = json.loads(raw_body)
+            err = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+            if isinstance(err, dict):
+                message = err.get("message") or message
+                error_type = err.get("type") or error_type
+        except (ValueError, TypeError):
+            pass
+    error_payload = {
+        "error": {
+            "message": f"HTTP {status_code}: {message}",
+            "type": error_type,
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+class UpstreamSSEFormatError(ValueError):
+    """The upstream did not produce one valid OpenAI-style SSE event."""
+
+
+def _pop_sse_event(buffer: bytearray) -> bytes | None:
+    """Remove one complete SSE event from a raw byte buffer."""
+    delimiters = [
+        (index, 2)
+        for index in (buffer.find(b"\n\n"),)
+        if index >= 0
+    ] + [
+        (index, 4)
+        for index in (buffer.find(b"\r\n\r\n"),)
+        if index >= 0
+    ]
+    if not delimiters:
+        return None
+    index, length = min(delimiters)
+    event = bytes(buffer[:index])
+    del buffer[:index + length]
+    return event
+
+
+def _normalize_upstream_sse_event(event: bytes) -> tuple[bytes, dict | None]:
+    """Validate and canonicalize one SSE event before it reaches the client."""
+    try:
+        lines = event.decode("utf-8").replace("\r\n", "\n").split("\n")
+    except UnicodeDecodeError as exc:
+        raise UpstreamSSEFormatError("non_utf8_event") from exc
+
+    headers = []
+    data_lines = []
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith(":"):
+            headers.append(line)
+            continue
+        if ":" not in line:
+            raise UpstreamSSEFormatError("invalid_sse_line")
+        field, value = line.split(":", 1)
+        value = value[1:] if value.startswith(" ") else value
+        if field == "data":
+            data_lines.append(value)
+        else:
+            headers.append(line)
+
+    if not data_lines:
+        return ("\n".join(headers) + "\n\n").encode("utf-8"), None
+
+    payload = "\n".join(data_lines)
+    if payload == "[DONE]":
+        return b"data: [DONE]\n\n", None
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise UpstreamSSEFormatError("invalid_json_data") from exc
+    if not isinstance(decoded, dict):
+        raise UpstreamSSEFormatError("non_object_json_data")
+
+    prefix = "\n".join(headers)
+    if prefix:
+        prefix += "\n"
+    return f"{prefix}data: {payload}\n\n".encode("utf-8"), decoded
+
+
+def _upstream_malformed_sse_event(reason: str) -> bytes:
+    error_payload = {
+        "error": {
+            "message": "Upstream emitted a malformed SSE event",
+            "type": "upstream_malformed_sse",
+            "code": reason,
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+def _persistence_error_event(exc: Exception) -> bytes:
+    payload = {
+        "error": {
+            "message": "Gateway received the complete response but could not commit the conversation",
+            "type": "gateway_persistence_error",
+            "code": type(exc).__name__,
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+
+async def safe_stream_and_capture(*args, **kwargs):
+    """Keep transport failures inside the already-started SSE response."""
+    session_id = args[2] if len(args) > 2 else kwargs.get("session_id", "")
+    done_delivered = False
+    try:
+        async for chunk in stream_and_capture(*args, **kwargs):
+            if b"data: [DONE]" in chunk:
+                done_delivered = True
+            yield chunk
+    except asyncio.CancelledError:
+        print(f"ℹ️  客户端断开，已取消上游流: session={session_id}", flush=True)
+        raise
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+        print(
+            f"❌ 上游流建立或关闭失败: session={session_id}, "
+            f"type={type(exc).__name__}, detail={exc}",
+            flush=True,
+        )
+        yield _upstream_stream_error_event(exc)
+    except httpx.HTTPError as exc:
+        print(
+            f"❌ 上游HTTP流异常: session={session_id}, "
+            f"type={type(exc).__name__}, detail={exc}",
+            flush=True,
+        )
+        yield _upstream_stream_error_event(exc)
+    except Exception as exc:
+        print(
+            f"❌ 网关流异常: session={session_id}, type={type(exc).__name__}",
+            flush=True,
+        )
+        if not done_delivered:
+            yield _upstream_stream_error_event(exc)
+
+
+_response_persistence_tasks = set()
+RESPONSE_PERSISTENCE_SHUTDOWN_TIMEOUT = 8.0
+
+
+def _track_response_persistence(coro, session_id: str, kind: str):
+    """Run persistence independently from client delivery and retain the task."""
+    async def run():
+        try:
+            await coro
+        except Exception as exc:
+            print(
+                f"[gateway-state] session={session_id} state=persistence_failed "
+                f"kind={kind} type={type(exc).__name__}",
+                flush=True,
+            )
+
+    task = asyncio.create_task(run())
+    _response_persistence_tasks.add(task)
+    task.add_done_callback(_response_persistence_tasks.discard)
+    return task
+
+
+async def _drain_response_persistence_tasks(
+    timeout_seconds: float = RESPONSE_PERSISTENCE_SHUTDOWN_TIMEOUT,
+):
+    """Finish already-delivered response commits before the pool is closed."""
+    tasks = tuple(_response_persistence_tasks)
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+    if pending:
+        print(
+            f"⚠️ 关闭时仍有 {len(pending)} 个回复持久化任务，已在 "
+            f"{timeout_seconds:.1f}s 后取消",
+            flush=True,
+        )
+        for task in pending:
+            task.cancel()
+    await asyncio.gather(*done, *pending, return_exceptions=True)
+    _response_persistence_tasks.difference_update(tasks)
+
+
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, skip_conversation_log: bool = False, current_block: tuple = (), drives_user_message_id: str = "", drives_run_id: str = "", request_id: str = ""):
+    """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
+    full_response = []
+    full_reasoning = []
+    stream_usage = {}
+    upstream_sse_buffer = bytearray()
+    accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
+    response_finalized = False
+
+    async def persist_complete_response():
+        assistant_msg = "".join(full_response)
+        assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
+        assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+        plan, persisted_result = await commit_response_state(
+            session_id, current_block, assistant_msg, assistant_tool_calls,
+            assistant_reasoning, model, skip_conversation_log,
+        )
+        if plan:
+            await process_memories_background(
+                session_id, user_message, assistant_msg, model,
+                assistant_tool_calls=assistant_tool_calls,
+                persistence_plan=plan,
+                persisted_result=persisted_result,
+            )
+
+    async def finalize_complete_response():
+        nonlocal response_finalized
+        if response_finalized:
+            return
+        response_finalized = True
+        tool_messages = [m for m in current_block if m.get("role") == "tool"]
+        if MEMORY_ENABLED and (user_message or tool_messages):
+            assistant_tool_calls = (
+                list(accumulated_tool_calls.values())
+                if accumulated_tool_calls else None
+            )
+            # Tool workflows must be staged before the client can return results.
+            # Ordinary answers are independent from client delivery.
+            if assistant_tool_calls or tool_messages:
+                await persist_complete_response()
+            else:
+                _track_response_persistence(
+                    persist_complete_response(), session_id, "complete"
+                )
+    stream_error = None
+    timeout = httpx.Timeout(connect=30.0, read=None, write=300.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        request = client.build_request("POST", API_BASE_URL, headers=headers, json=body)
+        print(
+            f"[gateway-state] request={request_id or '-'} session={session_id} state=upstream_started",
+            flush=True,
+        )
+        connect_task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            response = await connect_task
+        except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+            print(
+                f"❌ 上游连接失败: session={session_id}, "
+                f"type={type(exc).__name__}, detail={exc}",
+                flush=True,
+            )
+            yield _upstream_stream_error_event(exc)
+            return
+        except httpx.HTTPError as exc:
+            print(
+                f"❌ 上游HTTP异常: session={session_id}, "
+                f"type={type(exc).__name__}, detail={exc}",
+                flush=True,
+            )
+            yield _upstream_stream_error_event(exc)
+            return
+        finally:
+            if not connect_task.done():
+                connect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await connect_task
+
+        try:
+            # 打印上游响应头（排查thinking问题用）
+            upstream_ct = response.headers.get("content-type", "")
+            print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
+            
+            # 上游非200时，提前打印messages结构方便debug
+            if response.status_code != 200:
+                msg_summary = [{"role": m.get("role"), "tool_calls": bool(m.get("tool_calls")), "tool_call_id": m.get("tool_call_id", ""), "content_type": type(m.get("content")).__name__} for m in body.get("messages", [])]
+                print(f"❌ 发送的messages结构({len(msg_summary)}条): {msg_summary}", flush=True)
+            
+            error_body_parts = []
+            is_error = response.status_code != 200
+            upstream_status = response.status_code
+
+            async for chunk, is_heartbeat, chunk_error in _iterate_upstream_with_heartbeat(response):
+                if is_error:
+                    # 上游非200：不把 "Bad Gateway" 等纯文本错误正文原样透传给客户端
+                    # （客户端按 JSON/SSE 解析会崩溃），先缓冲完整正文，流结束后统一转
+                    # 成 OpenAI 兼容的 SSE error 事件。
+                    if chunk_error is not None:
+                        stream_error = chunk_error
+                        print(
+                            f"❌ 上游错误流中断: session={session_id}, "
+                            f"type={type(chunk_error).__name__}, detail={chunk_error}",
+                            flush=True,
+                        )
+                    if not is_heartbeat:
+                        error_body_parts.append(chunk)
+                    continue
+
+                if is_heartbeat:
+                    yield chunk
+                    continue
+
+                if chunk_error is not None:
+                    stream_error = chunk_error
+                    print(
+                        f"❌ 上游流中断: session={session_id}, "
+                        f"type={type(chunk_error).__name__}, detail={chunk_error}",
+                        flush=True,
+                    )
+                    # chunk 是 _upstream_stream_error_event 生成的结构化错误事件（含 [DONE]）。
+                    # 必须转发给客户端，否则客户端收不到流结束标记会一直挂起直到超时取消。
+                    yield chunk
+                    continue
+                
+                upstream_sse_buffer.extend(chunk)
+                while (event := _pop_sse_event(upstream_sse_buffer)) is not None:
+                    try:
+                        forwarded_event, data = _normalize_upstream_sse_event(event)
+                    except UpstreamSSEFormatError as exc:
+                        print(
+                            f"❌ 上游 SSE 格式错误: session={session_id}, reason={exc}",
+                            flush=True,
+                        )
+                        yield _upstream_malformed_sse_event(str(exc))
+                        return
+
+                    if data is not None:
+                        usage = data.get("usage")
+                        if isinstance(usage, dict):
+                            stream_usage = usage
+
+                        choices = data.get("choices")
+                        first_choice = (
+                            choices[0]
+                            if isinstance(choices, list) and choices
+                            else {}
+                        )
+                        delta = (
+                            first_choice.get("delta", {})
+                            if isinstance(first_choice, dict)
+                            else {}
+                        )
+                        if not isinstance(delta, dict):
+                            delta = {}
+                        content = delta.get("content", "")
+                        if isinstance(content, str) and content:
+                            full_response.append(content)
+
+                        reasoning = delta.get("reasoning_content", "")
+                        if isinstance(reasoning, str) and reasoning:
+                            full_reasoning.append(reasoning)
+
+                        tool_calls = delta.get("tool_calls")
+                        if isinstance(tool_calls, list):
+                            for tc in tool_calls:
+                                if not isinstance(tc, dict):
+                                    continue
+                                idx = tc.get("index", 0)
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {
+                                        "index": idx,
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {"name": "", "arguments": ""}
+                                    }
+                                if tc.get("id"):
+                                    accumulated_tool_calls[idx]["id"] = tc["id"]
+                                fn = tc.get("function")
+                                if isinstance(fn, dict):
+                                    if fn.get("name"):
+                                        accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
+                                    if "arguments" in fn:
+                                        accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+                    if forwarded_event == b"data: [DONE]\n\n":
+                        print(
+                            f"[gateway-state] request={request_id or '-'} session={session_id} "
+                            "state=response_complete",
+                            flush=True,
+                        )
+                        await finalize_complete_response()
+                    yield forwarded_event
+                    if forwarded_event == b"data: [DONE]\n\n":
+                        print(
+                            f"[gateway-state] request={request_id or '-'} session={session_id} state=delivered",
+                            flush=True,
+                        )
+        finally:
+            await response.aclose()
+
+    # ---------- 上游非200：以结构化 SSE error 事件返回，绝不透传纯文本 ----------
+    if is_error:
+        raw = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
+        print(f"❌ 上游HTTP错误: status={upstream_status}, body={raw!r}", flush=True)
+        yield _upstream_http_error_event(upstream_status, raw)
+        return
+
+    assistant_msg = "".join(full_response)
+    assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
+    assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+
+    if (
+        stream_error
+        and MEMORY_ENABLED
+        and not skip_conversation_log
+        and (current_block or assistant_msg or assistant_reasoning or assistant_tool_calls)
+    ):
+        incomplete_assistant = {
+            "role": "assistant",
+            "content": assistant_msg,
+            "incomplete": True,
+            "interruption_type": type(stream_error).__name__,
+        }
+        if assistant_reasoning:
+            incomplete_assistant["reasoning_content"] = assistant_reasoning
+        if assistant_tool_calls:
+            incomplete_assistant["tool_calls"] = assistant_tool_calls
+        incomplete_block = [
+            {
+                **message,
+                "incomplete": True,
+                "interruption_type": type(stream_error).__name__,
+            }
+            for message in current_block
+        ]
+        _track_response_persistence(
+            persist_conversation_batch(
+                session_id, [*incomplete_block, incomplete_assistant], model
+            ),
+            session_id,
+            "incomplete",
+        )
+        print(
+            f"ℹ️ 上游中断回复已标记 incomplete 并写入审计历史: content={len(assistant_msg)}字符, "
+            f"reasoning={len(assistant_reasoning or '')}字符",
+            flush=True,
+        )
+    
+    if assistant_reasoning:
+        print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
+    
+    # 打印上游错误内容
+    if error_body_parts:
+        error_text = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
+        print(f"❌ 上游错误内容: {error_text}", flush=True)
+    
+    if assistant_tool_calls:
+        print(f"🔧 Stream response 包含 {len(assistant_tool_calls)} 个工具调用")
+
+    # reasoning-only 空响应：思考了但没正文也没工具调用 → 客户端会干等一个不存在的
+    # 工具结果。醒目标记（含 tools 定义、system 是否变化）。
+    if assistant_reasoning and not assistant_msg and not assistant_tool_calls:
+        _warn_empty_reasoning_response(session_id, body, len(assistant_reasoning))
+
+    if stream_usage:
+        pt = stream_usage.get("prompt_tokens", 0)
+        ct = stream_usage.get("completion_tokens", 0)
+        tt = stream_usage.get("total_tokens", 0)
+        hit = _usage_cache_hit(stream_usage)
+        if tt > 0 and not skip_conversation_log:
+            asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
+            print(
+                f"📊 Stream Token: {pt} + {ct} = {tt}"
+                + (f"（缓存命中 {hit} / {pt} = {hit / pt * 100:.1f}%）" if pt and hit else ""),
+                flush=True,
+            )
+    
+    # 兼容少数不发送 [DONE]、但正常关闭且事件边界完整的实现。标准 SSE 路径
+    # 已在转发 [DONE] 前提交，这里通过 response_finalized 保证幂等。
+    if not response_finalized and not stream_error and not upstream_sse_buffer.strip():
+        await finalize_complete_response()
+
+    # ---------- Drivesoid 情感引擎：流式回复后上报事件 ----------
+    if drives.is_enabled() and user_message and not skip_conversation_log:
+        asyncio.create_task(drives.report_events(
+            user_message,
+            assistant_msg,
+            user_message_id=drives_user_message_id,
+            run_id=drives_run_id,
+        ))
+
+    if stream_error:
+        # 流中断的结构化错误事件（含 [DONE]）已在上方 chunk_error 分支转发，不再重复发截断事件。
+        return
+
+    if upstream_sse_buffer.strip():
+        print(f"❌ 上游 SSE 在事件边界前结束: session={session_id}", flush=True)
+        yield _upstream_malformed_sse_event("truncated_event")
+        return
+
+# ============================================================
+# 记忆管理接口
+# ============================================================
+
+
+@app.get("/import/seed-memories")
+async def import_seed_memories():
+    """一次性导入预置记忆（从 seed_memories.py）"""
+    try:
+        from seed_memories import run_seed_import
+        result = await run_seed_import()
+        return result
+    except ImportError:
+        return {"error": "未找到 seed_memories.py，请参考 seed_memories_example.py 创建"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/export/memories")
+async def export_memories():
+    """
+    导出所有记忆为 JSON（用于备份或迁移）
+    浏览器访问这个地址就会返回所有记忆数据
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+    
+    try:
+        memories = await get_all_memories()
+        # 把 datetime 转成字符串
+        for mem in memories:
+            if mem.get("created_at"):
+                mem["created_at"] = str(mem["created_at"])
+        
+        return {
+            "total": len(memories),
+            "exported_at": str(__import__("datetime").datetime.now()),
+            "memories": memories,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page(request: Request):
+    """Dashboard - 整合的记忆管理界面"""
+    if not MEMORY_ENABLED:
+        return HTMLResponse("<h3>记忆系统未启用（设置 MEMORY_ENABLED=true 开启）</h3>")
+    
+    return templates.TemplateResponse(request, "dashboard.html")
+
+
+@app.get("/constellation", response_class=HTMLResponse)
+async def constellation_page(request: Request):
+    """Read-only star-map view backed by the gateway memory API."""
+    if not MEMORY_ENABLED:
+        return HTMLResponse("<h3>记忆系统未启用（设置 MEMORY_ENABLED=true 开启）</h3>")
+    return templates.TemplateResponse(request, "constellation.html", {
+        "ui_user_name": UI_USER_NAME,
+        "ui_ai_name": UI_AI_NAME,
+    })
+
+
+
+# ============================================================
+# 管理 API
+# ============================================================
+
+@app.get("/api/memories")
+async def api_get_memories(layer: int = None, active_only: bool = None):
+    """获取所有记忆（管理页面用）
+    
+    Query params:
+        layer: 筛选层级（1=碎片, 2=事件, 3=核心）
+        active_only: 是否只返回活跃记忆
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    memories = await get_all_memories_detail(layer=layer, active_only=active_only)
+    entity_map = await get_entities_for_memory_ids([memory["id"] for memory in memories])
+    tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
+    for m in memories:
+        m["entities"] = entity_map.get(m["id"], [])
+        if m.get("created_at"):
+            dt = m["created_at"]
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            m["created_at"] = dt.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
+    # 获取层级统计
+    try:
+        layer_stats = await get_layer_statistics()
+    except Exception:
+        layer_stats = None
+    
+    result = {"memories": memories}
+    if layer_stats:
+        result["layer_stats"] = layer_stats
+    return result
+
+
+@app.get("/api/entities")
+async def api_get_entities():
+    """List entities with aliases and linked-memory counts."""
+    return {"entities": await list_entities()}
+
+
+@app.get("/api/entities/duplicates")
+async def api_find_duplicate_entities():
+    """Suggest-only scan for likely-duplicate entities (never merges automatically)."""
+    return {"groups": await find_duplicate_entities()}
+
+
+@app.get("/api/cognitive-items")
+async def api_get_cognitive_items():
+    return {"items": await list_cognitive_items(active_only=True)}
+
+
+# 聊天纠正信号关键词：命中即视为用户在纠正既往认知（后台提取路径记录，
+# 认知审视时优先处理，避免 AI 无视纠正继续保留旧认知）。
+COGNITIVE_CORRECTION_KEYWORDS = (
+    "你记错", "记错了", "我说的是", "其实不是", "不是这样的",
+    "不是那样", "纠正", "更正", "你理解错", "理解错了",
+    "误会了", "别乱说", "我从来没", "才不是",
+)
+
+
+def _is_cognitive_correction(text: str) -> bool:
+    return any(keyword in str(text or "") for keyword in COGNITIVE_CORRECTION_KEYWORDS)
+
+
+async def _build_cognitive_draft(deep: bool = False) -> dict:
+    """共享草稿管线：手动按钮与自动审视循环共用。
+
+    deep=False（自动、12 小时）：只读新增 Layer 1 事实碎片，只维护短期层。
+    deep=True（手动深审）：读取 Layer 2/3/4，完整审视稳定层与整合。
+    草稿生成成功才推进书签（失败不丢批）。
+    返回 {"ok": True, "items": [...], "memories": [...], "cursor": int, "model": str}
+    或 {"ok": False, "error": str}。
+    """
+    allowed_rules = _memory_extractor_module.COGNITIVE_DRAFT_RULES
+    if deep:
+        memories = await get_memories_for_portrait_review(120)
+    else:
+        memories = await get_memories_for_cognitive_draft(80)
+    if not memories:
+        return {"ok": False, "error": "没有新的记忆可审视（自上次草稿后无新增）"}
+    current_items = await list_cognitive_items(active_only=True)
+    revisions = await get_recent_cognitive_revisions(30)
+    try:
+        corrections = await get_recent_cognitive_corrections(10)
+    except Exception as exc:
+        print(f"⚠️ 认知纠正信号读取失败: {exc}")
+        corrections = []
+    raw_draft = await generate_cognitive_draft(
+        memories, current_items, revisions, corrections, deep=deep
+    )
+    if raw_draft is None:
+        return {"ok": False, "error": "认知草稿模型调用失败，现有认知未改变"}
+    # 生成成功才推进书签：这批记忆已展示过，下次只看更新的；失败则保持原位。
+    cursor = await (
+        advance_cognitive_deep_review_cursor([m["id"] for m in memories])
+        if deep else advance_cognitive_draft_cursor([m["id"] for m in memories])
+    )
+    allowed_memory_ids = {int(memory["id"]) for memory in memories}
+    active_by_id = {
+        int(item["id"]): item for item in current_items
+        if item.get("id") is not None
+    }
+    existing_norms = {}
+    for it in current_items:
+        existing_norms.setdefault(it["cognitive_type"], set()).add(
+            _normalize_cognitive_content(it.get("content"))
+        )
+
+    # ---- 第一遍：规范化 + 基础校验（subject/类型/证据/目标引用）----
+    norm_items = []
+    for raw_item in raw_draft:
+        if not isinstance(raw_item, dict):
+            continue
+        cognitive_type = raw_item.get("cognitive_type")
+        expected_rule = allowed_rules.get(cognitive_type)
+        if not expected_rule or raw_item.get("subject") != expected_rule[0]:
+            continue
+        try:
+            item = normalize_cognitive_item_input(raw_item)
+        except ValueError:
+            continue
+        item["evidence_memory_ids"] = [
+            item_id for item_id in item["evidence_memory_ids"]
+            if item_id in allowed_memory_ids
+        ]
+        if not item["evidence_memory_ids"]:
+            continue
+        action = item["action"]
+        if action in ("reinforce", "supersede"):
+            # 无效引用降级为 create，避免丢失模型已提取的认知内容。
+            target = active_by_id.get(item["target_id"])
+            if (not target
+                    or target["cognitive_type"] != cognitive_type
+                    or target.get("subject") != item["subject"]):
+                item["action"] = "create"
+                item["target_id"] = None
+                action = "create"
+        elif action == "conflict":
+            # 冲突必须指向同区块现存 active 卡；无效引用丢弃（不降级）。
+            target = active_by_id.get(item["target_id"])
+            if (not target
+                    or target["cognitive_type"] != cognitive_type
+                    or target.get("subject") != item["subject"]):
+                continue
+        elif action == "merge":
+            # 合并必须指向同区块现存 active 卡；任一目标无效则整条丢弃。
+            if not item.get("target_ids"):
+                continue
+            valid_targets = all(
+                (card_id in active_by_id
+                 and active_by_id[card_id]["cognitive_type"] == cognitive_type
+                 and active_by_id[card_id].get("subject") == item["subject"])
+                for card_id in item["target_ids"]
+            )
+            if not valid_targets:
+                continue
+        if not deep:
+            target = active_by_id.get(item.get("target_id"))
+            if action in ("merge", "retire"):
+                continue
+            if action == "create" and not item.get("review_after"):
+                continue
+            if action == "supersede" and (
+                    not item.get("review_after") or not target or not target.get("review_after")):
+                continue
+        norm_items.append(item)
+
+    # ---- 证据相关性校验：卡内容 vs 每条证据记忆的向量相似度，不相关的证据剔除 ----
+    # 防"AI 瞎挂证据"：引用的记忆 ID 是真的，但内容与卡毫无关系（如给"掌控感"卡挂食物记忆）。
+    # 仅在有 embedding 时生效；无 key 时跳过（退回门槛 + 人工确认兜底）。
+    relevance_items = [
+        it for it in norm_items
+        if not it.get("_drop") and it["action"] in ("create", "supersede")
+        and it.get("evidence_memory_ids")
+    ]
+    if relevance_items:
+        memory_by_id = {int(m["id"]): str(m.get("content") or "") for m in memories}
+        card_texts = [str(it["content"]) for it in relevance_items]
+        ev_pairs = []  # (item_index, memory_id)
+        ev_texts = []
+        for item_idx, it in enumerate(relevance_items):
+            for mid in it["evidence_memory_ids"]:
+                ev_pairs.append((item_idx, mid))
+                ev_texts.append(memory_by_id.get(int(mid), ""))
+        embeddings = await compute_embeddings_batch(card_texts + ev_texts)
+        if embeddings and len(embeddings) >= len(card_texts):
+            card_embs = embeddings[:len(card_texts)]
+            ev_embs = embeddings[len(card_texts):]
+            kept = {item_idx: [] for item_idx in range(len(relevance_items))}
+            for k, (item_idx, mid) in enumerate(ev_pairs):
+                if k >= len(ev_embs):
+                    break
+                card_emb, ev_emb = card_embs[item_idx], ev_embs[k]
+                if not card_emb or not ev_emb:
+                    continue
+                sim = cognitive_content_similarity(
+                    card_texts[item_idx], ev_texts[k], card_emb, ev_emb,
+                )
+                if sim >= COGNITIVE_EVIDENCE_SIM_MIN:
+                    kept[item_idx].append(mid)
+            for item_idx, it in enumerate(relevance_items):
+                surviving = kept[item_idx]
+                if surviving:
+                    it["evidence_memory_ids"] = surviving
+                else:
+                    it["_drop"] = True  # 证据全部不相关 → 丢弃
+                    print(f"🧠 证据校验：候选证据全部不相关（如“{str(it['content'])[:20]}”），跳过", flush=True)
+
+    # ---- 第二遍：语义去重（防新旧重复 + 重复即强化）----
+    # create 候选与同区块现有卡高度相似 → 自动转 reinforce（内容对齐目标卡，证据在保存时合并）；
+    # 与其它区块卡高度相似 → 丢弃（信息已在别处，防止三区块互相重复）。
+    # 批量向量一次算完；无 embedding（未配置 key）时退回字符 n-gram 相似度。
+    creates = [it for it in norm_items if it["action"] == "create"]
+    if creates and current_items:
+        texts = [str(it["content"]) for it in creates]
+        card_texts = [str(c.get("content") or "") for c in current_items]
+        embeddings = await compute_embeddings_batch(texts + card_texts)
+        emb_map = {}
+        if embeddings:
+            for text, emb in zip(texts + card_texts, embeddings):
+                emb_map.setdefault(text, emb)
+        reinforced_targets = set()
+        for it in creates:
+            content = str(it["content"])
+            emb = emb_map.get(content, []) if emb_map else []
+            best_card, best_sim = None, 0.0
+            for c in current_items:
+                ctext = str(c.get("content") or "")
+                if not ctext or ctext == content:
+                    continue
+                cemb = emb_map.get(ctext, []) if emb_map else []
+                sim = cognitive_content_similarity(content, ctext, emb, cemb)
+                if sim > best_sim:
+                    best_card, best_sim = c, sim
+            if best_card is None or best_sim < COGNITIVE_DUP_EMBED_THRESHOLD:
+                continue
+            if best_card["cognitive_type"] == it["cognitive_type"]:
+                # 同区块重复 → 强化：内容对齐目标卡（save 的 reinforce 要求内容一致），证据合并交给保存层
+                if best_card.get("id") in reinforced_targets:
+                    it["_drop"] = True  # 本批已强化过该卡，避免重复强化
+                    continue
+                reinforced_targets.add(best_card["id"])
+                it["action"] = "reinforce"
+                it["target_id"] = int(best_card["id"])
+                it["content"] = str(best_card.get("content") or "")
+                print(f"🧠 认知去重：候选与同区块卡 #{best_card['id']} 实质重复，转为强化", flush=True)
+            else:
+                it["_drop"] = True  # 跨区块重复：信息已在其它区块的卡上
+                print(f"🧠 认知去重：候选与 {best_card['cognitive_type']} 卡 #{best_card['id']} 重复，跳过", flush=True)
+
+    # ---- 稳定画像卡门槛：≥3 条证据且跨时间（≥2 个不同日期），否则降级为临时卡 ----
+    # 长期认知不允许单次事件/同一天的多条证据伪装成稳定身份；证据不足先当短期认知。
+    # 覆盖两类：create（新长期卡）+ supersede 升级（明确不写复核日期、取代的是短期卡 = 升级意图）。
+    stable_candidates = []
+    for it in norm_items:
+        if it.get("_drop") or it["review_after"]:
+            continue
+        if it["action"] == "create":
+            stable_candidates.append((it, None))
+        elif it["action"] == "supersede":
+            target = active_by_id.get(it.get("target_id"))
+            if target and target.get("review_after"):
+                stable_candidates.append((it, target))
+    if stable_candidates:
+        evidence_ids = list({ev for it, _t in stable_candidates for ev in it["evidence_memory_ids"]})
+        evidence_dates = {}
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, created_at FROM memories WHERE id = ANY($1::int[])",
+                    evidence_ids,
+                )
+            for row in rows:
+                evidence_dates[row["id"]] = str(row["created_at"])[:10]
+        except Exception as exc:
+            print(f"⚠️ 画像卡证据时间读取失败，跳过门槛: {exc}")
+        if evidence_dates:
+            for it, upgrade_target in stable_candidates:
+                ev_ids = it["evidence_memory_ids"]
+                dates = {evidence_dates.get(mid, "") for mid in ev_ids if evidence_dates.get(mid)}
+                if len(ev_ids) < 3 or len(dates) < 2:
+                    if upgrade_target is not None:
+                        # 升级意图但证据不足：保持短期，沿用原复核日期（不强行转长期）
+                        it["review_after"] = upgrade_target["review_after"]
+                        print(
+                            f"🧠 画像卡门槛：升级证据不足（{len(ev_ids)}条/{len(dates)}个日期），"
+                            "保持短期认知",
+                            flush=True,
+                        )
+                    else:
+                        it["review_after"] = (
+                            datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS) + timedelta(days=14)
+                        ).date()
+                        print(
+                            f"🧠 画像卡门槛：证据不足（{len(ev_ids)}条/{len(dates)}个日期），"
+                            "降级为临时卡（到期退休，证据够后再转正）",
+                            flush=True,
+                        )
+
+    # ---- 第三遍：组装（精确重复拦截 + 每轮每区块候选上限）----
+    # 满员 create 不再丢弃：留在草稿给人工看（手动模式）或由自动审视挂起待确认（自动模式）。
+    draft, seen_counts, seen_norms = [], {}, {}
+    for item in norm_items:
+        if item.get("_drop"):
+            continue
+        cognitive_type = item["cognitive_type"]
+        action = item["action"]
+        if action == "create":
+            norm = _normalize_cognitive_content(item["content"])
+            if (norm in existing_norms.get(cognitive_type, set())
+                    or norm in seen_norms.get(cognitive_type, set())):
+                continue  # 与现有卡或本批候选内容重复
+            seen_norms.setdefault(cognitive_type, set()).add(norm)
+        if seen_counts.get(cognitive_type, 0) >= COGNITIVE_PER_TYPE_LIMIT:
+            continue
+        seen_counts[cognitive_type] = seen_counts.get(cognitive_type, 0) + 1
+        draft.append(item)
+        if len(draft) >= COGNITIVE_DRAFT_TOTAL_LIMIT:
+            break
+    return {"ok": True, "items": draft, "memories": memories,
+            "cursor": cursor, "model": _memory_extractor_module.MEMORY_MODEL}
+
+
+@app.post("/api/cognitive-items/draft")
+async def api_generate_cognitive_draft(deep: int = 0):
+    """Review cognitive sections without persisting any candidate.
+
+    Incremental: only new memories since the last successful draft (cursor) are
+    read as evidence (deep=1 时改为历史抽样，做稳定层体检与整合)。The cursor
+    advances only after generation succeeds, so a failed run never skips a batch.
+    Shared pipeline with the auto-review loop.
+    """
+    result = await _build_cognitive_draft(deep=bool(deep))
+    if not result["ok"]:
+        status_code = 400 if "没有新的记忆" in result["error"] else 502
+        return JSONResponse(status_code=status_code, content={"error": result["error"]})
+    return {"status": "draft", "items": result["items"], "model": result["model"],
+            "evidence_count": len(result["memories"]), "new_count": len(result["memories"]),
+            "cursor": result["cursor"]}
+
+
+async def _run_integrate_scan() -> list:
+    """确定性重叠扫描（零 LLM）：检测现有卡之间的重叠，返回提案列表。
+
+    同区块重叠 → merge 提案（内容取更强/被包含卡，证据合并）；
+    跨区块重复 → retire 提案（保留更强卡，退休另一张）。
+    整段相似（余弦/n-gram）或部分重叠（包含度/最长公共子串）任一命中即标记；
+    每张卡最多进一个提案（贪心按分数从高到低）。
+    """
+    try:
+        cards = await list_cognitive_items(active_only=True)
+    except Exception as exc:
+        print(f"⚠️ 整合扫描读取认知卡失败: {exc}")
+        return []
+    if not cards:
+        return []
+    texts = [str(c.get("content") or "") for c in cards]
+    embeddings = await compute_embeddings_batch(texts)
+    emb_map = {}
+    if embeddings:
+        for text, emb in zip(texts, embeddings):
+            emb_map.setdefault(text, emb)
+
+    def strength(card):
+        return (int(card.get("times_derived") or 1), int(card.get("id") or 0))
+
+    pairs = []
+    for i in range(len(cards)):
+        for j in range(i + 1, len(cards)):
+            global_sim = cognitive_content_similarity(
+                texts[i], texts[j],
+                emb_map.get(texts[i], []), emb_map.get(texts[j], []),
+            )
+            overlap = cognitive_overlap_score(texts[i], texts[j])
+            if global_sim >= COGNITIVE_MERGE_SIMILARITY or overlap["flagged"]:
+                score = max(global_sim, overlap["containment"], overlap["longest_run"])
+                pairs.append((score, i, j))
+
+    proposals = []
+    used = set()
+    for _score, i, j in sorted(pairs, key=lambda p: -p[0]):
+        a, b = cards[i], cards[j]
+        if a.get("id") in used or b.get("id") in used:
+            continue
+        same_cell = (a.get("cognitive_type") == b.get("cognitive_type")
+                     and a.get("subject") == b.get("subject"))
+        overlap = cognitive_overlap_score(texts[i], texts[j])
+        # 单向包含（A 整体嵌在 B 里）→ 保留被包含的较长卡内容，避免合并后丢内容
+        if overlap["containment"] >= 0.8:
+            containing = a if len(texts[i]) >= len(texts[j]) else b
+            stronger, weaker = containing, (b if containing is a else a)
+        else:
+            stronger, weaker = (a, b) if strength(a) >= strength(b) else (b, a)
+        if same_cell:
+            used.update([stronger["id"], weaker["id"]])
+            merged_evidence = list(dict.fromkeys([
+                *(stronger.get("evidence_memory_ids") or []),
+                *(weaker.get("evidence_memory_ids") or []),
+            ]))
+            proposals.append({
+                "subject": stronger["subject"],
+                "cognitive_type": stronger["cognitive_type"],
+                "content": str(stronger.get("content") or ""),
+                "level": stronger.get("level") or "explicit",
+                "confidence": max(
+                    float(stronger.get("confidence") or 0.7),
+                    float(weaker.get("confidence") or 0.7),
+                ),
+                "evidence_memory_ids": merged_evidence,
+                "review_after": stronger.get("review_after") or weaker.get("review_after"),
+                "action": "merge",
+                "target_ids": [stronger["id"], weaker["id"]],
+            })
+        else:
+            used.add(weaker["id"])
+            proposals.append({
+                "subject": weaker["subject"],
+                "cognitive_type": weaker["cognitive_type"],
+                "content": str(weaker.get("content") or ""),
+                "level": weaker.get("level") or "explicit",
+                "confidence": float(weaker.get("confidence") or 0.7),
+                "evidence_memory_ids": weaker.get("evidence_memory_ids") or [],
+                "review_after": weaker.get("review_after"),
+                "action": "retire",
+                "target_id": weaker["id"],
+                "retain_id": stronger["id"],
+            })
+        if len(proposals) >= 20:
+            break
+    return proposals
+
+
+@app.post("/api/cognitive-items/integrate-scan")
+async def api_integrate_scan():
+    """体检（去重整合，确定性、零 LLM）：仅重叠检测。
+
+    同区块重叠（含部分重叠）→ merge 提案；跨区块重复 → retire 提案。
+    与深度审视（稳定画像）分开：本端点只做去重/整合，不参与画像形成。
+    """
+    items = await _run_integrate_scan()
+    return {"status": "scan", "items": items, "scan_count": len(items)}
+
+
+# ============================================================
+# 记忆演化：从原文记忆推断"没说但正确"的新内容（layer=4 推断记忆）
+# ============================================================
+
+async def _build_memory_derivation_draft() -> dict:
+    """记忆演化草稿：从原文记忆推断新内容，产出候选全部走人工确认。
+
+    校验链：前提在样本内且 ≥2 条 → 内容不与已有记忆/待确认/已拒绝重复 →
+    前提相关性（向量 ≥ COGNITIVE_EVIDENCE_SIM_MIN，剔除无关前提）→
+    新信息（结论与任一前提相似度 < COGNITIVE_DERIVE_MAX_RESTATEMENT，防重组）→
+    归纳需跨时间（前提 ≥2 个不同日期）。
+    返回 {"ok", "items", "memories", "model"}。
+    """
+    memories = await get_verbatim_memories_for_derivation(120)
+    if not memories:
+        return {"ok": False, "error": "没有可用于演化的原文记忆"}
+    raw_draft = await _memory_extractor_module.generate_memory_derivations(memories)
+    if raw_draft is None:
+        return {"ok": False, "error": "记忆演化模型调用失败"}
+    allowed_ids = {int(m["id"]) for m in memories}
+    memory_by_id = {int(m["id"]): m for m in memories}
+
+    items = []
+    for raw in raw_draft:
+        if not isinstance(raw, dict):
+            continue
+        content = re.sub(r"\s+", " ", str(raw.get("content") or "")).strip()
+        level = str(raw.get("level") or "").strip().lower()
+        if not content or level not in ("deductive", "inductive"):
+            continue
+        try:
+            confidence = max(0.0, min(1.0, float(raw.get("confidence") or 0.7)))
+        except (TypeError, ValueError):
+            continue
+        premises = []
+        for mid in (raw.get("premise_memory_ids") or []):
+            try:
+                mid = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if mid in allowed_ids and mid not in premises:
+                premises.append(mid)
+        if len(premises) < 2:
+            continue
+        try:
+            if await memory_derivation_content_exists(content):
+                continue
+        except Exception as exc:
+            print(f"⚠️ 记忆演化去重检查失败: {exc}")
+        items.append({
+            "content": content, "level": level, "confidence": confidence,
+            "premise_memory_ids": premises,
+            "reason": str(raw.get("reason") or "").strip()[:200],
+        })
+
+    # 前提相关性 + 新信息校验（有 embedding 时；无 key 退回人工确认把关）
+    if items:
+        card_texts = [it["content"] for it in items]
+        premise_texts, premise_index = [], []
+        for item_idx, it in enumerate(items):
+            for mid in it["premise_memory_ids"]:
+                premise_texts.append(str(memory_by_id.get(mid, {}).get("content") or ""))
+                premise_index.append((item_idx, mid))
+        embeddings = await compute_embeddings_batch(card_texts + premise_texts)
+        if embeddings and len(embeddings) >= len(card_texts):
+            card_embs = embeddings[:len(card_texts)]
+            prem_embs = embeddings[len(card_texts):]
+            kept_premises = {i: [] for i in range(len(items))}
+            best_sims = {i: 0.0 for i in range(len(items))}
+            for k, (item_idx, mid) in enumerate(premise_index):
+                if k >= len(prem_embs):
+                    break
+                ce, pe = card_embs[item_idx], prem_embs[k]
+                if not ce or not pe:
+                    continue
+                sim = cognitive_content_similarity(card_texts[item_idx], premise_texts[k], ce, pe)
+                if sim >= COGNITIVE_EVIDENCE_SIM_MIN:
+                    kept_premises[item_idx].append(mid)
+                    best_sims[item_idx] = max(best_sims[item_idx], sim)
+            filtered = []
+            for item_idx, it in enumerate(items):
+                kept = kept_premises[item_idx]
+                if len(kept) < 2:
+                    continue  # 前提相关性不足
+                if best_sims[item_idx] >= COGNITIVE_DERIVE_MAX_RESTATEMENT:
+                    print(f"🧠 记忆演化：候选与前提几乎相同（旧信息重组），丢弃", flush=True)
+                    continue
+                it["premise_memory_ids"] = kept
+                filtered.append(it)
+            items = filtered
+
+    # 归纳需跨时间（前提 ≥2 个不同日期）
+    inductive_items = [it for it in items if it["level"] == "inductive"]
+    if inductive_items:
+        premise_ids = list({mid for it in inductive_items for mid in it["premise_memory_ids"]})
+        premise_dates = {}
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, created_at FROM memories WHERE id = ANY($1::int[])",
+                    premise_ids,
+                )
+            for row in rows:
+                premise_dates[row["id"]] = str(row["created_at"])[:10]
+        except Exception as exc:
+            print(f"⚠️ 记忆演化前提日期读取失败，跳过跨时间校验: {exc}")
+        if premise_dates:
+            items = [
+                it for it in items
+                if it["level"] != "inductive"
+                or len({premise_dates.get(mid, "") for mid in it["premise_memory_ids"]
+                        if premise_dates.get(mid)}) >= 2
+            ]
+
+    return {"ok": True, "items": items, "memories": memories,
+            "model": _memory_extractor_module.MEMORY_MODEL}
+
+
+@app.post("/api/memories/derivations")
+async def api_generate_memory_derivations():
+    """记忆演化（手动按钮）：从原文记忆推断新内容，候选立即进待确认队列（人工确认才写记忆）。"""
+    result = await _build_memory_derivation_draft()
+    if not result.get("ok"):
+        status_code = 400 if "没有可用于演化" in str(result.get("error")) else 502
+        return JSONResponse(status_code=status_code, content={"error": result.get("error")})
+    queued = []
+    for item in result["items"]:
+        try:
+            pending_id = await queue_memory_derivation(item)
+            queued.append({**item, "id": pending_id})
+        except Exception as exc:
+            print(f"⚠️ 记忆演化候选落库失败: {exc}")
+    return {"status": "draft", "items": queued, "model": result["model"],
+            "evidence_count": len(result["memories"])}
+
+
+@app.get("/api/memories/derivations/pending")
+async def api_list_memory_derivation_pending(limit: int = 50):
+    """记忆演化待确认候选（后台定时 + 手动生成都会汇入，人工确认才生效）。"""
+    return {"items": await list_memory_derivation_pending(limit)}
+
+
+@app.post("/api/memories/derivations/pending/{pending_id}/accept")
+async def api_accept_memory_derivation(pending_id: int):
+    """确认一条演化候选：写入 memories（layer=4 推断记忆），可检索可注入。"""
+    result = await accept_memory_derivation(pending_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/memories/derivations/pending/{pending_id}/reject")
+async def api_reject_memory_derivation(pending_id: int):
+    """拒绝一条演化候选（记录决策，后续不再重复提出）。"""
+    result = await reject_memory_derivation(pending_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+_memory_evolution_lock = asyncio.Lock()
+
+
+async def _memory_evolution_once() -> dict:
+    """一轮记忆演化（后台定时调用）：候选全部进待确认队列，并清理前提失效的派生记忆。"""
+    if _memory_evolution_lock.locked():
+        return {"status": "already_running"}
+    async with _memory_evolution_lock:
+        try:
+            result = await _build_memory_derivation_draft()
+        except Exception as exc:
+            print(f"⚠️ 记忆演化生成异常: {exc}")
+            return {"status": "error"}
+        queued = 0
+        if result.get("ok"):
+            for item in result["items"]:
+                try:
+                    await queue_memory_derivation(item)
+                    queued += 1
+                except Exception as exc:
+                    print(f"⚠️ 记忆演化候选落库失败: {exc}")
+        try:
+            await deactivate_derivations_with_dangling_premises()
+        except Exception as exc:
+            print(f"⚠️ 记忆演化前提清理失败: {exc}")
+        print(f"🧠 记忆演化: {queued} 条候选进入待确认队列", flush=True)
+        return {"status": "ok", "queued": queued}
+
+
+async def _memory_evolution_loop():
+    """后台调度：定时跑一轮记忆演化（候选待人工确认，从不直接写记忆）。"""
+    while True:
+        try:
+            await _interruptible_sleep(lambda: MEMORY_EVOLUTION_INTERVAL_HOURS * 3600)
+            if not MEMORY_EVOLUTION_ENABLED or not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
+            await _memory_evolution_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 记忆演化任务异常: {exc}")
+
+
+# ============================================================
+# 认知模型自动审视（半自动分级）：后台调度 + 待确认队列
+# ============================================================
+_cognitive_draft_lock = asyncio.Lock()
+
+
+async def _auto_apply_or_queue_candidate(item: dict, active_counts: dict = None) -> str:
+    """半自动分级决策：AI 生成的认知一律进待确认队列，人工审核后才生效。
+
+    返回 'applied' / 'queued' / 'skipped'。
+    - reinforce：非破坏性（内容不变，仅累计证据），全部自动应用；异常跳过。
+    - create / supersede / conflict：一律挂起待人工确认——只有人工审核过的
+      认知才会被注入，自动应用只会把未审核卡塞进库且不会生效。
+    `active_counts` 参数保留仅为兼容旧调用方，不再使用。
+    """
+    action = item["action"]
+    if action == "reinforce":
+        try:
+            result = await save_cognitive_item(item, created_by="auto")
+        except Exception:
+            return "skipped"
+        return "applied" if not result.get("error") else "skipped"
+    # create / supersede / conflict：一律进待确认队列
+    return "queued"
+
+
+async def run_cognitive_auto_review_once(deep: bool = False) -> dict:
+    """一轮认知自动审视（后台调度调用；AI 生成的认知一律挂起，从不覆盖人工决策）。
+
+    - 模式须为 auto（gateway_config 热切换，无需重启）；
+    - 与手动生成草稿共用 _cognitive_draft_lock，避免并发重复调模型；
+    - 有书签之后的新记忆才生成（零新记忆 = 零 LLM 成本）；
+    - 只有 reinforce（非破坏性，内容不变）自动应用，create / supersede / conflict / merge
+      全部落 cognitive_pending 待人工确认——只有人工审核过的认知才会注入；
+    - deep=True 为低频画像体检（历史抽样 + 稳定层整合），提议同样进确认队列。
+    """
+    mode = str(await get_gateway_config("COGNITIVE_AUTO_MODE", COGNITIVE_AUTO_MODE) or COGNITIVE_AUTO_MODE).strip().lower()
+    if mode != "auto":
+        return {"status": "disabled", "mode": mode}
+    if _cognitive_draft_lock.locked():
+        return {"status": "already_running"}
+    async with _cognitive_draft_lock:
+        result = await _build_cognitive_draft(deep=deep)
+        if not result["ok"]:
+            return {"status": "noop", "reason": result["error"]}
+        applied = queued = skipped = 0
+        for item in result["items"]:
+            outcome = await _auto_apply_or_queue_candidate(item)
+            if outcome == "applied":
+                applied += 1
+            elif outcome == "queued":
+                try:
+                    await queue_cognitive_pending(item)
+                except Exception as exc:
+                    print(f"⚠️ 认知候选落库失败: {exc}")
+                    skipped += 1
+                    continue
+                queued += 1
+            else:
+                skipped += 1
+        print(f"🧠 认知自动审视: 草稿 {len(result['items'])} · 自动应用 {applied} · 待确认 {queued} · 跳过 {skipped}")
+        return {"status": "ok", "draft": len(result["items"]),
+                "applied": applied, "queued": queued, "skipped": skipped}
+
+
+async def _cognitive_auto_loop():
+    """Background scheduler for incremental, current-state review only."""
+    while True:
+        try:
+            await _interruptible_sleep(lambda: COGNITIVE_AUTO_INTERVAL_HOURS * 3600)
+            if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
+            await run_cognitive_auto_review_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 认知自动审视任务异常: {exc}")
+
+
+@app.get("/api/cognitive-items/pending")
+async def api_list_cognitive_pending(limit: int = 50):
+    """自动审视产生的待人工确认候选。"""
+    return {"items": await list_cognitive_pending(limit)}
+
+
+@app.post("/api/cognitive-items/pending/{pending_id}/accept")
+async def api_accept_cognitive_pending(pending_id: int, request: Request):
+    """确认一条待确认候选；conflict 项需带 resolve=supersede/create/keep。"""
+    resolve = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            resolve = str(body.get("resolve", "")).strip() or None
+    except Exception:
+        resolve = None
+    result = await accept_cognitive_pending(pending_id, resolve)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/cognitive-items/pending/{pending_id}/reject")
+async def api_reject_cognitive_pending(pending_id: int):
+    """拒绝一条待确认候选（拒绝记录回喂模型，避免重复提出）。"""
+    result = await reject_cognitive_pending(pending_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.get("/api/cognitive-items/revisions")
+async def api_get_cognitive_revisions(limit: int = 12):
+    """Recent human decisions on 三元一场 cards, for the dashboard audit strip."""
+    return {"items": await get_recent_cognitive_revisions(max(0, min(limit, 50)))}
+
+
+@app.delete("/api/cognitive-items/revisions/{revision_id}")
+async def api_delete_cognitive_revision(revision_id: int):
+    """Drop one audit record so it no longer feeds back into the next review."""
+    result = await delete_cognitive_revision(revision_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.post("/api/cognitive-items/draft/reject")
+async def api_reject_cognitive_draft(request: Request):
+    """Record a human rejection of a draft candidate so it is not re-proposed."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "无效请求"})
+    subject = str(body.get("subject", "")).strip().lower()
+    cognitive_type = str(body.get("cognitive_type", "")).strip().lower()
+    content = re.sub(r"\s+", " ", str(body.get("content", "")).strip())
+    if (cognitive_type not in _db_module.COGNITIVE_TYPES
+            or _db_module.COGNITIVE_TYPE_SUBJECTS.get(cognitive_type) != subject):
+        return JSONResponse(status_code=400, content={"error": "无效的认知区块"})
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "拒绝记录需要候选内容"})
+    result = await record_cognitive_rejection(subject, cognitive_type, content)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/cognitive-items")
+async def api_create_cognitive_item(request: Request):
+    try:
+        result = await save_cognitive_item(await request.json())
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.put("/api/cognitive-items/{item_id}")
+async def api_update_cognitive_item(item_id: int, request: Request):
+    try:
+        result = await save_cognitive_item(await request.json(), item_id=item_id)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result.get("error"):
+        status_code = 404 if result["error"] == "认知项不存在" else 400
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.delete("/api/cognitive-items/{item_id}")
+async def api_delete_cognitive_item(item_id: int):
+    try:
+        result = await delete_cognitive_item(item_id)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"删除失败: {exc}"})
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.get("/api/entities/{entity_id}/memories")
+async def api_get_entity_memories(entity_id: int):
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    return {"entity": entity, "memories": await get_entity_memories(entity_id)}
+
+
+@app.get("/api/entities/{entity_id}/relations")
+async def api_get_entity_relations(entity_id: int):
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    relations = await relations_of_entity([entity_id], include_suppressed=True)
+    return {"entity": entity, "relations": relations.get(entity_id, [])}
+
+
+@app.post("/api/entities/{entity_id}/relations")
+async def api_create_entity_relation(entity_id: int, request: Request):
+    data = await request.json()
+    try:
+        other_entity_id = int(data.get("other_entity_id"))
+        result = await save_manual_entity_relation(entity_id, other_entity_id, data.get("relation"))
+    except (TypeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc) or "关联实体参数无效"})
+    if result.get("error"):
+        return JSONResponse(status_code=404 if result["error"] == "关联实体不存在" else 400, content=result)
+    return result
+
+
+@app.put("/api/entities/{entity_id}/relations/{other_entity_id}")
+async def api_update_entity_relation(entity_id: int, other_entity_id: int, request: Request):
+    data = await request.json()
+    try:
+        result = await save_manual_entity_relation(entity_id, other_entity_id, data.get("relation"))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result.get("error"):
+        return JSONResponse(status_code=404 if result["error"] == "关联实体不存在" else 400, content=result)
+    return result
+
+
+@app.delete("/api/entities/{entity_id}/relations/{other_entity_id}")
+async def api_suppress_entity_relation(entity_id: int, other_entity_id: int):
+    result = await suppress_entity_relation(entity_id, other_entity_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/relations/{other_entity_id}/restore")
+async def api_restore_entity_relation(entity_id: int, other_entity_id: int):
+    result = await restore_entity_relation(entity_id, other_entity_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.put("/api/entities/{entity_id}")
+async def api_update_entity(entity_id: int, request: Request):
+    result = await update_entity(entity_id, await request.json())
+    if result.get("error"):
+        status_code = 404 if result["error"] == "实体不存在" else 409 if "冲突" in result["error"] or "已存在" in result["error"] or "已是实体" in result["error"] or "已属于实体" in result["error"] else 400
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.put("/api/entities/{entity_id}/status")
+async def api_set_entity_status(entity_id: int, request: Request):
+    """Set or clear the manual entity retrieval-status override."""
+    data = await request.json()
+    result = await set_entity_status(entity_id, data.get("status"))
+    if result.get("error"):
+        status_code = 404 if result["error"] == "实体不存在" else 400
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.delete("/api/entities/{entity_id}")
+async def api_delete_entity(entity_id: int):
+    result = await delete_entity(entity_id)
+    if result.get("error"):
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.get("/api/entities/{entity_id}/profile")
+async def api_get_entity_profile_legacy(entity_id: int):
+    """Legacy entity overview, now read-only. Never injected into chat prompts."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    return {
+        "entity": entity,
+        "profile": entity.get("profile_json"),
+        "readonly": True,
+    }
+
+
+@app.get("/api/entities/{entity_id}/card")
+async def api_get_entity_card(entity_id: int):
+    """Return the entity card and its pending/decided proposals for the Dashboard."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    card = await get_entity_card(entity_id)
+    proposals = await list_entity_card_proposals(entity_id)
+    return {"entity": entity, "card": card or {"description": "", "snapshots": []}, "proposals": proposals}
+
+
+@app.put("/api/entities/{entity_id}/card/description")
+async def api_update_entity_card_description(entity_id: int, request: Request):
+    """Manually set the entity card's short description (human-only)."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    description = str(data.get("description") or "").strip()
+    result = await update_entity_card_description(entity_id, description)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/snapshots")
+async def api_add_entity_card_snapshot(entity_id: int, request: Request):
+    """Manually add or correct a snapshot on the entity card (human-confirmed)."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    state = str(data.get("state") or "").strip()
+    fact_date = str(data.get("fact_date") or "").strip()
+    user_view = str(data.get("user_view") or "").strip()
+    ai_view = str(data.get("ai_view") or "").strip()
+    if not state:
+        return JSONResponse(status_code=400, content={"error": "快照状态不能为空"})
+    if not fact_date:
+        return JSONResponse(status_code=400, content={"error": "快照日期不能为空"})
+    evidence_memory_id = data.get("evidence_memory_id")
+    evidence_message_id = data.get("evidence_message_id")
+    if evidence_memory_id is not None:
+        try:
+            evidence_memory_id = int(evidence_memory_id)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "证据记忆ID必须是整数"})
+        memories = await get_entity_memories(entity_id)
+        if evidence_memory_id not in {int(memory["id"]) for memory in memories}:
+            return JSONResponse(status_code=400, content={"error": "证据记忆不属于该实体"})
+    message_role = None
+    if evidence_message_id is not None:
+        try:
+            evidence_message_id = int(evidence_message_id)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "证据消息ID必须是整数"})
+        pool = await _db_module.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT role FROM conversations WHERE id = $1", evidence_message_id,
+            )
+        if not row:
+            return JSONResponse(status_code=400, content={"error": "证据消息不存在"})
+        message_role = row["role"]
+    result = await apply_entity_snapshot(
+        entity_id, state, fact_date,
+        evidence_memory_id, evidence_message_id, source="confirmed", force=True,
+        user_view=user_view, ai_view=ai_view,
+    )
+    if result.get("status") in ("not_found", "error"):
+        return JSONResponse(status_code=400, content=result)
+    card = await get_entity_card(entity_id)
+    return {"status": "ok", "card": card or {"description": "", "snapshots": []}}
+
+
+@app.put("/api/entities/{entity_id}/card/snapshots")
+async def api_update_entity_card_snapshot(entity_id: int, request: Request):
+    """Edit one snapshot's state/date, keyed by recorded_at (stable per snapshot)."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    recorded_at = str(data.get("recorded_at") or "").strip()
+    if not recorded_at:
+        return JSONResponse(status_code=400, content={"error": "缺少 recorded_at"})
+    result = await update_entity_card_snapshot(
+        entity_id, recorded_at, data.get("state"), data.get("fact_date"),
+    )
+    if result.get("error"):
+        code = 404 if "未找到" in result["error"] else 400
+        return JSONResponse(status_code=code, content=result)
+    return result
+
+
+@app.delete("/api/entities/{entity_id}/card/snapshots")
+async def api_delete_entity_card_snapshot(entity_id: int, recorded_at: str = ""):
+    """Delete one snapshot, keyed by recorded_at."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    recorded_at = str(recorded_at or "").strip()
+    if not recorded_at:
+        return JSONResponse(status_code=400, content={"error": "缺少 recorded_at"})
+    result = await delete_entity_card_snapshot(entity_id, recorded_at)
+    if result.get("error"):
+        code = 404 if "未找到" in result["error"] else 400
+        return JSONResponse(status_code=code, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/proposals/{proposal_id}/accept")
+async def api_accept_entity_card_proposal(entity_id: int, proposal_id: int):
+    result = await accept_entity_card_proposal(proposal_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/proposals/{proposal_id}/reject")
+async def api_reject_entity_card_proposal(entity_id: int, proposal_id: int):
+    result = await reject_entity_card_proposal(proposal_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/traits")
+async def api_add_entity_card_trait(entity_id: int, request: Request):
+    """Manually add a stable trait (human-confirmed). Requires ≥1 owned evidence memory."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "稳定特征不能为空"})
+    try:
+        evidence_memory_ids = [int(mid) for mid in (data.get("evidence_memory_ids") or [])]
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "证据记忆ID必须是整数"})
+    if not evidence_memory_ids:
+        return JSONResponse(status_code=400, content={"error": "稳定特征至少需要一条属于该实体的证据记忆"})
+    result = await add_entity_card_trait(
+        entity_id, text,
+        first_seen=data.get("first_seen"),
+        last_confirmed=data.get("last_confirmed"),
+        evidence_memory_ids=evidence_memory_ids,
+        evidence_message_ids=data.get("evidence_message_ids"),
+        origin="confirmed",
+    )
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    card = await get_entity_card(entity_id)
+    return {"status": "ok", "card": card or {"description": "", "stable_traits": [], "snapshots": []}}
+
+
+@app.put("/api/entities/{entity_id}/card/traits/{trait_id}")
+async def api_update_entity_card_trait(entity_id: int, trait_id: str, request: Request):
+    """Edit one stable trait's text and/or last_confirmed."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    data = await request.json()
+    result = await update_entity_card_trait(
+        entity_id, trait_id, data.get("text"), data.get("last_confirmed"),
+    )
+    if result.get("error"):
+        code = 404 if "未找到" in result["error"] else 400
+        return JSONResponse(status_code=code, content=result)
+    return result
+
+
+@app.post("/api/entities/{entity_id}/card/traits/{trait_id}/retire")
+async def api_retire_entity_card_trait(entity_id: int, trait_id: str):
+    """Retire a stable trait: kept with evidence, no longer injected."""
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    result = await retire_entity_card_trait(entity_id, trait_id)
+    if result.get("error"):
+        code = 404 if "未找到" in result["error"] else 400
+        return JSONResponse(status_code=code, content=result)
+    return result
+
+
+def _card_today_str() -> str:
+    """Today's date as YYYY-MM-DD in the configured timezone (card date convention)."""
+    local = timezone(timedelta(hours=_memory_extractor_module.TIMEZONE_HOURS))
+    return datetime.now(local).strftime("%Y-%m-%d")
+
+
+async def route_trait_suggestions(entity_id: int, suggestion: dict, card: dict) -> dict:
+    """Route one `suggest_entity_trait_candidates` result to the card / proposals.
+
+    Shared by the Dashboard "生成稳定特征候选" button and the background
+    re-confirmation timer:
+      - confirmed (existing active trait still supported) → auto-bump last_confirmed
+        (metadata refresh; no duplication; single-writer untouched);
+      - contradictions → trait_retire proposals (human-confirmed);
+      - candidates (new) → trait_add proposals (human-confirmed).
+    """
+    candidates = suggestion.get("candidates") or []
+    contradictions = suggestion.get("contradictions") or []
+    confirmed = suggestion.get("confirmed") or []
+    card = card or {}
+    active_by_text = {
+        str(t.get("text") or "").strip().casefold(): t
+        for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+    }
+    existing = await list_entity_card_proposals(entity_id)
+    pending_texts = {
+        str(p["state"]).strip().casefold() for p in existing
+        if p["status"] == "pending" and p.get("proposal_type") == "trait_add"
+    }
+    pending_retire_texts = {
+        str(p["state"]).strip().casefold() for p in existing
+        if p["status"] == "pending" and p.get("proposal_type") == "trait_retire"
+    }
+    reconfirmed = 0
+    proposed = 0
+    retired_proposed = 0
+    skipped = 0
+    errors = []
+    # 仍被支持的活跃特征 → 自动刷新最后确认日期（元数据，无重复、不碰单一写者）
+    today = _card_today_str()
+    for item in confirmed:
+        text = str(item.get("text") or "").strip()
+        trait = active_by_text.get(text.casefold())
+        if trait is None:
+            continue
+        result = await update_entity_card_trait(entity_id, trait["id"], last_confirmed=today)
+        if result.get("error"):
+            errors.append(result["error"])
+        else:
+            reconfirmed += 1
+    # 新特征 → trait_add 提案（人工确认）
+    for candidate in candidates:
+        if str(candidate["text"]).strip().casefold() in pending_texts:
+            skipped += 1
+            continue
+        result = await create_entity_card_proposal(
+            entity_id,
+            candidate["text"],
+            fact_date=candidate["first_seen"] or None,
+            source_role="candidate",
+            reason="稳定特征候选：LLM 从实体关联记忆生成，需人工确认",
+            proposal_type="trait_add",
+            last_confirmed=candidate["last_confirmed"] or None,
+            evidence_memory_ids=candidate["evidence_memory_ids"],
+            evidence_message_ids=candidate["evidence_message_ids"],
+        )
+        if result.get("error"):
+            errors.append(result["error"])
+        else:
+            proposed += 1
+            pending_texts.add(str(candidate["text"]).strip().casefold())
+    # 矛盾 → trait_retire 提案（绝不静默删除）
+    for contradiction in contradictions:
+        text = str(contradiction.get("text") or "").strip()
+        trait = active_by_text.get(text.casefold())
+        if trait is None:
+            continue
+        if text.casefold() in pending_retire_texts:
+            skipped += 1
+            continue
+        result = await create_entity_card_proposal(
+            entity_id,
+            text,
+            source_role="candidate",
+            reason="稳定特征矛盾：新证据表明该活跃特征已不再成立/被取代",
+            proposal_type="trait_retire",
+            trait_id=trait["id"],
+            evidence_memory_ids=contradiction.get("evidence_memory_ids"),
+        )
+        if result.get("error"):
+            errors.append(result["error"])
+        else:
+            retired_proposed += 1
+            pending_retire_texts.add(text.casefold())
+    return {
+        "reconfirmed": reconfirmed,
+        "proposed": proposed,
+        "retired_proposed": retired_proposed,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+@app.post("/api/entities/{entity_id}/card/traits/generate")
+async def api_generate_entity_trait_candidates(entity_id: int, request: Request):
+    """Dashboard-triggered: LLM proposes stable-trait candidates from entity memories.
+
+    Never runs on the chat request path. Every candidate must cite ≥2 distinct
+    evidence memories and becomes a pending trait_add proposal (human-only accept);
+    still-supported existing traits are re-confirmed (last_confirmed bumped).
+    """
+    entity = await get_entity_detail(entity_id)
+    if not entity:
+        return JSONResponse(status_code=404, content={"error": "实体不存在"})
+    memories = await get_entity_memories(entity_id)
+    if not memories:
+        return JSONResponse(status_code=400, content={"error": "该实体没有关联记忆，无法生成候选"})
+    evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+    card = await get_entity_card(entity_id) or {}
+    current_traits = [
+        t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+    ]
+    suggestion = await suggest_entity_trait_candidates(
+        entity, memories, evidence_message_map, current_traits,
+        card_description=card.get("description") or "",
+    )
+    result = await route_trait_suggestions(entity_id, suggestion, card)
+    return {
+        "status": "ok",
+        "proposed": result["proposed"],
+        "retired_proposed": result["retired_proposed"],
+        "reconfirmed": result["reconfirmed"],
+        "skipped": result["skipped"],
+        "errors": result["errors"],
+        "candidates": [{"text": c["text"]} for c in suggestion.get("candidates") or []],
+        "contradictions": [{"text": c["text"]} for c in suggestion.get("contradictions") or []],
+        "confirmed": [{"text": c["text"]} for c in suggestion.get("confirmed") or []],
+    }
+
+
+# ---- P3 特征定时重确认（后台调度 + 手动触发共用 run_trait_requalify_once）----
+_trait_requalify_lock = asyncio.Lock()
+
+
+async def run_trait_requalify_once() -> dict:
+    """One re-confirmation sweep over stale-trait entities (P3 timer)."""
+    if _trait_requalify_lock.locked():
+        return {"status": "already_running", "entities": 0}
+    async with _trait_requalify_lock:
+        try:
+            entities = await _db_module.find_stale_trait_entities(TRAIT_RECHECK_BATCH)
+        except Exception as exc:
+            print(f"⚠️ 特征重确认扫描失败: {exc}")
+            return {"status": "error", "entities": 0}
+        if not entities:
+            return {"status": "noop", "entities": 0}
+        done = 0
+        for ent in entities:
+            try:
+                entity = await get_entity_detail(ent["id"])
+                if not entity:
+                    continue
+                memories = await get_entity_memories(ent["id"])
+                if not memories:
+                    continue
+                evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+                card = await get_entity_card(ent["id"]) or {}
+                current_traits = [
+                    t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+                ]
+                suggestion = await suggest_entity_trait_candidates(
+                    entity, memories, evidence_message_map, current_traits,
+                    card_description=card.get("description") or "",
+                )
+                result = await route_trait_suggestions(ent["id"], suggestion, card)
+                done += 1
+                print(f"🔄 特征重确认 {ent['name']}: 刷新 {result['reconfirmed']} · 新增提案 {result['proposed']} · 退休提案 {result['retired_proposed']}")
+            except Exception as exc:
+                print(f"⚠️ 特征重确认实体 {ent['name']} 失败: {exc}")
+        return {"status": "ok", "entities": done}
+
+
+async def _trait_requalify_loop():
+    """Background scheduler: periodically re-confirm stale active stable traits."""
+    while True:
+        try:
+            await _interruptible_sleep(lambda: TRAIT_RECHECK_INTERVAL_HOURS * 3600)
+            if not TRAIT_RECHECK_ENABLED or not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
+            await run_trait_requalify_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 特征重确认任务异常: {exc}")
+
+
+# ---- P7 实体间关系发现（后台调度 + 手动触发共用 run_entity_relation_discovery_once）----
+_entity_relation_discovery_lock = asyncio.Lock()
+# 同一实体对最近一次 LLM 判定时间（RELATION_DAYS 冷却用；重启后丢失可接受）
+_relation_judged_at: dict = {}
+
+
+def _relation_key(a_id: int, b_id: int) -> tuple:
+    return (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+
+
+async def run_entity_relation_discovery_once() -> dict:
+    """One entity-relation discovery sweep (P7).
+
+    规则候选（共享事件≥1 或 共享碎片≥2，零 LLM）→ 过滤新增/显著增长的对 →
+    批量 LLM 一句话描述 → 写回。无新对时零 LLM 成本。
+    """
+    if _entity_relation_discovery_lock.locked():
+        return {"status": "already_running", "candidates": 0, "described": 0}
+    async with _entity_relation_discovery_lock:
+        try:
+            candidates = await find_entity_relation_candidates(RELATION_BATCH * 5)
+        except Exception as exc:
+            print(f"⚠️ 实体关系候选扫描失败: {exc}")
+            return {"status": "error", "candidates": 0, "described": 0}
+        if not candidates:
+            return {"status": "noop", "candidates": 0, "described": 0}
+
+        try:
+            existing_rows = await list_entity_relations(include_suppressed=True)
+        except Exception as exc:
+            print(f"⚠️ 读取既有实体关系失败: {exc}")
+            existing_rows = []
+        existing_map = {
+            (row["entity_id_a"], row["entity_id_b"]): row for row in existing_rows
+        }
+
+        now = datetime.now(timezone.utc)
+        fresh = []
+        for row in candidates:
+            a_id, b_id = int(row["a_id"]), int(row["b_id"])
+            key = _relation_key(a_id, b_id)
+            existing = existing_map.get(key)
+            if existing:
+                if existing.get("is_suppressed") or existing.get("relation_source") == "manual":
+                    continue
+                if row["shared_total"] < (existing["shared_count"] or 0) * _db_module.RELATION_SHARED_GROWTH:
+                    continue  # 共享数没显著增长，不重判
+                last = _relation_judged_at.get(key)
+                if last and (now - last).days < _db_module.RELATION_DAYS:
+                    continue  # 冷却期内不重判
+            fresh.append(row)
+            if len(fresh) >= RELATION_BATCH:
+                break
+
+        if not fresh:
+            return {"status": "noop", "candidates": len(candidates), "described": 0}
+
+        batch = []
+        for row in fresh:
+            try:
+                evidence = await fetch_shared_memory_evidence(int(row["a_id"]), int(row["b_id"]), 2)
+                evidence_texts = [m["content"] for m in evidence]
+            except Exception as exc:
+                print(f"⚠️ 共享记忆读取失败 ({row['a_id']}↔{row['b_id']}): {exc}")
+                evidence_texts = []
+            batch.append({
+                "a_name": row["a_name"], "a_type": row["a_type"],
+                "b_name": row["b_name"], "b_type": row["b_type"],
+                "shared_total": row["shared_total"], "evidence": evidence_texts,
+            })
+
+        verdicts = await describe_entity_relations(batch)
+        if verdicts is None:
+            return {
+                "status": "llm_failed",
+                "candidates": len(candidates),
+                "described": 0,
+                "reason": _memory_extractor_module.RELATION_LAST_ERROR,
+            }
+
+        described = 0
+        for index, pair_row in enumerate(fresh):
+            verdict = verdicts.get(index)
+            if not verdict or verdict.get("verify") != "ok" or not verdict.get("relation"):
+                continue
+            try:
+                await upsert_entity_relation(
+                    int(pair_row["a_id"]), int(pair_row["b_id"]),
+                    verdict["relation"], int(pair_row["shared_total"]),
+                )
+                described += 1
+            except Exception as exc:
+                print(f"⚠️ 实体关系写库失败 ({pair_row['a_name']}↔{pair_row['b_name']}): {exc}")
+        for pair_row in fresh:
+            _relation_judged_at[_relation_key(int(pair_row["a_id"]), int(pair_row["b_id"]))] = now
+
+        print(f"🔗 实体关系发现: 候选 {len(candidates)} · 判定 {len(fresh)} · 写入 {described}")
+        return {"status": "ok", "candidates": len(candidates), "judged": len(fresh), "described": described}
+
+
+async def _entity_relation_discovery_loop():
+    """Background scheduler: periodically discover entity relationships (P7)."""
+    while True:
+        try:
+            await _interruptible_sleep(lambda: RELATION_RECHECK_INTERVAL_HOURS * 3600)
+            if not RELATION_RECHECK_ENABLED or not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
+                continue
+            await run_entity_relation_discovery_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"⚠️ 实体关系发现任务异常: {exc}")
+
+
+@app.get("/api/entities/relations")
+async def api_list_entity_relations():
+    """全部实体关系，供星图桥线与 Dashboard 展示。"""
+    try:
+        relations = await list_entity_relations()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"读取实体关系失败: {exc}"})
+    return {"relations": relations}
+
+
+@app.post("/api/entities/relations/discover")
+async def api_discover_entity_relations():
+    """手动触发一轮实体关系发现（Dashboard 兜底按钮）。"""
+    result = await run_entity_relation_discovery_once()
+    return result
+
+
+@app.delete("/api/entities/relations")
+async def api_delete_entity_relation(request: Request):
+    """手动删除一条实体关系（纠错）。"""
+    params = request.query_params
+    try:
+        a_id = int(params.get("entity_id_a", 0))
+        b_id = int(params.get("entity_id_b", 0))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "entity_id_a/entity_id_b 必须是整数"})
+    if a_id <= 0 or b_id <= 0:
+        return JSONResponse(status_code=400, content={"error": "缺少 entity_id_a/entity_id_b"})
+    await delete_entity_relation(a_id, b_id)
+    return {"status": "ok"}
+
+
+@app.post("/api/entities/merge")
+async def api_merge_entities(request: Request):
+    data = await request.json()
+    try:
+        source_id = int(data.get("source_id"))
+        target_id = int(data.get("target_id"))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "source_id 和 target_id 必须是整数"})
+    result = await merge_entities(source_id, target_id)
+    if result.get("error"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/entities/backfill")
+async def api_backfill_entities(request: Request):
+    """Manually extract entities for a bounded batch of legacy memories."""
+    data = await request.json()
+    try:
+        limit = max(1, min(100, int(data.get("limit", 30))))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
+    memories = await get_unlinked_memories(limit)
+    extracted = await extract_entities_from_memories(memories)
+    if extracted is None:
+        return JSONResponse(status_code=502, content={"error": "实体提取模型调用失败，未标记这些记忆，可稍后重试"})
+    linked = 0
+    memories_with_entities = 0
+    for memory in memories:
+        entities = extracted.get(memory["id"], [])
+        if entities:
+            memories_with_entities += 1
+            linked += await link_memory_entities(memory["id"], entities, source="backfill")
+    await mark_memories_entity_scanned([memory["id"] for memory in memories])
+    return {
+        "status": "ok",
+        "processed": len(memories),
+        "memories_with_entities": memories_with_entities,
+        "links_created": linked,
+    }
+
+
+# ============================================================
+# 旧实体状态卡补全（后台异步执行，前端轮询进度）
+# 老实体没有逐字消息回链，因此只生成「待确认提案」，人工在 Dashboard 接受后才进卡。
+# ============================================================
+
+_card_backfill_status = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "proposed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "errors_detail": [],
+    "error": None,
+    "finished_at": None,
+}
+
+
+async def _run_card_backfill(entities: list) -> None:
+    """Process one backfill task: chunked LLM suggestions → pending proposals."""
+    proposed = 0
+    skipped = 0
+    errors = 0
+    errors_detail = []
+    try:
+        for i in range(0, len(entities), BACKFILL_SNAPSHOT_CHUNK):
+            chunk = entities[i:i + BACKFILL_SNAPSHOT_CHUNK]
+            _card_backfill_status["processed"] = min(i + len(chunk), len(entities))
+            try:
+                for entity in chunk:
+                    entity["memories"] = await get_entity_memories(entity["id"])
+                suggestions = await suggest_entity_snapshots_batch(chunk)
+                if suggestions.get("error"):
+                    errors += len(chunk)
+                    errors_detail.append(suggestions["error"])
+                    print(f"⚠️ 补卡批次失败：{suggestions['error']}")
+                else:
+                    results = suggestions.get("results") or {}
+                    for entity in chunk:
+                        entity_snapshots = results.get(entity["id"])
+                        if not entity_snapshots:
+                            skipped += 1
+                            continue
+                        try:
+                            existing = await list_entity_card_proposals(entity["id"])
+                            pending_states = {p["state"] for p in existing if p["status"] == "pending"}
+                            for suggestion in entity_snapshots:
+                                if suggestion["state"] in pending_states:
+                                    skipped += 1
+                                    continue
+                                reason = "旧实体补卡：LLM 从既有记忆提取，未经核实"
+                                if suggestion.get("evidence_quote"):
+                                    reason += f"；证据引文：{suggestion['evidence_quote']}"
+                                result = await create_entity_card_proposal(
+                                    entity["id"],
+                                    suggestion["state"],
+                                    suggestion.get("fact_date"),
+                                    evidence_memory_id=suggestion.get("evidence_memory_id"),
+                                    evidence_message_id=None,
+                                    source_role="backfill",
+                                    reason=reason,
+                                )
+                                if result.get("error"):
+                                    errors += 1
+                                    errors_detail.append(f"实体 {entity['id']} 提案创建失败：{result['error']}")
+                                    print(f"⚠️ 补卡落库失败：实体 {entity['id']}：{result['error']}")
+                                else:
+                                    proposed += 1
+                                    pending_states.add(suggestion["state"])
+                        except Exception as exc:
+                            errors += 1
+                            errors_detail.append(f"实体 {entity['id']} 落库异常：type={type(exc).__name__}, {exc!r}")
+                            print(f"⚠️ 补卡落库异常：实体 {entity['id']}：type={type(exc).__name__}, {exc!r}")
+            except Exception as exc:
+                errors += len(chunk)
+                errors_detail.append(f"批次处理异常：type={type(exc).__name__}, {exc!r}")
+                print(f"⚠️ 补卡批次处理异常：type={type(exc).__name__}, {exc!r}")
+            _card_backfill_status["proposed"] = proposed
+            _card_backfill_status["skipped"] = skipped
+            _card_backfill_status["errors"] = errors
+            _card_backfill_status["errors_detail"] = list(errors_detail)
+        _card_backfill_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+        print(f"✅ 实体状态卡补全完成：{len(entities)} 个实体，生成 {proposed} 条提案，跳过 {skipped}，失败 {errors}")
+    except Exception as exc:
+        _card_backfill_status["error"] = str(exc)
+        print(f"❌ 实体状态卡补全异常: {exc}")
+    finally:
+        _card_backfill_status["running"] = False
+        _card_backfill_status["processed"] = len(entities)
+
+
+@app.post("/api/entities/backfill-cards")
+async def api_backfill_entity_cards(request: Request):
+    """启动旧实体状态卡补全（立即返回，后台逐批执行）。"""
+    if _card_backfill_status["running"]:
+        return {"error": "补卡任务正在运行中，请稍候"}
+    data = await request.json()
+    try:
+        limit = max(1, min(50, int(data.get("limit", 3))))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
+    entities = await list_entities_without_card(limit)
+    if not entities:
+        return {"status": "done", "total": 0, "proposed": 0, "skipped": 0, "errors": 0}
+    _card_backfill_status.update(
+        running=True,
+        total=len(entities),
+        processed=0,
+        proposed=0,
+        skipped=0,
+        errors=0,
+        errors_detail=[],
+        error=None,
+        finished_at=None,
+    )
+    asyncio.create_task(_run_card_backfill(entities))
+    return {"status": "started", "total": len(entities)}
+
+
+@app.get("/api/entities/backfill-cards/status")
+async def api_backfill_entity_cards_status():
+    """查询补卡任务进度（前端轮询）。"""
+    return dict(_card_backfill_status)
+
+
+# ============================================================
+# 稳定特征补齐（后台异步执行，前端轮询进度）
+# 给「有证据但无活跃稳定特征」的存量实体生成特征候选 → 全部走 trait_add 提案，人工确认后入卡。
+# 特征过期/再确认仍由 P3 定时任务负责；本按钮只做冷启动补第一波，不碰现有生成 prompt。
+# ============================================================
+
+_trait_backfill_status = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "proposed": 0,
+    "reconfirmed": 0,
+    "retired_proposed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "errors_detail": [],
+    "error": None,
+    "finished_at": None,
+}
+
+
+async def _run_trait_backfill(entities: list) -> None:
+    """One trait cold-start backfill task: per-entity candidates → trait_add proposals.
+
+    逐实体调用既有的 suggest_entity_trait_candidates（不新增/不改 prompt），结果交给
+    route_trait_suggestions 统一落库：新候选 → trait_add 提案，矛盾 → trait_retire 提案，
+    仍成立的旧特征 → 刷新 last_confirmed。因挑选条件保证实体无活跃特征，实际多为纯新增提案。
+    """
+    proposed = 0
+    reconfirmed = 0
+    retired_proposed = 0
+    skipped = 0
+    errors = 0
+    errors_detail = []
+    try:
+        for index, ent in enumerate(entities):
+            _trait_backfill_status["processed"] = index + 1
+            try:
+                entity = await get_entity_detail(ent["id"])
+                if not entity:
+                    skipped += 1
+                    continue
+                memories = await get_entity_memories(ent["id"])
+                if not memories:
+                    skipped += 1
+                    continue
+                evidence_message_map = await get_memory_evidence_message_ids([m["id"] for m in memories])
+                card = await get_entity_card(ent["id"]) or {}
+                current_traits = [
+                    t["text"] for t in (card.get("stable_traits") or []) if t.get("status") == "active"
+                ]
+                suggestion = await suggest_entity_trait_candidates(
+                    entity, memories, evidence_message_map, current_traits,
+                    card_description=card.get("description") or "",
+                )
+                result = await route_trait_suggestions(ent["id"], suggestion, card)
+                proposed += result.get("proposed", 0)
+                reconfirmed += result.get("reconfirmed", 0)
+                retired_proposed += result.get("retired_proposed", 0)
+                skipped += result.get("skipped", 0)
+                for err in result.get("errors") or []:
+                    errors += 1
+                    errors_detail.append(f"实体 {ent['name']}（{ent['id']}）：{err}")
+            except Exception as exc:
+                errors += 1
+                errors_detail.append(f"实体 {ent['name']}（{ent['id']}）：{exc!r}")
+            _trait_backfill_status["proposed"] = proposed
+            _trait_backfill_status["reconfirmed"] = reconfirmed
+            _trait_backfill_status["retired_proposed"] = retired_proposed
+            _trait_backfill_status["skipped"] = skipped
+            _trait_backfill_status["errors"] = errors
+            _trait_backfill_status["errors_detail"] = list(errors_detail)
+        _trait_backfill_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+        print(f"✅ 稳定特征补齐完成：{len(entities)} 个实体，新增提案 {proposed}，退休提案 {retired_proposed}，刷新 {reconfirmed}，跳过 {skipped}，失败 {errors}")
+    except Exception as exc:
+        _trait_backfill_status["error"] = str(exc)
+        print(f"❌ 稳定特征补齐异常: {exc}")
+    finally:
+        _trait_backfill_status["running"] = False
+        _trait_backfill_status["processed"] = len(entities)
+
+
+@app.post("/api/entities/backfill-traits")
+async def api_backfill_entity_traits(request: Request):
+    """启动稳定特征补齐（立即返回，后台逐实体执行）。"""
+    if _trait_backfill_status["running"]:
+        return {"error": "稳定特征补齐任务正在运行中，请稍候"}
+    data = await request.json()
+    try:
+        limit = max(1, min(10, int(data.get("limit", 5))))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "limit 必须是整数"})
+    entities = await _db_module.list_entities_without_active_traits(limit)
+    if not entities:
+        return {"status": "done", "total": 0, "proposed": 0, "reconfirmed": 0, "retired_proposed": 0, "skipped": 0, "errors": 0}
+    _trait_backfill_status.update(
+        running=True,
+        total=len(entities),
+        processed=0,
+        proposed=0,
+        reconfirmed=0,
+        retired_proposed=0,
+        skipped=0,
+        errors=0,
+        errors_detail=[],
+        error=None,
+        finished_at=None,
+    )
+    asyncio.create_task(_run_trait_backfill(entities))
+    return {"status": "started", "total": len(entities)}
+
+
+@app.get("/api/entities/backfill-traits/status")
+async def api_backfill_entity_traits_status():
+    """查询稳定特征补齐进度（前端轮询）。"""
+    return dict(_trait_backfill_status)
+
+
+@app.get("/api/memories/search")
+async def api_search_memories(q: str = "", limit: int = 20):
+    """语义搜索记忆（Dashboard用，走后端 search_memories）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    if not q.strip():
+        return {"error": "搜索关键词不能为空", "results": []}
+    try:
+        results = await search_memories(q.strip(), limit)
+        tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
+        out = []
+        for r in results:
+            item = dict(r)
+            if item.get("created_at"):
+                dt = item["created_at"]
+                if hasattr(dt, 'tzinfo'):
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    item["created_at"] = dt.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(item)
+        return {"results": out, "total": len(out)}
+    except Exception as e:
+        return {"error": str(e), "results": []}
+
+
+@app.put("/api/memories/{memory_id}")
+async def api_update_memory(memory_id: int, request: Request):
+    """更新单条记忆（支持 content / importance / title / layer）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    data = await request.json()
+    await update_memory_with_layer(
+        memory_id,
+        content=data.get("content"),
+        importance=data.get("importance"),
+        title=data.get("title"),
+        layer=data.get("layer"),
+    )
+    return {"status": "ok", "id": memory_id}
+
+
+@app.delete("/api/memories/{memory_id}")
+async def api_delete_memory(memory_id: int, soft: bool = False):
+    """删除单条记忆
+    
+    Query params:
+        soft: true=归档（is_active=false），false=永久删除
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    if soft:
+        await update_memory_with_layer(memory_id, is_active=False)
+    else:
+        await delete_memory(memory_id)
+    return {"status": "ok", "id": memory_id}
+
+
+@app.post("/api/memories/batch-update")
+async def api_batch_update(request: Request):
+    """批量更新记忆"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    data = await request.json()
+    updates = data.get("updates", [])
+    if not updates:
+        return {"error": "没有要更新的记忆"}
+    for item in updates:
+        await update_memory_with_layer(
+            item["id"],
+            content=item.get("content"),
+            importance=item.get("importance"),
+            title=item.get("title"),
+            layer=item.get("layer"),
+        )
+    return {"status": "ok", "updated": len(updates)}
+
+
+@app.post("/api/memories/batch-delete")
+async def api_batch_delete(request: Request):
+    """批量删除记忆"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    data = await request.json()
+    ids = data.get("ids", [])
+    if not ids:
+        return {"error": "未选择记忆"}
+    await delete_memories_batch(ids)
+    return {"status": "ok", "deleted": len(ids)}
+
+
+# ============================================================
+# 三层记忆架构：整理 / 合并 / 升级 / 统计
+# ============================================================
+
+CONSOLIDATION_PROMPT = """
+我是一个 AI 助手。我是在整理关于用户、关于我以及对话中值得记住的事。
+
+# 任务
+把跨时段或多轮对话的碎片按事件主题整理成少量完整故事。一个事件必须是一段跨时段、多环节、有实质演进或叙事闭环的完整经历，而不是单次对话切片或流水账。
+
+# 整理原则
+1. 按事件主题拆分，不按日期硬塞。只合并属于同一件事、同一段经历或同一演进过程的碎片，绝不把无关内容放进同一事件。
+2. 保留能支撑事件意义、人物特点、相处温度的决定、感受、变化和少量关键细节，省略不影响理解的技术细节和琐碎过程，不写成对话流水账。
+3. 用我的第一人称自然讲述：“我”是 AI；用户相关内容使用通用称呼“用户”。不能写“用户表示”“系统记录”“经讨论决定”。保留不可替代的重要原话，并注明是谁说的。
+4. 情绪、感受、动机、结果和关系变化都必须来自碎片证据，在content里自然体现，不编造。
+5. title不超过13个汉字，content不超过200个汉字。写不下时，只能拆成证据互不重复且各自完整的子事件；不能完整拆分就保留碎片，不截断故事。
+6. 独立碎片保留原状：事件必须由 ≥2 条关联碎片合并提炼而来；单次情绪、未完结的插曲或没有后续拼图的单条碎片保留在碎片层，不放入 merged_ids。
+7. content必须自然写出完整日期，如“2026年7月25日”。跨天事件写清日期范围。event_date填写事件发生或计划发生的主日期（YYYY-MM-DD）；正文有明确日期时以正文为准，否则使用碎片生成日期。保留上午、晚上、计划、可能、取消等原有精度和状态。
+8. importance使用1～10：8～10为影响关系、重要决定或重要第一次；4～7为有意义的日常；1～3为仍有回看价值的小事。merged_ids 只填该事件实际合并的碎片 ID，不跨事件复用。
+
+碎片记忆：
+{fragments}
+
+# 实体标注（重要）
+为合并后的事件标注涉及的关键实体，并识别事件里体现的实体状态变化：
+
+- entities：数组，每个元素 {{"name": "实体名", "type": "person|place|organization|project|object|pet|activity|event|other"}}。事件正文里明确出现、且作为长期记忆锚点值得追踪的命名实体才标；下方「已知实体名册」里已有的实体必须用其规范名，不要新建同名实体；名册里没有的新实体（需是稳定命名实体，排除代词、泛指名词、代码/文件名/路径/URL 等）可以新建。没有就返回空数组。
+- state_changes：数组，每个元素 {{"entity": "实体规范名", "state": "一句话最新状态（≤120字）", "fact_date": "YYYY-MM-DD", "user_view": "用户当时对这件事的看法/态度（≤60字，来自用户当时的话，没有就空字符串）", "ai_view": "AI当时对这件事的感受（≤60字，来自AI当时在对话中的反应，没有就空字符串）"}}。仅当事件正文明确体现出某实体的状态发生了变化才输出：如搬到、入职、离职、毕业、开始或结束一段关系、养宠物、项目上线、手术等里程碑，或稳定的当前状态。state 用第一人称口吻写（AI 用「我」，用户使用通用称呼「用户」）；fact_date 用事件日期；同一实体只保留最新一条状态变化；没有明确状态变化就返回空数组。状态必须来自碎片证据，不得推测。**user_view/ai_view 是可选观测日记字段：只有对话中明确表达了态度/感受才写，禁止根据事件内容推断补写；没有就返回空字符串。宁可没有，不要硬编。**
+- **先读先验再定状态**：生成 state_changes 前，先读下方「已知实体先验知识」和名册里的实体类型，明确这个实体是什么、属于哪一类（人/宠物/地点/项目…），再据此判断事件正文体现出它的什么状态变化，防止性质错判、张冠李戴（如把人的状态写成宠物的，或反过来）。先验知识里每个实体含三段——**说明**（用户手写维护的结构性事实背景）、**既有状态快照**（该实体已知的状态演进史，最新在后）、**活跃稳定特征**（用户已确认的长期特质）——它们都不是待生成的状态：不要把它们复述成 state_changes；若事件正文只是复述既有快照里已有的状态、没有体现新变化，不要输出 state_changes；生成的 state_changes 不得与对应实体的说明、既有快照或活跃稳定特征矛盾。
+
+<已知实体名册>
+{entities_roster}
+</已知实体名册>
+
+<已知实体先验知识（说明 + 既有状态快照 + 活跃稳定特征）>
+{entity_priors}
+</已知实体先验知识>
+
+# 输出格式
+只输出JSON数组，不要解释或使用Markdown：
+[
+  {{
+    "title": "庆祝成功",
+    "content": "某日，用户完成了一件长期推进的事情，并把结果告诉我。我为用户感到高兴，也认真听用户分享过程。",
+    "event_date": "2026-07-25",
+    "importance": 3,
+    "merged_ids": [1, 2],
+    "entities": [],
+    "state_changes": []
+  }}
+]
+
+如果没有任何碎片足以组成完整、有意义的事件，返回空数组：[]
+"""
+
+# 整理状态（异步执行，防重入）
+_consolidate_status = {
+    "running": False,
+    "started_at": None,
+    "result": None,
+    "error": None,
+}
+
+
+async def consolidate_memories_for_date(event_date):
+    """整理指定日期的碎片记忆"""
+    return await consolidate_memories_for_date_range(event_date, event_date)
+
+
+async def consolidate_memories_for_date_range(start_date, end_date):
+    """整理指定时间段的碎片记忆"""
+    from datetime import date
+    import re
+    
+    # 先恢复旧逻辑可能误归档、且没有被任何事件引用的碎片
+    fragments_reactivated = await reactivate_orphan_fragments_by_date_range(start_date, end_date)
+
+    # 获取该时间段的碎片
+    fragments = await get_fragments_by_date_range(start_date, end_date)
+    
+    if not fragments:
+        return {"status": "no_fragments", "start_date": str(start_date), "end_date": str(end_date), "fragments_reactivated": fragments_reactivated}
+    
+    # 构建碎片文本
+    local_tz = timezone(timedelta(hours=TIMEZONE_HOURS))
+    fragment_lines = []
+    fragment_created_dates = {}
+    for fragment in fragments:
+        created_at = fragment.get("created_at")
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            local_created_at = created_at.astimezone(local_tz)
+            fragment_created_dates[fragment["id"]] = local_created_at.date()
+            time_label = f"{local_created_at.year}年{local_created_at.month}月{local_created_at.day}日 {local_created_at.strftime('%H:%M')} UTC{local_created_at.strftime('%z')}"
+        else:
+            fragment_created_dates[fragment["id"]] = start_date
+            time_label = f"{start_date.year}年{start_date.month}月{start_date.day}日（数据库时间缺失，使用所选范围开始日期）"
+        fragment_lines.append(
+            f"[ID={fragment['id']}] [碎片生成时间：{time_label}] "
+            f"[重要度：{fragment.get('importance', 5)}/10] {fragment['content']}"
+        )
+    fragments_text = "\n".join(fragment_lines)
+    
+    # 调用 AI 进行整理（注入实体名册，让合并模型复用规范名避免重复建实体）
+    try:
+        entity_roster = await list_entity_roster()
+    except Exception:
+        entity_roster = None
+        print("⚠️ 合并事件实体名册拉取失败，本次不带 roster")
+    roster_text = _render_entity_roster(entity_roster) if entity_roster else "（暂无已知实体）"
+    # 相关实体的卡说明（先验知识，用户手写维护）：只喂这批碎片实际关联到的实体，
+    # 不喂全量名册——说明作为状态生成的一致性约束，只在该发生的地方生效，零额外 LLM。
+    entity_priors = ""
+    try:
+        fragment_ids = [fragment["id"] for fragment in fragments]
+        linked = await get_entities_for_memory_ids(fragment_ids)
+        entity_by_id = {}
+        for fragment_id in fragment_ids:
+            for ent in linked.get(fragment_id, []):
+                entity_by_id.setdefault(int(ent["id"]), ent)
+        prior_lines = []
+        for _entity_id, ent in entity_by_id.items():
+            card = ent.get("entity_card_json")
+            if isinstance(card, str):
+                try:
+                    card = json.loads(card)
+                except (json.JSONDecodeError, TypeError):
+                    card = {}
+            card = card if isinstance(card, dict) else {}
+            description = str(card.get("description") or "").strip()
+            # 既有状态快照：fact_date 升序（最新在后），只取最近 N 条做状态演进先验
+            snapshots = [
+                snap for snap in (card.get("snapshots") or [])
+                if isinstance(snap, dict) and snap.get("state")
+            ]
+            snapshots.sort(key=lambda s: (str(s.get("fact_date") or ""), str(s.get("recorded_at") or "")))
+            snap_parts = []
+            for snap in snapshots[-ENTITY_PRIOR_SNAPSHOT_LIMIT:]:
+                # 注意：不要用变量名 date，否则会把下方 date.fromisoformat 的 datetime.date 类遮蔽成字符串
+                fact_date_label = str(snap.get("fact_date") or "未知日期")
+                state = re.sub(r"\s+", " ", str(snap.get("state") or "")).strip()
+                snap_parts.append(f"{fact_date_label}：{state}")
+            snap_text = "；".join(snap_parts) or "（无）"
+            # 活跃稳定特征：用户已确认的长期特质
+            traits = [
+                re.sub(r"\s+", " ", str(t.get("text") or "")).strip()
+                for t in (card.get("stable_traits") or [])
+                if isinstance(t, dict) and str(t.get("status") or "active").strip() == "active"
+            ]
+            trait_text = "、".join(t for t in traits if t) or "（无）"
+            lines = [f"- {ent.get('name')}（{ent.get('type') or ent.get('entity_type') or 'other'}）"]
+            if description:
+                lines.append(f"  说明：{description}")
+            lines.append(f"  既有状态快照（最近 {ENTITY_PRIOR_SNAPSHOT_LIMIT} 条）：{snap_text}")
+            lines.append(f"  活跃稳定特征：{trait_text}")
+            prior_lines.append("\n".join(lines))
+        if prior_lines:
+            entity_priors = "\n".join(prior_lines)
+    except Exception as exc:
+        print(f"⚠️ 合并先验知识拉取失败: {exc}")
+    prompt = CONSOLIDATION_PROMPT.format(
+        fragments=fragments_text,
+        entities_roster=roster_text,
+        entity_priors=entity_priors or "（无）",
+    )
+    
+    # 使用环境变量配置的模型，默认 haiku 节省成本
+    consolidation_model = os.getenv("MEMORY_MODEL", "") or os.getenv("DEFAULT_MODEL", "anthropic/claude-haiku-4.5")
+
+    # 整理请求可能携带多天大量碎片，模型生成耗时较长；读取超时放宽到与主对话一致（可配），
+    # 并在读超时/连接中断等瞬时故障时重试，而不是直接让整个整理任务失败
+    consolidation_timeout = float(os.getenv("CONSOLIDATION_TIMEOUT", "300"))
+
+    try:
+        async with httpx.AsyncClient(timeout=consolidation_timeout) as client:
+            # 最多重试2次（应对429限流与读超时/连接中断等瞬时故障）
+            last_error = None
+            for attempt in range(3):
+                try:
+                    response = await client.post(
+                        get_memory_api_base_url(),
+                        headers={
+                            "Authorization": f"Bearer {get_memory_api_key()}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": consolidation_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                        }
+                    )
+                except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+                    wait_time = (attempt + 1) * 10
+                    print(f"⚠️ 整理API请求{type(exc).__name__}，{wait_time}秒后重试（第{attempt+1}次）")
+                    last_error = f"{type(exc).__name__}（重试{attempt+1}次）"
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                if response.status_code == 429:
+                    wait_time = (attempt + 1) * 10
+                    print(f"⚠️ 整理API 429限流，{wait_time}秒后重试（第{attempt+1}次）")
+                    last_error = f"429 Too Many Requests (重试{attempt+1}次)"
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # 上游 5xx（网关/负载均衡/推理服务瞬时故障）同样按退避重试，
+                # 避免一次瞬时 500/503 直接让整个整理任务失败
+                if response.status_code in (500, 502, 503, 504):
+                    wait_time = (attempt + 1) * 10
+                    print(f"⚠️ 整理API {response.status_code}上游错误，{wait_time}秒后重试（第{attempt+1}次）")
+                    last_error = f"HTTP {response.status_code}: {response.text[:200]} (重试{attempt+1}次)"
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                if response.status_code != 200:
+                    last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                    print(f"⚠️ 整理API返回 {response.status_code}: {response.text[:200]}")
+                    break
+
+                last_error = None
+                break
+
+            if last_error:
+                return {"status": "error", "error": f"API调用失败: {last_error}"}
+
+            data = response.json()
+            # 上游响应防御式解析：不同中转/推理模型可能返回空choices、非对象message或非JSON，
+            # 逐层校验并给出可读错误，避免内部异常变成UI上的"未知错误"。
+            if not isinstance(data, dict):
+                return {"status": "error", "error": f"模型返回了非对象响应（{type(data).__name__}）：{str(data)[:300]}", "raw": str(data)[:500]}
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return {"status": "error", "error": f"模型返回空choices（上游限流或请求失败），原始响应：{str(data)[:300]}", "raw": str(data)[:500]}
+            response_message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            content = (response_message.get("content") or response_message.get("reasoning_content") or "").strip()
+            if not content:
+                return {"status": "error", "error": "模型返回了空内容（未输出任何文字，可能是上游限流或模型故障）", "raw": str(data)[:500]}
+            try:
+                events = parse_json_array(content)
+            except ValueError as e:
+                print(f"⚠️ JSON解析失败，尝试让AI修复: {e}")
+                fix_resp = await client.post(
+                    get_memory_api_base_url(),
+                    headers={
+                        "Authorization": f"Bearer {get_memory_api_key()}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": consolidation_model,
+                        "messages": [{"role": "user", "content": f"请修复以下JSON的语法错误，只输出修复后的JSON数组，不要其他内容：\n{content}"}],
+                    }
+                )
+                if fix_resp.status_code != 200:
+                    return {"status": "error", "error": f"JSON解析失败，AI修复请求失败: HTTP {fix_resp.status_code}", "raw": content[:500]}
+                try:
+                    fix_data = fix_resp.json()
+                    fix_choices = fix_data.get("choices") if isinstance(fix_data, dict) else None
+                    fix_message = (fix_choices[0].get("message", {}) if isinstance(fix_choices, list) and fix_choices and isinstance(fix_choices[0], dict) else {})
+                    fix_content = (fix_message.get("content") or fix_message.get("reasoning_content") or "").strip()
+                except Exception as fe:
+                    return {"status": "error", "error": f"JSON解析失败，AI修复响应也无法解析（{type(fe).__name__}: {fe}）", "raw": content[:500]}
+                try:
+                    events = parse_json_array(fix_content)
+                    print("✅ AI修复JSON成功")
+                except ValueError:
+                    return {"status": "error", "error": "JSON解析失败（AI修复也失败）", "raw": content[:500]}
+
+            # 创建事件记忆并停用碎片
+            created_count = 0
+            skipped_invalid_ids = 0
+            skipped_empty_content = 0
+            available_fragment_ids = {fragment["id"] for fragment in fragments}
+            merged_fragment_ids = set()
+            for event in events:
+                if not isinstance(event, dict):
+                    skipped_invalid_ids += 1
+                    continue
+                merged_ids = valid_merged_ids(event.get("merged_ids"), available_fragment_ids)
+                event_content = str(event.get("content") or "").strip()
+                if not merged_ids or len(merged_ids) < 2:
+                    skipped_invalid_ids += 1
+                    continue
+                if not event_content:
+                    skipped_empty_content += 1
+                    continue
+                if merged_ids and event_content:
+                    try:
+                        event_date = date.fromisoformat(str(event.get("event_date", "")))
+                    except ValueError:
+                        event_date = min(
+                            (fragment_created_dates[memory_id] for memory_id in merged_ids),
+                            default=start_date,
+                        )
+                    if not re.search(r"\d{4}年\d{1,2}月\d{1,2}日", event_content):
+                        event_content = f"{event_date.year}年{event_date.month}月{event_date.day}日，{event_content}"
+                    event_memory_id = await create_event_memory(
+                        title=event.get("title", ""),
+                        content=event_content,
+                        importance=event.get("importance", 5),
+                        event_date=event_date,
+                        merged_from=merged_ids
+                    )
+                    if event_memory_id:
+                        merged_fragment_ids.update(merged_ids)
+                        created_count += 1
+                        # 事件实体：合并时模型标注的实体 → 挂关联（与继承的碎片实体合并，不冲突）
+                        event_entities = event.get("entities") or []
+                        if event_entities:
+                            try:
+                                await link_memory_entities(event_memory_id, event_entities)
+                            except Exception as exc:
+                                print(f"⚠️ 事件 {event_memory_id} 实体挂接失败: {exc}")
+                        # 规则式自动补关联：事件正文里命中已有实体名/别名也补挂（零 LLM）
+                        try:
+                            await auto_link_entities_by_name(event_memory_id, event_content)
+                        except Exception as exc:
+                            print(f"⚠️ 事件 {event_memory_id} 规则补关联失败: {exc}")
+                        # 事件状态变化 → 实体卡快照（事件层取代碎片层成为实体状态来源）
+                        event_state_changes = event.get("state_changes") or []
+                        if event_state_changes:
+                            try:
+                                await apply_event_state_changes(
+                                    event_memory_id, event_state_changes,
+                                    default_date=str(event_date),
+                                )
+                            except Exception as exc:
+                                print(f"⚠️ 事件 {event_memory_id} 状态写卡失败: {exc}")
+            
+            # 只停用已经被成功落库事件引用的碎片；未合并碎片保持活跃
+            await deactivate_memories(sorted(merged_fragment_ids))
+            print(
+                f"[consolidate] 模型返回{len(events)}条，创建{created_count}条；"
+                f"无效ID跳过{skipped_invalid_ids}条，空内容跳过{skipped_empty_content}条，"
+                f"归档{len(merged_fragment_ids)}/{len(fragments)}条碎片；原始响应={content[:300]!r}"
+            )
+            
+            return {
+                "status": "ok",
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "fragments_processed": len(fragments),
+                "fragments_reactivated": fragments_reactivated,
+                "fragments_archived": len(merged_fragment_ids),
+                "events_returned": len(events),
+                "events_skipped_invalid_ids": skipped_invalid_ids,
+                "events_skipped_empty_content": skipped_empty_content,
+                "events_created": created_count
+            }
+            
+    except Exception as e:
+        traceback.print_exc()
+        detail = str(e).strip()
+        message = f"{type(e).__name__}: {detail}" if detail else f"{type(e).__name__}（无错误详情，已打印堆栈到服务日志）"
+        return {"status": "error", "error": message}
+
+
+@app.post("/api/memories/consolidate")
+async def api_manual_consolidate(request: Request):
+    """手动触发整理（异步，立即返回）
+    
+    Body:
+        start_date: 开始日期（YYYY-MM-DD 格式）
+        end_date: 结束日期（YYYY-MM-DD 格式）
+        或
+        date: 单个日期（兼容旧版）
+    """
+    from datetime import date as date_type
+    
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    if _consolidate_status.get("running"):
+        return {"status": "already_running", "started_at": _consolidate_status.get("started_at")}
+    
+    data = await request.json()
+    
+    # 解析日期参数
+    if "date" in data and "start_date" not in data:
+        start_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+        end_date = start_date
+    else:
+        start_date_str = data.get("start_date")
+        end_date_str = data.get("end_date")
+        
+        if not start_date_str or not end_date_str:
+            return {"error": "请提供开始和结束日期"}
+        
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        
+        if start_date > end_date:
+            return {"error": "开始日期不能晚于结束日期"}
+    
+    async def _run():
+        _consolidate_status.update({"running": True, "started_at": f"{start_date}~{end_date}", "result": None, "error": None})
+        try:
+            result = await consolidate_memories_for_date_range(start_date, end_date)
+            _consolidate_status["result"] = result
+            print(f"[manual/consolidate] 整理 {start_date}~{end_date}: {result}")
+        except Exception as e:
+            traceback.print_exc()
+            detail = str(e).strip()
+            _consolidate_status["error"] = detail or f"{type(e).__name__}（无错误详情，已打印堆栈到服务日志）"
+            print(f"[manual/consolidate] 整理 {start_date}~{end_date} 失败: {e}")
+        finally:
+            _consolidate_status["running"] = False
+    
+    asyncio.create_task(_run())
+    return {"status": "started", "start_date": str(start_date), "end_date": str(end_date)}
+
+
+@app.get("/api/memories/consolidate/status")
+async def api_consolidate_status():
+    """查询整理任务状态"""
+    return _consolidate_status
+
+
+@app.post("/api/memories/{memory_id}/promote")
+async def api_promote_to_core(memory_id: int, request: Request):
+    """将记忆升级为核心记忆"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    data = await request.json()
+    title = data.get("title")
+    
+    await promote_to_core(memory_id, title=title)
+    return {"status": "ok", "memory_id": memory_id, "layer": 3}
+
+
+@app.post("/api/memories/merge")
+async def api_merge_memories(request: Request):
+    """手动合并多条记忆"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    data = await request.json()
+    memory_ids = data.get("ids", [])
+    new_title = data.get("title", "")
+    new_content = data.get("content", "")
+    importance = data.get("importance", 5)
+    layer = data.get("layer", 2)
+    
+    if not memory_ids or not new_content:
+        return {"error": "请提供记忆ID列表和合并后内容"}
+    
+    new_id = await merge_memories(memory_ids, new_title, new_content, importance, layer)
+    return {"status": "ok", "new_id": new_id, "merged": len(memory_ids)}
+
+
+@app.post("/api/memories/check-duplicate")
+async def api_check_duplicate(request: Request):
+    """检查记忆是否重复"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    data = await request.json()
+    content = data.get("content", "")
+    threshold = data.get("threshold", 0.7)
+    
+    if not content:
+        return {"error": "请提供记忆内容"}
+    
+    result = await check_duplicate_memory(content, threshold)
+    return result
+
+
+@app.post("/api/memories/cleanup-fragments")
+async def api_cleanup_fragments(request: Request):
+    """清理指定天数前的归档碎片
+    
+    Body:
+        days: 清理多少天前的归档碎片（默认30天）
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    data = await request.json()
+    days = data.get("days", 30)
+    
+    try:
+        deleted = await cleanup_old_fragments(days)
+        return {"status": "ok", "deleted": deleted, "days": days}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/memories/cleanup-low-fragments")
+async def api_cleanup_low_importance_fragments(request: Request):
+    """清理指定天数前、重要度低的活跃碎片（layer=1, is_active=TRUE）
+
+    Body:
+        days: 多少天之前（默认14）
+        max_importance: 重要度上限（默认3，即1-3低评分）
+        dry_run: 仅统计不删除（默认false），用于前端先展示数量再确认
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    data = await request.json()
+    days = int(data.get("days", 14))
+    max_importance = int(data.get("max_importance", 3))
+    dry_run = bool(data.get("dry_run", False))
+    
+    try:
+        deleted = await cleanup_low_importance_fragments(days, max_importance, dry_run)
+        return {
+            "status": "ok",
+            "deleted": deleted,
+            "days": days,
+            "max_importance": max_importance,
+            "dry_run": dry_run,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/memories/{memory_id}/revert-merge")
+async def api_revert_merge(memory_id: int):
+    """撤回合并操作：恢复原始碎片，删除合并后的事件记忆"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    try:
+        result = await revert_merge(memory_id)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/memories/{memory_id}/restore")
+async def api_restore_memory(memory_id: int):
+    """恢复已归档的记忆（将 is_active 设为 TRUE）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    try:
+        await update_memory_with_layer(memory_id, is_active=True)
+        return {"status": "ok", "id": memory_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/memories/layer-stats")
+async def api_layer_statistics():
+    """获取各层记忆统计数据"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    try:
+        stats = await get_layer_statistics()
+        return stats
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/import/text")
+async def import_text_memories(request: Request):
+    """从纯文本导入记忆（每行一条），可选自动评分"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+    
+    try:
+        data = await request.json()
+        lines = data.get("lines", [])
+        skip_scoring = data.get("skip_scoring", False)
+        
+        if not lines:
+            return {"error": "没有找到记忆条目"}
+        
+        if skip_scoring:
+            scored = [{"content": t, "importance": 5} for t in lines]
+        else:
+            scored = await score_memories(lines)
+        
+        imported = 0
+        skipped = 0
+        
+        for mem in scored:
+            content = mem.get("content", "")
+            if not content:
+                continue
+            
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                existing = await conn.fetchval(
+                    "SELECT COUNT(*) FROM memories WHERE content = $1", content
+                )
+            
+            if existing > 0:
+                skipped += 1
+                continue
+            
+            await save_memory(
+                content=content,
+                importance=mem.get("importance", 5),
+                source_session="text-import",
+            )
+            imported += 1
+        
+        total = await get_all_memories_count()
+        return {
+            "status": "done",
+            "imported": imported,
+            "skipped": skipped,
+            "total": total,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/import/memories")
+async def import_memories(request: Request):
+    """从 JSON 导入记忆（用于迁移或恢复备份）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+    
+    try:
+        data = await request.json()
+        memories = data.get("memories", [])
+        
+        if not memories:
+            return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
+        
+        imported = 0
+        skipped = 0
+        
+        for mem in memories:
+            content = mem.get("content", "")
+            if not content:
+                continue
+            
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                existing = await conn.fetchval(
+                    "SELECT COUNT(*) FROM memories WHERE content = $1", content
+                )
+            
+            if existing > 0:
+                skipped += 1
+                continue
+            
+            await save_memory(
+                content=content,
+                importance=mem.get("importance", 5),
+                source_session=mem.get("source_session", "json-import"),
+            )
+            imported += 1
+        
+        total = await get_all_memories_count()
+        return {
+            "status": "done",
+            "imported": imported,
+            "skipped": skipped,
+            "total": total,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# 对话记录管理 API
+# ============================================================
+
+@app.get("/api/conversations")
+async def api_conversations(page: int = 1, per_page: int = 20):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        results, total = await get_conversations_paginated(page, per_page)
+        total_pages = max(1, -(-total // per_page))  # 向上取整
+        return {"conversations": results, "total": total, "page": page, "per_page": per_page, "total_pages": total_pages}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/conversation-messages")
+@app.get("/api/conversations/{session_id}/messages")
+async def api_conversation_messages(session_id: str, limit: int = 50, offset: int = 0):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = $1", session_id
+            )
+            rows = await conn.fetch("""
+                SELECT id, role, content, created_at
+                FROM conversations WHERE session_id = $1
+                ORDER BY id DESC
+                LIMIT $2 OFFSET $3
+            """, session_id, limit, offset)
+        msgs = [{"id": r["id"], "role": r["role"], "content": r["content"], 
+                 "created_at": r["created_at"].isoformat() if r.get("created_at") else None} for r in rows]
+        return {"messages": msgs, "total": total}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/conversations/{session_id}")
+async def api_delete_conversation(session_id: str):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        await _replace_active_session_before_deletion({session_id})
+        deleted = await delete_conversation(session_id)
+        if not deleted:
+            return JSONResponse(status_code=404, content={"error": "对话不存在或已被删除"})
+        return {"status": "ok"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/conversations/batch-delete")
+async def api_batch_delete(request: Request):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        body = await request.json()
+        raw_ids = body.get("session_ids", [])
+        if not isinstance(raw_ids, list):
+            return JSONResponse(status_code=400, content={"error": "session_ids 必须是数组"})
+        ids = list(dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip()))
+        await _replace_active_session_before_deletion(set(ids))
+        deleted = await batch_delete_conversations(ids)
+        if ids and deleted == 0:
+            return JSONResponse(status_code=404, content={"error": "选中的对话不存在或已被删除"})
+        return {"status": "ok", "deleted": deleted, "requested": len(ids)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/admin/merge-sessions")
+async def api_merge_sessions(request: Request):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        body = await request.json()
+        source_ids = [s for s in body.get("source_ids", []) if s != body.get("target_id", "")]
+        target_id = body.get("target_id", "")
+        if not source_ids or not target_id:
+            return {"error": "source_ids 和 target_id 不能为空"}
+        result = await merge_sessions_to_target(source_ids, target_id)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/chat/search")
+async def api_search_conversations(q: str = "", limit: int = 20, offset: int = 0):
+    """搜索对话内容"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    if not q.strip():
+        return {"error": "搜索关键词不能为空", "results": [], "total": 0}
+    try:
+        results, total = await search_conversations(q.strip(), limit, offset)
+        return {"results": results, "total": total}
+    except Exception as e:
+        return {"error": str(e), "results": [], "total": 0}
+
+
+@app.patch("/api/chat/messages/{message_id}")
+async def api_update_message(message_id: int, request: Request):
+    """编辑单条消息内容"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        body = await request.json()
+        content = body.get("content", "").strip()
+        if not content:
+            return {"error": "内容不能为空"}
+        updated = await update_message_content(message_id, content)
+        if updated == 0:
+            return {"error": "消息不存在"}
+        return {"status": "ok"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/chat/messages/{message_id}")
+async def api_delete_message(message_id: int):
+    """删除单条消息"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        deleted = await delete_single_message(message_id)
+        if deleted == 0:
+            return {"error": "消息不存在"}
+        return {"status": "ok"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/conversations/export")
+async def api_export_conversations():
+    """导出所有对话记录"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        data = await export_all_conversations()
+        return JSONResponse(content=data)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/conversations/import")
+async def api_import_conversations(request: Request):
+    """导入对话记录（JSON格式，自动去重）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    try:
+        records = await request.json()
+        if not isinstance(records, list):
+            return {"error": "格式错误：需要 JSON 数组"}
+        imported, skipped = await import_conversations(records)
+        return {"status": "ok", "imported": imported, "skipped": skipped, "total": imported + skipped}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# 对话线管理 API（分区缓存）
+# ============================================================
+
+@app.get("/api/partition/status")
+async def api_partition_status():
+    active_sid = get_active_session_id()
+    state = await get_session_cache_state(active_sid) if active_sid else {}
+    return {
+        "enabled": CACHE_PARTITION_ENABLED,
+        "active_session_id": active_sid,
+        "partition_x": CACHE_PARTITION_X,
+        "summary_model": CACHE_SUMMARY_MODEL,
+        "summary": '\n\n'.join(state.get('summary_parts', [])),
+        "summary_parts": state.get('summary_parts', []),
+        "summary_count": len(state.get('summary_parts', [])),
+        "summary_length": sum(len(p) for p in state.get('summary_parts', [])),
+        "a_start_round": state.get('a_start_round', 0),
+        "updated_at": state.get('updated_at').isoformat() if state.get('updated_at') else None,
+    }
+
+
+@app.get("/api/partition/threads")
+async def api_partition_threads():
+    threads = await list_all_session_cache_states()
+    active_sid = get_active_session_id()
+    for t in threads:
+        t['is_active'] = (t['session_id'] == active_sid)
+    if active_sid and not any(t['session_id'] == active_sid for t in threads):
+        threads.insert(0, {'session_id': active_sid, 'summary': '', 'summary_length': 0, 'summary_count': 0, 'a_start_round': 0, 'updated_at': None, 'message_count': 0, 'chat_tokens': 0, 'is_active': True})
+    return {"threads": threads, "active_session_id": active_sid}
+
+
+@app.put("/api/partition/summary")
+async def api_update_summary(request: Request):
+    try:
+        body = await request.json()
+        sid = body.get("session_id", "")
+        summary = body.get("summary", "")
+        if not sid:
+            return {"error": "session_id 不能为空"}
+        state = await get_session_cache_state(sid)
+        summary_parts = [summary] if isinstance(summary, str) and summary else summary if isinstance(summary, list) else []
+        # 摘要清空时 a_start_round 也归零，否则历史会被跳过
+        a_start = state.get('a_start_round', 0) if summary_parts else 0
+        await save_session_cache_state(sid, summary_parts, a_start)
+        total_len = sum(len(p) for p in summary_parts)
+        return {"status": "ok", "summary_parts": len(summary_parts), "summary_length": total_len}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/partition/summary")
+async def api_clear_summary(request: Request):
+    try:
+        body = await request.json()
+        sid = body.get("session_id", "")
+        if not sid:
+            return {"error": "session_id 不能为空"}
+        # 摘要和 a_start_round 一起归零
+        await save_session_cache_state(sid, [], 0)
+        return {"status": "ok"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/partition/thread")
+async def api_create_thread(request: Request):
+    try:
+        body = await request.json()
+        new_id = body.get("session_id", "").strip()
+        copy_from = body.get("copy_summary_from", "")
+        copy_tail_from = body.get("copy_tail_from", "").strip() or copy_from
+        try:
+            tail_count = int(body.get("tail_count", 0) or 0)
+        except (TypeError, ValueError):
+            tail_count = 0
+        tail_count = max(0, min(tail_count, 200))
+        if not new_id:
+            return {"error": "session_id 不能为空"}
+        existing = await get_session_cache_state(new_id)
+        if existing.get('updated_at'):
+            return {"error": f"对话线 '{new_id}' 已存在"}
+        summary_parts = []
+        if copy_from:
+            source = await get_session_cache_state(copy_from)
+            summary_parts = source.get('summary_parts', [])
+        tail_copied = 0
+        if tail_count > 0:
+            if not copy_tail_from:
+                return {"error": "继承消息需要指定来源对话线"}
+            if copy_tail_from == new_id:
+                return {"error": "不能从自身继承消息"}
+            # 目标必须是空会话：提取基线在首条真实消息写入前建立，
+            # 若已有消息，复制尾部会被当成新历史重复提取。
+            existing_msgs = await get_conversation_messages(new_id, limit=1)
+            if existing_msgs:
+                return {"error": "目标对话线已有消息，不能继承尾部消息"}
+            tail_copied = await copy_tail_messages(copy_tail_from, new_id, tail_count)
+            print(
+                f"[thread] 继承尾部: source={copy_tail_from!r} target={new_id!r} "
+                f"request={tail_count} copied={tail_copied}"
+            )
+        await save_session_cache_state(new_id, summary_parts, 0)
+        total_len = sum(len(p) for p in summary_parts)
+        return {"status": "ok", "session_id": new_id, "summary_length": total_len, "tail_copied": tail_copied}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/partition/switch")
+async def api_switch_thread(request: Request):
+    global PARTITION_SESSION_ID
+    try:
+        body = await request.json()
+        new_id = body.get("session_id", "").strip()
+        if not new_id:
+            return {"error": "session_id 不能为空"}
+        old_id = PARTITION_SESSION_ID
+        PARTITION_SESSION_ID = new_id
+        await set_gateway_config("partition_session_id", new_id)
+        return {"status": "ok", "old_session_id": old_id, "new_session_id": new_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.put("/api/partition/thread/rename")
+async def api_rename_thread(request: Request):
+    global PARTITION_SESSION_ID
+    try:
+        body = await request.json()
+        old_id = body.get("old_id", "").strip()
+        new_id = body.get("new_id", "").strip()
+        if not old_id or not new_id:
+            return {"error": "old_id 和 new_id 不能为空"}
+        if old_id == new_id:
+            return {"error": "新旧ID相同"}
+        success = await rename_session_id(old_id, new_id)
+        if not success:
+            return {"error": f"对话线 '{new_id}' 已存在"}
+        # 如果重命名的是活跃线，同步更新
+        if PARTITION_SESSION_ID == old_id:
+            PARTITION_SESSION_ID = new_id
+            await set_gateway_config("partition_session_id", new_id)
+        return {"status": "ok", "old_id": old_id, "new_id": new_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/partition/thread/{session_id:path}")
+async def api_delete_thread(session_id: str):
+    """删除对话线；删除活跃线前先切换到新对话线。"""
+    try:
+        await _replace_active_session_before_deletion({session_id})
+        await delete_session_cache_state(session_id)
+        print(f"🗑️ 删除对话线: {session_id}")
+        return {"status": "ok", "session_id": session_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# 记忆向量补算（带进度追踪）
+# ============================================================
+
+_backfill_mem_status = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "error": None,
+    "finished_at": None,
+}
+
+@app.post("/api/admin/backfill-memory-embeddings")
+async def api_backfill_memory_embeddings():
+    """给已有记忆补算embedding（后台异步执行，前端轮询进度）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    
+    if _backfill_mem_status["running"]:
+        return {"error": "补算任务正在运行中，请等待完成"}
+    
+    try:
+        total = await get_pending_memory_embedding_count()
+    except Exception as e:
+        return {"error": f"查询待处理数量失败: {e}"}
+    
+    if total == 0:
+        return {"status": "done", "message": "所有记忆已有embedding，无需补算", "total": 0, "done": 0}
+    
+    _backfill_mem_status["running"] = True
+    _backfill_mem_status["total"] = total
+    _backfill_mem_status["done"] = 0
+    _backfill_mem_status["error"] = None
+    _backfill_mem_status["finished_at"] = None
+    
+    async def run_backfill():
+        try:
+            while _backfill_mem_status["running"]:
+                updated = await backfill_memory_embeddings(batch_size=20)
+                _backfill_mem_status["done"] += updated
+                
+                if updated == 0:
+                    break
+                
+                await asyncio.sleep(1)
+            
+            _backfill_mem_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+            print(f"✅ 记忆embedding补算完成：{_backfill_mem_status['done']}/{_backfill_mem_status['total']}")
+        except Exception as e:
+            _backfill_mem_status["error"] = str(e)
+            print(f"❌ 记忆embedding补算异常: {e}")
+        finally:
+            _backfill_mem_status["running"] = False
+    
+    asyncio.create_task(run_backfill())
+    return {"status": "started", "total": total}
+
+@app.get("/api/admin/backfill-memory-embeddings/status")
+async def api_backfill_memory_embeddings_status():
+    """查询记忆embedding补算进度"""
+    return {
+        "running": _backfill_mem_status["running"],
+        "total": _backfill_mem_status["total"],
+        "done": _backfill_mem_status["done"],
+        "error": _backfill_mem_status["error"],
+        "finished_at": _backfill_mem_status["finished_at"],
+    }
+
+
+# ============================================================
+# 模型列表 API（/api/models）
+# 设置面板的 combo-box 用，根据 API_BASE_URL 自动适配
+# ============================================================
+
+@app.get("/api/models")
+async def get_models():
+    """获取可用模型列表（根据 API_BASE_URL 自动适配）"""
+    is_openrouter = "openrouter.ai" in API_BASE_URL
+    is_google = "googleapis.com" in API_BASE_URL or "generativelanguage" in API_BASE_URL
+    is_openai = "api.openai.com" in API_BASE_URL
+
+    try:
+        if is_openrouter:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {API_KEY}"}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    models = data.get("data", [])
+                    simplified = [{"id": m.get("id"), "name": m.get("name"), "context_length": m.get("context_length")} for m in models]
+                    simplified.sort(key=lambda x: x.get("name", ""))
+                    return {"models": simplified, "total": len(simplified), "provider": "openrouter"}
+
+        elif is_google:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    models = data.get("models", [])
+                    simplified = []
+                    for m in models:
+                        full_name = m.get("name", "")
+                        model_id = full_name.replace("models/", "") if full_name.startswith("models/") else full_name
+                        display_name = m.get("displayName", model_id)
+                        supported_methods = m.get("supportedGenerationMethods", [])
+                        if "generateContent" in supported_methods:
+                            simplified.append({"id": model_id, "name": display_name, "context_length": m.get("inputTokenLimit"), "output_limit": m.get("outputTokenLimit")})
+                    def sort_key(x):
+                        name = x.get("id", "")
+                        if "gemini-3" in name: return "0" + name
+                        elif "gemini-2.5" in name: return "1" + name
+                        elif "gemini-2.0" in name: return "2" + name
+                        else: return "9" + name
+                    simplified.sort(key=sort_key)
+                    return {"models": simplified, "total": len(simplified), "provider": "google"}
+                else:
+                    print(f"[get_models] Google API 返回 {response.status_code}: {response.text}")
+                    return {"error": f"Google API 返回 {response.status_code}", "models": [], "provider": "google"}
+
+        elif is_openai:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {API_KEY}"}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    models = data.get("data", [])
+                    simplified = [{"id": m.get("id", ""), "name": m.get("id", "")} for m in models if m.get("id", "").startswith(("gpt-", "o1", "o3", "o4"))]
+                    simplified.sort(key=lambda x: x.get("id", ""))
+                    return {"models": simplified, "total": len(simplified), "provider": "openai"}
+            openai_models = [
+                {"id": "gpt-4.1", "name": "GPT-4.1"},
+                {"id": "gpt-4o", "name": "GPT-4o"},
+                {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
+                {"id": "o3-mini", "name": "o3-mini"},
+            ]
+            return {"models": openai_models, "total": len(openai_models), "provider": "openai"}
+
+        else:
+            return {"models": [], "total": 0, "provider": "unknown", "note": "未识别的 API，请手动输入模型名"}
+
+    except Exception as e:
+        print(f"[get_models] 错误: {e}")
+        return {"error": str(e), "models": []}
+
+
+# ============================================================
+# 高级设置面板 API（/api/settings）
+# Dashboard 前端设置面板用，管理所有运行时可调配置
+# ============================================================
+
+def _mask_key(key_value: str) -> str:
+    """API Key 打码：只露前5位和后4位"""
+    if not key_value:
+        return ""
+    if len(key_value) < 10:
+        return "****"
+    return key_value[:5] + "****" + key_value[-4:]
+
+
+def _is_masked(value: str) -> bool:
+    """判断值是否是打码值（用户没改过）"""
+    return "****" in str(value)
+
+
+def _parse_bool(val, fallback=False) -> bool:
+    """解析布尔值（兼容字符串/布尔/None）"""
+    if val is None:
+        return fallback
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ("true", "1", "yes")
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """获取高级设置（数据库优先，fallback 到环境变量/运行时默认值）"""
+    try:
+        db = await get_all_gateway_config()
+
+        # --- 基础连接 ---
+        api_key_raw = db.get("API_KEY") or API_KEY
+        embedding_key_raw = db.get("EMBEDDING_API_KEY") or _db_module.EMBEDDING_API_KEY
+
+        memory_key_raw = db.get("MEMORY_API_KEY") or MEMORY_API_KEY
+
+        settings = {
+            # 基础连接
+            "API_BASE_URL":     db.get("API_BASE_URL") or str(API_BASE_URL),
+            "API_KEY":          _mask_key(api_key_raw),
+            "DEFAULT_MODEL":    db.get("DEFAULT_MODEL") or str(DEFAULT_MODEL),
+
+            # 记忆系统
+            "MEMORY_ENABLED":          _parse_bool(db.get("MEMORY_ENABLED"), MEMORY_ENABLED),
+            "MEMORY_API_KEY":          _mask_key(memory_key_raw),
+            "MEMORY_API_BASE_URL":     db.get("MEMORY_API_BASE_URL") or os.environ.get("MEMORY_API_BASE_URL", ""),
+            "MEMORY_MODEL":            db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", ""),
+            "MAX_MEMORIES_INJECT":     int(db.get("MAX_MEMORIES_INJECT") or MAX_MEMORIES_INJECT),
+            "MIN_SCORE_THRESHOLD":     float(db.get("MIN_SCORE_THRESHOLD") or _db_module.MIN_SCORE_THRESHOLD),
+            "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
+
+            # 定时后台任务
+            "COGNITIVE_AUTO_MODE": db.get("COGNITIVE_AUTO_MODE") or COGNITIVE_AUTO_MODE,
+            "COGNITIVE_AUTO_INTERVAL_HOURS": int(db.get("COGNITIVE_AUTO_INTERVAL_HOURS") or COGNITIVE_AUTO_INTERVAL_HOURS),
+            "MEMORY_EVOLUTION_ENABLED": _parse_bool(db.get("MEMORY_EVOLUTION_ENABLED"), MEMORY_EVOLUTION_ENABLED),
+            "MEMORY_EVOLUTION_INTERVAL_HOURS": int(db.get("MEMORY_EVOLUTION_INTERVAL_HOURS") or MEMORY_EVOLUTION_INTERVAL_HOURS),
+            "TRAIT_RECHECK_ENABLED": _parse_bool(db.get("TRAIT_RECHECK_ENABLED"), TRAIT_RECHECK_ENABLED),
+            "TRAIT_RECHECK_INTERVAL_HOURS": int(db.get("TRAIT_RECHECK_INTERVAL_HOURS") or TRAIT_RECHECK_INTERVAL_HOURS),
+            "RELATION_RECHECK_ENABLED": _parse_bool(db.get("RELATION_RECHECK_ENABLED"), RELATION_RECHECK_ENABLED),
+            "RELATION_RECHECK_INTERVAL_HOURS": int(db.get("RELATION_RECHECK_INTERVAL_HOURS") or RELATION_RECHECK_INTERVAL_HOURS),
+
+            # 缓存分区
+            "CACHE_PARTITION_ENABLED": _parse_bool(db.get("CACHE_PARTITION_ENABLED"), CACHE_PARTITION_ENABLED),
+            "CACHE_PARTITION_X":       int(db.get("CACHE_PARTITION_X") or CACHE_PARTITION_X),
+            "CACHE_PARTITION_TRIGGER": db.get("CACHE_PARTITION_TRIGGER") or CACHE_PARTITION_TRIGGER,
+            "CACHE_PARTITION_WINDOW":  int(db.get("CACHE_PARTITION_WINDOW") or CACHE_PARTITION_WINDOW),
+            "CACHE_SUMMARY_MODEL":     db.get("CACHE_SUMMARY_MODEL") or str(CACHE_SUMMARY_MODEL),
+            "CACHE_TTL":               db.get("CACHE_TTL") or str(CACHE_TTL),
+
+            # 向量搜索（开源版用 EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
+            "MEMORY_VECTOR_ENABLED":   _parse_bool(db.get("MEMORY_VECTOR_ENABLED"), _db_module.MEMORY_VECTOR_ENABLED),
+            "EMBEDDING_API_KEY":       _mask_key(embedding_key_raw),
+            "EMBEDDING_BASE_URL":      db.get("EMBEDDING_BASE_URL") or str(_db_module.EMBEDDING_BASE_URL),
+            "EMBEDDING_MODEL":         db.get("EMBEDDING_MODEL") or str(_db_module.EMBEDDING_MODEL),
+            "EMBEDDING_DIM":           int(db.get("EMBEDDING_DIM") or _db_module.EMBEDDING_DIM),
+
+            # 搜索权重
+            "MEMORY_HW_KEYWORD":        float(db.get("MEMORY_HW_KEYWORD") or _db_module.MEMORY_HW_KEYWORD),
+            "MEMORY_HW_SEMANTIC":       float(db.get("MEMORY_HW_SEMANTIC") or _db_module.MEMORY_HW_SEMANTIC),
+            "MEMORY_HW_IMPORTANCE":     float(db.get("MEMORY_HW_IMPORTANCE") or _db_module.MEMORY_HW_IMPORTANCE),
+            "MEMORY_HW_RECENCY":        float(db.get("MEMORY_HW_RECENCY") or _db_module.MEMORY_HW_RECENCY),
+            "MEMORY_HW_ENTITY":         float(db.get("MEMORY_HW_ENTITY") or _db_module.MEMORY_HW_ENTITY),
+            "MEMORY_SEMANTIC_THRESHOLD": float(db.get("MEMORY_SEMANTIC_THRESHOLD") or _db_module.MEMORY_SEMANTIC_THRESHOLD),
+
+            # 其他
+            "FORCE_STREAM":       _parse_bool(db.get("FORCE_STREAM"), FORCE_STREAM),
+            "REASONING_EFFORT":   db.get("REASONING_EFFORT") or str(REASONING_EFFORT),
+
+            # System Prompt
+            "systemPrompt": db.get("systemPrompt") or _DEFAULT_SYSTEM_PROMPT or "",
+        }
+
+        return {"status": "ok", "settings": settings}
+    except Exception as e:
+        print(f"[get_settings] 错误: {e}")
+        return {"error": str(e)}
+
+
+@app.put("/api/settings")
+async def save_settings(request: Request):
+    """保存高级设置（写入数据库 + 热更新运行时变量，立即生效无需重启）"""
+    try:
+        data = await request.json()
+        updated = []
+        skipped = []
+
+        # main.py 全局变量映射（key → 类型转换函数）
+        _MAIN_VARS = {
+            "API_BASE_URL":          str,
+            "API_KEY":               str,
+            "DEFAULT_MODEL":         str,
+            "MEMORY_API_KEY":        str,
+            "MEMORY_API_BASE_URL":   str,
+            "MEMORY_ENABLED":        lambda v: _parse_bool(v),
+            "MAX_MEMORIES_INJECT":   int,
+            "MEMORY_EXTRACT_INTERVAL": int,
+            "COGNITIVE_AUTO_MODE":       str,
+            "COGNITIVE_AUTO_INTERVAL_HOURS": int,
+            "MEMORY_EVOLUTION_ENABLED":  lambda v: _parse_bool(v),
+            "MEMORY_EVOLUTION_INTERVAL_HOURS": int,
+            "TRAIT_RECHECK_ENABLED":     lambda v: _parse_bool(v),
+            "TRAIT_RECHECK_INTERVAL_HOURS": int,
+            "RELATION_RECHECK_ENABLED":  lambda v: _parse_bool(v),
+            "RELATION_RECHECK_INTERVAL_HOURS": int,
+            "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
+            "CACHE_PARTITION_X":     int,
+            "CACHE_PARTITION_TRIGGER": str,
+            "CACHE_PARTITION_WINDOW": int,
+            "CACHE_SUMMARY_MODEL":   str,
+            "CACHE_TTL":             str,
+            "FORCE_STREAM":          lambda v: _parse_bool(v),
+            "REASONING_EFFORT":      str,
+        }
+
+        # database.py 全局变量映射（开源版用 EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
+        _DB_VARS = {
+            "EMBEDDING_API_KEY":       str,
+            "EMBEDDING_BASE_URL":      str,
+            "EMBEDDING_MODEL":         str,
+            "EMBEDDING_DIM":           int,
+            "MIN_SCORE_THRESHOLD":     float,
+            "MEMORY_VECTOR_ENABLED":   lambda v: _parse_bool(v),
+            "MEMORY_HW_KEYWORD":       float,
+            "MEMORY_HW_SEMANTIC":      float,
+            "MEMORY_HW_IMPORTANCE":    float,
+            "MEMORY_HW_RECENCY":       float,
+            "MEMORY_HW_ENTITY":        float,
+            "MEMORY_SEMANTIC_THRESHOLD": float,
+        }
+
+        # 只存 os.environ 的变量
+        _ENV_ONLY = {"MEMORY_MODEL": str}
+
+        # 打码字段
+        _MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY"}
+
+        for key, value in data.items():
+            # --- 打码字段特殊处理 ---
+            if key in _MASKED_KEYS:
+                str_val = str(value).strip()
+                if _is_masked(str_val):
+                    skipped.append(key)
+                    continue
+                if not str_val:
+                    await set_gateway_config(key, "")
+                    if key in _MAIN_VARS:
+                        globals()[key] = ""
+                    elif key in _DB_VARS:
+                        setattr(_db_module, key, "")
+                    _memory_extractor_module.apply_runtime_config(key, "")
+                    os.environ[key] = ""
+                    updated.append(key)
+                    continue
+
+            # --- systemPrompt 特殊处理 ---
+            if key == "systemPrompt":
+                await set_gateway_config("systemPrompt", str(value))
+                invalidate_system_prompt_cache()
+                updated.append("systemPrompt")
+                print(f"[settings] systemPrompt 已更新（{len(str(value))} 字）")
+                continue
+
+            # --- 常规字段 ---
+            await set_gateway_config(key, str(value))
+
+            if key in _MAIN_VARS:
+                typed_value = _MAIN_VARS[key](value)
+                globals()[key] = typed_value
+                os.environ[key] = str(value)
+                _memory_extractor_module.apply_runtime_config(key, typed_value)
+                updated.append(key)
+                print(f"[settings] {key} = {typed_value}")
+
+            elif key in _DB_VARS:
+                typed_value = _DB_VARS[key](value)
+                setattr(_db_module, key, typed_value)
+                os.environ[key] = str(value)
+                updated.append(key)
+                print(f"[settings] {key} = {typed_value} (database)")
+
+            elif key in _ENV_ONLY:
+                typed_value = _ENV_ONLY[key](value)
+                os.environ[key] = str(typed_value)
+                _memory_extractor_module.apply_runtime_config(key, typed_value)
+                updated.append(key)
+                print(f"[settings] {key} = {typed_value} (env)")
+
+            else:
+                skipped.append(key)
+
+        _SCHEDULER_KEYS = {
+            "COGNITIVE_AUTO_MODE", "COGNITIVE_AUTO_INTERVAL_HOURS",
+            "MEMORY_EVOLUTION_ENABLED", "MEMORY_EVOLUTION_INTERVAL_HOURS",
+            "TRAIT_RECHECK_ENABLED", "TRAIT_RECHECK_INTERVAL_HOURS",
+            "RELATION_RECHECK_ENABLED", "RELATION_RECHECK_INTERVAL_HOURS",
+            "MEMORY_ENABLED", "MEMORY_EXTRACT_ENABLED",
+        }
+        if any(k in _SCHEDULER_KEYS for k in updated):
+            notify_scheduler_config_updated()
+
+        return {
+            "status": "ok",
+            "updated": updated,
+            "skipped": skipped,
+            "message": f"已更新 {len(updated)} 项配置，立即生效"
+        }
+    except Exception as e:
+        print(f"[save_settings] 错误: {e}")
+        return {"error": str(e)}
+
+
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    print(f"🚀 AI Memory Gateway 启动中... 端口 {PORT}")
+    print(f"📝 人设长度：{len(SYSTEM_PROMPT)} 字符")
+    print(f"🤖 默认模型：{DEFAULT_MODEL}")
+    print(f"🔗 API 地址：{API_BASE_URL}")
+    print(f"🧠 记忆系统：{'开启' if MEMORY_ENABLED else '关闭'}")
+    if MEMORY_ENABLED:
+        print(f"📝 记忆提取+注入：{'开启' if MEMORY_EXTRACT_ENABLED else '关闭'}")
+    print(f"🔄 记忆提取间隔：{'禁用' if MEMORY_EXTRACT_INTERVAL == 0 else '每轮提取' if MEMORY_EXTRACT_INTERVAL == 1 else f'每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次'}")
+    if CACHE_PARTITION_ENABLED:
+        print(f"🔒 分区缓存：开启 (X={CACHE_PARTITION_X}, session={PARTITION_SESSION_ID or '未设置'})")
+    if FORCE_STREAM:
+        print(f"⚡ 强制流式传输：开启")
+    if REASONING_EFFORT:
+        print(f"🧠 推理参数注入：{REASONING_EFFORT}")
+    if drives.is_enabled():
+        print(f"💓 Drivesoid 情感引擎：已启用 ({drives.DRIVESOID_URL})")
+    else:
+        print(f"ℹ️  Drivesoid 情感引擎：未配置（设置 DRIVESOID_URL 启用）")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

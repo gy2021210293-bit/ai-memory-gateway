@@ -1,0 +1,492 @@
+/* AI Memory Gateway */
+
+/* ============================================
+   配色变量
+   ============================================ */
+:root {
+    --primary: #3C6E71;        /* 青绿色 - 主色调 */
+    --primary-dark: #284B63;   /* 深蓝色 - 强调/hover */
+    --text: #353535;           /* 深灰色 - 正文 */
+    --text-light: #6b7280;     /* 浅灰色 - 次要文字 */
+    --bg: #f8f9fa;             /* 页面背景 */
+    --card: #ffffff;           /* 卡片背景 */
+    --border: #D9D9D9;         /* 边框 */
+    --border-light: #e5e7eb;   /* 浅边框 */
+    --success: #3C6E71;        /* 成功 - 用主色 */
+    --danger: #9f5050;         /* 删除/危险 - 柔和红 */
+    --danger-hover: #854242;
+    --shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    --shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.1);
+    --radius: 12px;
+    --radius-sm: 8px;
+}
+
+/* ============================================
+   基础
+   ============================================ */
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 40px 24px;
+    color: var(--text);
+    line-height: 1.6;
+    background: var(--bg);
+}
+
+h2 {
+    color: var(--text);
+    margin-bottom: 8px;
+    font-weight: 600;
+    font-size: 1.5rem;
+}
+
+/* ============================================
+   卡片容器
+   ============================================ */
+.card {
+    background: var(--card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 24px;
+    margin-bottom: 20px;
+}
+
+/* ============================================
+   导航
+   ============================================ */
+.nav {
+    margin-bottom: 24px;
+    font-size: 14px;
+    color: var(--text-light);
+}
+
+.nav a {
+    color: var(--primary);
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+.nav a:hover {
+    color: var(--primary-dark);
+}
+
+/* ============================================
+   消息提示
+   ============================================ */
+.msg {
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+}
+
+.msg.ok {
+    background: #ecfdf5;
+    color: #047857;
+    border: 1px solid #a7f3d0;
+}
+
+.msg.err {
+    background: #fef2f2;
+    color: #b91c1c;
+    border: 1px solid #fecaca;
+}
+
+.msg.info {
+    background: #f0f9ff;
+    color: #0369a1;
+    border: 1px solid #bae6fd;
+}
+
+/* ============================================
+   按钮
+   ============================================ */
+button {
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    border-radius: var(--radius-sm);
+    transition: all 0.2s;
+}
+
+.btn-primary {
+    background: var(--primary);
+    color: white;
+}
+
+.btn-primary:hover {
+    background: var(--primary-dark);
+    box-shadow: var(--shadow-hover);
+}
+
+/* 兼容旧的 btn-green */
+.btn-green {
+    background: var(--primary);
+    color: white;
+}
+
+.btn-green:hover {
+    background: var(--primary-dark);
+    box-shadow: var(--shadow-hover);
+}
+
+.btn-red {
+    background: var(--danger);
+    color: white;
+}
+
+.btn-red:hover {
+    background: var(--danger-hover);
+}
+
+.btn-gray {
+    background: var(--border);
+    color: var(--text);
+}
+
+.btn-gray:hover {
+    background: #c5c5c5;
+}
+
+.btn-outline {
+    background: transparent;
+    color: var(--primary);
+    border: 1px solid var(--primary);
+}
+
+.btn-outline:hover {
+    background: var(--primary);
+    color: white;
+}
+
+/* ============================================
+   输入框
+   ============================================ */
+input[type="text"],
+input[type="date"],
+input[type="number"],
+select {
+    padding: 10px 14px;
+    font-size: 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--text);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+input[type="text"]:focus,
+input[type="date"]:focus,
+input[type="number"]:focus,
+select:focus,
+textarea:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(60, 110, 113, 0.1);
+}
+
+textarea {
+    width: 100%;
+    padding: 10px 14px;
+    font-size: 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--text);
+    resize: vertical;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+/* ============================================
+   表格
+   ============================================ */
+.table-wrapper {
+    background: var(--card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+th {
+    background: var(--bg);
+    padding: 14px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-light);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border-light);
+    position: sticky;
+    top: 0;
+}
+
+td {
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--border-light);
+    vertical-align: top;
+}
+
+tr:last-child td {
+    border-bottom: none;
+}
+
+tr:hover {
+    background: #f9fafb;
+}
+
+/* ============================================
+   Tab 切换
+   ============================================ */
+.tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 24px;
+    border-bottom: 2px solid var(--border-light);
+}
+
+.tab {
+    padding: 12px 24px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    color: var(--text-light);
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.tab:hover {
+    color: var(--text);
+}
+
+.tab.active {
+    border-bottom-color: var(--primary);
+    color: var(--primary);
+}
+
+.panel {
+    display: none;
+}
+
+.panel.active {
+    display: block;
+}
+
+/* ============================================
+   提示文字
+   ============================================ */
+.hint {
+    color: var(--text-light);
+    font-size: 13px;
+    margin: 8px 0;
+}
+
+/* ============================================
+   预览区域
+   ============================================ */
+.preview {
+    background: var(--bg);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    padding: 16px;
+    margin: 16px 0;
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 13px;
+}
+
+.preview-item {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-light);
+    color: var(--text);
+}
+
+.preview-item:last-child {
+    border-bottom: none;
+}
+
+/* ============================================
+   统计信息
+   ============================================ */
+.stats {
+    color: var(--text-light);
+    font-size: 14px;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: var(--card);
+    border-radius: var(--radius-sm);
+    display: inline-block;
+}
+
+/* ============================================
+   工具栏
+   ============================================ */
+.toolbar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    padding: 16px 20px;
+    background: var(--card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+/* ============================================
+   导入页面
+   ============================================ */
+.import-textarea {
+    height: 200px;
+    margin: 16px 0;
+}
+
+.import-file {
+    margin: 16px 0;
+    font-size: 14px;
+}
+
+.import-divider {
+    margin: 20px 0;
+    text-align: center;
+    color: var(--text-light);
+    font-size: 13px;
+}
+
+/* ============================================
+   管理页面
+   ============================================ */
+.check-col {
+    width: 40px;
+    text-align: center;
+}
+
+.id-col {
+    width: 50px;
+    font-weight: 600;
+    color: var(--text-light);
+}
+
+.imp-col {
+    width: 80px;
+}
+
+.source-col {
+    width: 100px;
+    font-size: 12px;
+    color: var(--text-light);
+}
+
+.time-col {
+    width: 150px;
+    font-size: 12px;
+    color: var(--text-light);
+    white-space: nowrap;
+}
+
+.actions-col {
+    width: 140px;
+}
+
+/* 操作按钮容器 - 同时用于td */
+.actions {
+    display: flex;
+    gap: 6px;
+    width: 140px;
+}
+
+.content-cell {
+    max-width: 400px;
+    word-break: break-all;
+}
+
+.importance-input {
+    width: 60px;
+    padding: 8px 4px;
+    text-align: center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+}
+
+.content-input {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    min-height: 60px;
+    line-height: 1.5;
+}
+
+.actions {
+    display: flex;
+    gap: 6px;
+}
+
+.actions button {
+    padding: 6px 12px;
+    font-size: 12px;
+}
+
+/* 搜索框 */
+.search-box {
+    width: 260px;
+}
+
+/* Checkbox 美化 */
+input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--primary);
+    cursor: pointer;
+}
+
+/* ============================================
+   响应式
+   ============================================ */
+@media (max-width: 768px) {
+    body {
+        padding: 20px 16px;
+    }
+    
+    .toolbar {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+    }
+    
+    .search-box {
+        width: 100%;
+    }
+    
+    table {
+        font-size: 13px;
+    }
+    
+    .content-cell {
+        max-width: 180px;
+    }
+    
+    th, td {
+        padding: 10px 8px;
+    }
+    
+    .source-col,
+    .time-col {
+        display: none;
+    }
+}
